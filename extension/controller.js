@@ -1,6 +1,6 @@
 export const EMPTY_STATE = {
   status: 'idle', tab: null, elapsedMs: 0, bytes: 0, level: 0,
-  error: null, notice: null, result: null,
+  error: null, notice: null, result: null, selection: null, exportResult: null,
   download: { id: null, status: 'idle', error: null },
 };
 
@@ -44,7 +44,7 @@ export function createController(api) {
   }
 
   async function badge(current) {
-    const labels = { starting: '…', recording: 'REC', paused: 'Ⅱ', stopping: '…', ready: '↓', error: '!' };
+    const labels = { starting: '…', recording: 'REC', paused: 'Ⅱ', stopping: '…', trimming: '…', ready: '↓', error: '!' };
     await Promise.all([
       api.action.setBadgeText({ text: labels[current.status] || '' }),
       api.action.setBadgeBackgroundColor({ color: current.status === 'recording' ? '#da4761' : '#247e76' }),
@@ -97,14 +97,23 @@ export function createController(api) {
       await badge(reply.state);
       return reply;
     }
-    if (message.type === 'SAVE') {
+    if (message.type === 'SAVE' || message.type === 'SAVE_RANGE') {
       if (current.status !== 'ready' || !current.result) throw new Error('녹음을 먼저 마쳐 주세요.');
       if (current.download.status === 'pending') throw new Error('파일 저장이 진행 중이에요.');
+      if (message.type === 'SAVE_RANGE') {
+        const prepared = await send('PREPARE_EXPORT', {
+          startSeconds: message.startSeconds, endSeconds: message.endSeconds,
+        });
+        if (!prepared.ok) return prepared;
+        current = prepared.state;
+      }
+      const output = message.type === 'SAVE_RANGE' ? current.exportResult : current.result;
+      if (!output?.url) throw new Error('저장할 파일을 준비하지 못했어요. 다시 시도해 주세요.');
       saveInFlight = true;
       try {
         await send('DOWNLOAD_UPDATE', { download: { id: null, status: 'pending', error: null } });
         const id = await api.downloads.download({
-          url: current.result.url, filename: current.result.filename,
+          url: output.url, filename: output.filename,
           saveAs: true, conflictAction: 'uniquify',
         });
         if (typeof id !== 'number') throw new Error('No download id');
@@ -116,9 +125,11 @@ export function createController(api) {
         return { ok: false, error, state: reply.state };
       } finally { saveInFlight = false; }
     }
-    if (!['PAUSE', 'RESUME', 'STOP', 'DISCARD'].includes(message.type)) throw new Error('지원하지 않는 요청이에요.');
+    if (!['PAUSE', 'RESUME', 'STOP', 'DISCARD', 'SET_SELECTION'].includes(message.type)) throw new Error('지원하지 않는 요청이에요.');
     if (!await hasDocument()) throw new Error('진행 중인 녹음이 없어요.');
-    const reply = await send(message.type);
+    const reply = await send(message.type, message.type === 'SET_SELECTION' ? {
+      startSeconds: message.startSeconds, endSeconds: message.endSeconds,
+    } : {});
     await badge(reply.state);
     return reply;
   }

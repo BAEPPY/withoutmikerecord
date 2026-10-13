@@ -6,6 +6,8 @@ const recordedFile = {
   url: 'blob:chrome-extension://recorder/recording-1',
   filename: 'tab-audio-2026-10-13.mp4',
   bytes: 2048,
+  mimeType: 'audio/mp4;codecs=mp4a.40.2',
+  durationSeconds: 12,
 };
 
 function deferred() {
@@ -24,6 +26,7 @@ function browser({ status = 'idle', download, document = status !== 'idle' } = {
     status,
     tab: status === 'idle' ? null : { id: 17, title: 'A playing tab' },
     result: status === 'ready' ? structuredClone(recordedFile) : null,
+    selection: status === 'ready' ? { startSeconds: 0, endSeconds: 12 } : null,
   });
   if (download) state.download = structuredClone(download);
   const env = {
@@ -33,6 +36,14 @@ function browser({ status = 'idle', download, document = status !== 'idle' } = {
     async capture() { return 'stream-for-tab-17'; },
     async download() { return 91; },
     async createDocument() {},
+    async prepareExport(startSeconds, endSeconds) {
+      return {
+        url: 'blob:chrome-extension://recorder/clip-1',
+        filename: 'tab-audio-2026-10-13-trim.mp4',
+        bytes: 768, mimeType: recordedFile.mimeType,
+        durationSeconds: endSeconds - startSeconds, startSeconds, endSeconds,
+      };
+    },
   };
   const record = (kind, data) => calls.push({ kind, data: structuredClone(data) });
   env.api = {
@@ -55,6 +66,20 @@ function browser({ status = 'idle', download, document = status !== 'idle' } = {
           case 'RESUME': state.status = 'recording'; break;
           case 'STOP':
             Object.assign(state, { status: 'ready', result: structuredClone(recordedFile) });
+            break;
+          case 'SET_SELECTION':
+            state.selection = { startSeconds: message.startSeconds, endSeconds: message.endSeconds };
+            break;
+          case 'PREPARE_EXPORT':
+            state.status = 'trimming';
+            try {
+              state.exportResult = await env.prepareExport(message.startSeconds, message.endSeconds);
+              state.selection = { startSeconds: message.startSeconds, endSeconds: message.endSeconds };
+            } catch (error) {
+              state.status = 'ready';
+              return { ok: false, error: error.message, state: structuredClone(state) };
+            }
+            state.status = 'ready';
             break;
           case 'DISCARD': Object.assign(state, structuredClone(EMPTY_STATE)); break;
           case 'DOWNLOAD_UPDATE': state.download = structuredClone(message.download); break;
@@ -329,4 +354,141 @@ test('a delayed tab-close notification cannot stop a newer recording in another 
   assert.equal(env.state.tab.id, 88);
   assert.equal(env.state.status, 'recording');
   assert.equal(messages(env, 'STOP').length, 1, 'the stale close must not issue a second stop');
+});
+
+test('selection commands forward fractional boundaries and persist across a worker restart', async () => {
+  const env = browser({ status: 'ready' });
+  const range = { startSeconds: 1.125, endSeconds: 9.875 };
+  const selected = await env.controller.handle({ type: 'SET_SELECTION', ...range });
+  assert.equal(selected.ok, true);
+  assert.deepEqual(selected.state.selection, range);
+  assert.deepEqual(messages(env, 'SET_SELECTION')[0].data, { target: 'offscreen', type: 'SET_SELECTION', ...range });
+  const restarted = createController(env.api);
+  assert.deepEqual((await restarted.handle({ type: 'STATUS' })).state.selection, range);
+  assert.equal(events(env, 'capture').length, 0);
+  assert.equal(events(env, 'download').length, 0);
+});
+
+test('SAVE_RANGE downloads the prepared clip while SAVE still downloads the full original', async () => {
+  const env = browser({ status: 'ready' });
+  env.items.set(91, { id: 91, state: 'complete' });
+  const range = { startSeconds: 1.25, endSeconds: 7.75 };
+  const saved = await env.controller.handle({ type: 'SAVE_RANGE', ...range });
+  assert.equal(saved.ok, true);
+  assert.equal(saved.state.download.status, 'complete');
+  assert.deepEqual(saved.state.result, recordedFile);
+  assert.deepEqual(messages(env, 'PREPARE_EXPORT')[0].data, { target: 'offscreen', type: 'PREPARE_EXPORT', ...range });
+  assert.deepEqual(events(env, 'download')[0].data, {
+    url: saved.state.exportResult.url, filename: saved.state.exportResult.filename,
+    saveAs: true, conflictAction: 'uniquify',
+  });
+  assert.notEqual(saved.state.exportResult.url, recordedFile.url);
+  assert.equal(messages(env, 'START').length, 0, 'trimming never captures the tab again');
+  const full = await env.controller.handle({ type: 'SAVE' });
+  assert.equal(full.ok, true);
+  assert.deepEqual(events(env, 'download')[1].data, {
+    url: recordedFile.url, filename: recordedFile.filename,
+    saveAs: true, conflictAction: 'uniquify',
+  });
+  assert.deepEqual(full.state.exportResult, saved.state.exportResult);
+  assert.equal(messages(env, 'PREPARE_EXPORT').length, 1);
+});
+
+test('failed trim never opens a Save As dialog and preserves any prior exported clip', async () => {
+  const env = browser({ status: 'ready' });
+  const prior = await env.prepareExport(1, 4);
+  env.state.exportResult = structuredClone(prior);
+  env.prepareExport = async () => { throw new Error('선택한 구간을 자를 수 없어요.'); };
+  const reply = await env.controller.handle({ type: 'SAVE_RANGE', startSeconds: 5, endSeconds: 9 });
+  assert.equal(reply.ok, false);
+  assert.match(reply.error, /자를 수 없어요/);
+  assert.equal(reply.state.status, 'ready');
+  assert.deepEqual(reply.state.result, recordedFile);
+  assert.deepEqual(reply.state.exportResult, prior);
+  assert.equal(events(env, 'download').length, 0);
+  assert.equal(messages(env, 'DOWNLOAD_UPDATE').length, 0);
+});
+
+test('cancelled range saving retains selection and both files, allowing a successful retry', async () => {
+  const env = browser({ status: 'ready' });
+  const range = { startSeconds: 2, endSeconds: 10 };
+  env.download = async () => { throw new Error('USER_CANCELED'); };
+  const cancelled = await env.controller.handle({ type: 'SAVE_RANGE', ...range });
+  assert.equal(cancelled.ok, false);
+  assert.equal(cancelled.state.download.status, 'interrupted');
+  assert.deepEqual(cancelled.state.result, recordedFile);
+  assert.deepEqual(cancelled.state.selection, range);
+  assert.ok(cancelled.state.exportResult.url);
+  env.download = async () => 92;
+  env.items.set(92, { id: 92, state: 'complete' });
+  const retried = await env.controller.handle({ type: 'SAVE_RANGE', ...range });
+  assert.equal(retried.ok, true);
+  assert.equal(retried.state.download.status, 'complete');
+  assert.deepEqual(retried.state.result, recordedFile);
+  assert.deepEqual(retried.state.exportResult, cancelled.state.exportResult);
+  assert.equal(messages(env, 'DISCARD').length, 0);
+  assert.equal(events(env, 'download').length, 2);
+});
+
+test('STATUS remains readable while a range is being prepared and during its Save As dialog', async () => {
+  const env = browser({ status: 'ready' });
+  const entered = deferred();
+  const releaseTrim = deferred();
+  const pickerOpened = deferred();
+  const dialog = deferred();
+  const prepare = env.prepareExport;
+  env.prepareExport = async (start, end) => {
+    entered.resolve();
+    await releaseTrim.promise;
+    return prepare(start, end);
+  };
+  env.download = async () => { pickerOpened.resolve(); return dialog.promise; };
+  const saving = env.controller.handle({ type: 'SAVE_RANGE', startSeconds: 2, endSeconds: 8 });
+  await entered.promise;
+  const busy = await env.controller.handle({ type: 'STATUS' });
+  assert.equal(busy.ok, true);
+  assert.equal(busy.state.status, 'trimming');
+  assert.deepEqual(busy.state.result, recordedFile);
+  assert.equal(events(env, 'download').length, 0);
+  releaseTrim.resolve();
+  await pickerOpened.promise;
+  const pending = await env.controller.handle({ type: 'STATUS' });
+  assert.equal(pending.state.status, 'ready');
+  assert.equal(pending.state.download.status, 'pending');
+  assert.equal(pending.state.download.id, null);
+  assert.ok(pending.state.exportResult.url);
+  env.items.set(93, { id: 93, state: 'complete' });
+  dialog.resolve(93);
+  assert.equal((await saving).state.download.status, 'complete');
+});
+
+test('a pending download blocks SAVE_RANGE before any trim is started', async () => {
+  const env = browser({ status: 'ready', download: { id: 91, status: 'pending', error: null } });
+  env.items.set(91, { id: 91, state: 'in_progress' });
+  const reply = await env.controller.handle({ type: 'SAVE_RANGE', startSeconds: 0, endSeconds: 5 });
+  assert.equal(reply.ok, false);
+  assert.equal(messages(env, 'PREPARE_EXPORT').length, 0);
+  assert.equal(events(env, 'download').length, 0);
+  assert.deepEqual(reply.state.result, recordedFile);
+});
+
+test('a recreated worker recovers a cancelled clip picker without losing the clip or selection', async () => {
+  const env = browser({ status: 'ready', download: { id: null, status: 'pending', error: null } });
+  const range = { startSeconds: 1, endSeconds: 5 };
+  const clip = await env.prepareExport(range.startSeconds, range.endSeconds);
+  env.state.selection = structuredClone(range);
+  env.state.exportResult = structuredClone(clip);
+  const restarted = createController(env.api);
+  const status = await restarted.handle({ type: 'STATUS' });
+  assert.equal(status.state.download.status, 'interrupted');
+  assert.deepEqual(status.state.result, recordedFile);
+  assert.deepEqual(status.state.exportResult, clip);
+  assert.deepEqual(status.state.selection, range);
+  env.items.set(91, { id: 91, state: 'complete' });
+  const saved = await restarted.handle({ type: 'SAVE_RANGE', ...range });
+  assert.equal(saved.ok, true);
+  assert.equal(saved.state.download.status, 'complete');
+  assert.deepEqual(events(env, 'download')[0].data, {
+    url: clip.url, filename: clip.filename, saveAs: true, conflictAction: 'uniquify',
+  });
 });

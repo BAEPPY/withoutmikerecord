@@ -69,8 +69,34 @@
           </button>
         </div>
         <div class="ready-controls" id="ready-controls" hidden>
-          <button class="button primary" id="save-button" type="button">파일 저장 · .mp4</button>
-          <button class="button secondary" id="discard-button" type="button">새 녹음</button>
+          <section class="trim-editor" aria-labelledby="trim-title">
+            <h2 id="trim-title">듣고, 원하는 구간만 저장하기</h2>
+            <audio id="audio-preview" controls preload="metadata" aria-label="녹음 미리 듣기"></audio>
+            <p class="trim-note" id="trim-unavailable" hidden>이 녹음의 길이를 확인할 수 없어 구간을 자를 수 없어요. 전체 파일은 저장할 수 있어요.</p>
+            <div class="trim-fields">
+              <div>
+                <label for="trim-start">시작 (초)</label>
+                <input id="trim-start" type="number" min="0" step="0.01" inputmode="decimal" aria-describedby="trim-summary trim-error" />
+                <button class="position-button" id="set-trim-start" type="button">현재 위치를 시작으로</button>
+              </div>
+              <div>
+                <label for="trim-end">끝 (초)</label>
+                <input id="trim-end" type="number" min="0" step="0.01" inputmode="decimal" aria-describedby="trim-summary trim-error" />
+                <button class="position-button" id="set-trim-end" type="button">현재 위치를 끝으로</button>
+              </div>
+            </div>
+            <div class="trim-preview-row">
+              <p id="trim-summary" class="trim-summary" role="status" aria-live="polite"></p>
+              <button class="button secondary preview-button" id="preview-range" type="button">선택 구간 듣기</button>
+            </div>
+            <p id="trim-error" class="trim-error" role="alert" hidden></p>
+            <p class="trim-note trim-precision">저장 구간의 시작·끝은 약 0.1초 차이가 날 수 있어요.</p>
+          </section>
+          <button class="button primary" id="save-range-button" type="button">선택 구간 저장 · .mp4</button>
+          <div class="save-row">
+            <button class="button secondary" id="save-button" type="button">전체 저장 · .mp4</button>
+            <button class="button secondary" id="discard-button" type="button">새 녹음</button>
+          </div>
         </div>
         <p class="control-hint" id="control-hint">먼저 페이지에서 소리를 재생해 주세요.</p>
       </div>

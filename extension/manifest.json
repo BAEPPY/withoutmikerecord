@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Without Mike · 탭 소리 녹음",
-  "version": "1.0.0",
-  "description": "마이크 없이 현재 탭의 소리만 녹음하고 MP4 오디오 파일로 저장하세요.",
+  "version": "1.1.0",
+  "description": "마이크 없이 탭 소리를 녹음하고 원하는 구간을 잘라 MP4 오디오 파일로 저장하세요.",
   "minimum_chrome_version": "128",
   "permissions": ["activeTab", "tabCapture", "offscreen", "downloads"],
   "background": { "service_worker": "background.js", "type": "module" },

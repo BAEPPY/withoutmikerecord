@@ -1,3 +1,5 @@
+import { inspectMp4, trimMp4 } from './mp4-trim.js';
+
 export const MAX_RECORDING_BYTES = 128 * 1024 * 1024;
 export const MAX_RECORDING_MS = 2 * 60 * 60 * 1000;
 
@@ -14,6 +16,8 @@ function initialState() {
     error: null,
     notice: null,
     result: null,
+    selection: null,
+    exportResult: null,
     download: { id: null, status: 'idle', error: null },
   };
 }
@@ -57,6 +61,10 @@ export class TabAudioRecorder {
     this.maxBytes = options.maxBytes ?? MAX_RECORDING_BYTES;
     this.maxDurationMs = options.maxDurationMs ?? MAX_RECORDING_MS;
     this.onStateChange = options.onStateChange ?? (() => {});
+    this.inspectMp4 = options.inspectMp4 ?? inspectMp4;
+    this.trimMp4 = options.trimMp4 ?? trimMp4;
+    this.originalBlob = null;
+    this.exportRange = null;
 
     this.state = initialState();
     this.operations = Promise.resolve();
@@ -95,6 +103,8 @@ export class TabAudioRecorder {
       elapsedMs: this.elapsedMs(),
       level,
       result: this.state.result ? { ...this.state.result } : null,
+      selection: this.state.selection ? { ...this.state.selection } : null,
+      exportResult: this.state.exportResult ? { ...this.state.exportResult } : null,
       download: { ...this.state.download },
     };
   }
@@ -103,6 +113,9 @@ export class TabAudioRecorder {
     // Status polling must remain responsive while capture or finalization waits.
     if (message.type === 'STATUS') {
       return Promise.resolve({ ok: true, state: this.getState() });
+    }
+    if (this.state.status === 'trimming') {
+      return Promise.resolve({ ok: false, error: '선택 구간을 만드는 중이에요. 잠시 기다려 주세요.', state: this.getState() });
     }
     const operation = this.operations.then(async () => {
       try {
@@ -125,6 +138,12 @@ export class TabAudioRecorder {
             break;
           case 'DOWNLOAD_UPDATE':
             this.updateDownload(message.download);
+            break;
+          case 'SET_SELECTION':
+            this.setSelection(message);
+            break;
+          case 'PREPARE_EXPORT':
+            await this.prepareExport(message);
             break;
           default:
             throw new Error('지원하지 않는 녹음 요청입니다.');
@@ -307,18 +326,32 @@ export class TabAudioRecorder {
     }
   }
 
-  finalize() {
+  async finalize() {
     if (this.finalizing) return;
     this.finalizing = true;
     this.freezeElapsed();
     const mimeType = this.mediaRecorder?.mimeType || this.recordingMimeType;
     this.disposeMedia();
+    this.state.status = 'stopping';
+    this.emit();
     try {
       const blob = new this.Blob(this.chunks, { type: mimeType });
+      this.chunks = [];
       if (!blob.size) throw new Error('녹음된 데이터가 없습니다. 페이지에서 소리를 재생한 뒤 다시 녹음해 주세요.');
+      let durationSeconds = null;
+      let trimError = null;
+      try {
+        const metadata = await this.inspectMp4(blob);
+        if (!Number.isFinite(metadata.durationSeconds) || metadata.durationSeconds <= 0) throw new Error('Invalid duration');
+        durationSeconds = metadata.durationSeconds;
+      } catch {
+        trimError = '이 파일의 구간 정보를 읽지 못했어요. 전체 녹음은 그대로 저장할 수 있어요.';
+      }
       const filename = recordingFilename(this.state.tab?.title, this.wallNow());
       const url = this.url.createObjectURL(blob);
-      this.state.result = { url, filename, mimeType, bytes: blob.size };
+      this.originalBlob = blob;
+      this.state.result = { url, filename, mimeType, bytes: blob.size, durationSeconds, trimError };
+      this.state.selection = durationSeconds ? { startSeconds: 0, endSeconds: durationSeconds } : null;
       this.state.bytes = blob.size;
       this.state.status = 'ready';
       this.chunks = [];
@@ -327,6 +360,57 @@ export class TabAudioRecorder {
       this.emit();
     } catch (error) {
       this.fail(error);
+    }
+  }
+
+  validateSelection({ startSeconds, endSeconds }) {
+    if (this.state.status !== 'ready' || !this.state.result || !this.originalBlob) {
+      throw new Error('녹음을 끝낸 뒤 구간을 선택해 주세요.');
+    }
+    if (this.state.download.status === 'pending') throw new Error('파일 저장이 끝난 뒤 구간을 변경해 주세요.');
+    const duration = this.state.result.durationSeconds;
+    if (!Number.isFinite(duration) || duration <= 0) throw new Error('구간 정보를 읽지 못했어요. 전체 저장을 사용해 주세요.');
+    if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || startSeconds < 0 ||
+        endSeconds <= startSeconds || endSeconds > duration) {
+      throw new Error('시작과 끝을 녹음 길이 안에서 입력해 주세요. 끝은 시작보다 뒤여야 해요.');
+    }
+    return { startSeconds, endSeconds };
+  }
+
+  setSelection(message) {
+    this.state.selection = this.validateSelection(message);
+    this.emit();
+  }
+
+  async prepareExport(message) {
+    const selection = this.validateSelection(message);
+    this.state.selection = selection;
+    if (this.state.exportResult && this.exportRange?.startSeconds === selection.startSeconds &&
+        this.exportRange?.endSeconds === selection.endSeconds) {
+      this.emit();
+      return;
+    }
+    this.state.status = 'trimming';
+    this.emit();
+    try {
+      const clip = await this.trimMp4(this.originalBlob, selection.startSeconds, selection.endSeconds);
+      if (!clip.blob?.size || !Number.isFinite(clip.durationSeconds) || clip.durationSeconds <= 0) {
+        throw new Error('선택한 구간의 파일을 만들지 못했어요. 다른 구간으로 다시 시도해 주세요.');
+      }
+      const url = this.url.createObjectURL(clip.blob);
+      const suffix = `${selection.startSeconds.toFixed(2)}-${selection.endSeconds.toFixed(2)}s`;
+      const previousUrl = this.state.exportResult?.url;
+      this.state.exportResult = {
+        url, filename: this.state.result.filename.replace(/\.mp4$/i, `-clip-${suffix}.mp4`),
+        mimeType: clip.blob.type || this.state.result.mimeType, bytes: clip.blob.size,
+        durationSeconds: clip.durationSeconds, startSeconds: clip.startSeconds, endSeconds: clip.endSeconds,
+      };
+      this.exportRange = { ...selection };
+      if (previousUrl) this.url.revokeObjectURL(previousUrl);
+    } finally {
+      // A trim failure leaves the original and the previous export available.
+      this.state.status = 'ready';
+      this.emit();
     }
   }
 
@@ -356,6 +440,9 @@ export class TabAudioRecorder {
       throw new Error('파일 저장이 끝난 뒤 녹음을 지울 수 있습니다.');
     }
     if (this.state.result?.url) this.url.revokeObjectURL(this.state.result.url);
+    if (this.state.exportResult?.url) this.url.revokeObjectURL(this.state.exportResult.url);
+    this.originalBlob = null;
+    this.exportRange = null;
     this.disposeMedia();
     this.chunks = [];
     this.recordedMs = 0;
