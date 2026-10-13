@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>탭 소리 녹음</title>
+    <link rel="stylesheet" href="popup.css" />
+    <script src="popup.js" defer></script>
+  </head>
+  <body>
+    <main class="app" aria-labelledby="app-title">
+      <header class="header">
+        <div class="brand-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M4 10v4m4-8v12m4-15v18m4-15v12m4-8v4" />
+          </svg>
+        </div>
+        <div>
+          <p class="eyebrow">WITHOUT MIKERECORD</p>
+          <h1 id="app-title">탭 소리 녹음</h1>
+        </div>
+        <span class="local-badge">LOCAL</span>
+      </header>
+
+      <p class="intro">마이크 없이, 현재 탭에서 재생되는 소리만.</p>
+
+      <section class="recorder" aria-label="녹음 상태">
+        <div class="recorder-top">
+          <p class="status-pill" id="status-pill" data-status="loading">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="status-label" role="status" aria-live="polite">상태 확인 중</span>
+          </p>
+          <span class="format-tag">MP4 / AUDIO</span>
+        </div>
+        <p class="timer" id="timer" aria-label="녹음 시간 0분 0초">00:00</p>
+        <p class="timer-caption" id="timer-caption">녹음할 탭에서 시작해 주세요</p>
+        <div class="level" aria-hidden="true">
+          <div class="level-fill" id="level-fill"></div>
+        </div>
+        <div class="recorder-bottom">
+          <span id="level-label">오디오 대기 중</span>
+          <span id="file-size">0 B</span>
+        </div>
+      </section>
+
+      <section class="source" aria-label="녹음 대상">
+        <svg class="source-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <rect x="3" y="4" width="18" height="16" rx="3" />
+          <path d="M3 9h18M6 6.5h.01M9 6.5h.01" stroke-linecap="round" />
+        </svg>
+        <div class="source-text">
+          <p class="source-label">녹음 대상 탭</p>
+          <p class="source-title" id="source-title">시작할 때 열려 있는 탭</p>
+        </div>
+      </section>
+
+      <div class="message error-message" id="error-message" role="alert" hidden></div>
+      <p class="message notice-message" id="notice-message" role="status" aria-live="polite" hidden></p>
+
+      <div class="controls" aria-label="녹음 제어">
+        <button class="button primary" id="start-button" type="button" disabled>
+          <span class="record-icon" aria-hidden="true"></span>
+          <span id="start-label">녹음 시작</span>
+        </button>
+        <div class="button-row" id="recording-controls" hidden>
+          <button class="button secondary" id="pause-button" type="button">일시 정지</button>
+          <button class="button stop" id="stop-button" type="button">
+            <span class="stop-icon" aria-hidden="true"></span>녹음 끝내기
+          </button>
+        </div>
+        <div class="ready-controls" id="ready-controls" hidden>
+          <button class="button primary" id="save-button" type="button">파일 저장 · .mp4</button>
+          <button class="button secondary" id="discard-button" type="button">새 녹음</button>
+        </div>
+        <p class="control-hint" id="control-hint">먼저 페이지에서 소리를 재생해 주세요.</p>
+      </div>
+
+      <footer class="footer">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true">
+          <rect x="3.5" y="7" width="9" height="7" rx="2" />
+          <path d="M5.5 7V4a2.5 2.5 0 0 1 5 0v3" />
+        </svg>
+        <span>마이크 접근 없음 · 서버 전송 없음</span>
+      </footer>
+    </main>
+  </body>
+</html>
