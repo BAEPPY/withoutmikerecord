@@ -32,6 +32,7 @@ button, p, h1 { margin: 0; }
 h1 { font-size: 19px; font-weight: 750; letter-spacing: -.7px; }
 .local-badge { margin-left: auto; font-size: 9px; letter-spacing: 1px; color: #a7c5c3; }
 .intro { margin-top: 17px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.extract-file-button { margin-top: 14px; min-height: 38px; border-color: #345b58; color: #bdf9eb; }
 
 .recorder {
   margin-top: 18px;

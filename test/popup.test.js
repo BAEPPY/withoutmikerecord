@@ -46,11 +46,13 @@ class Element {
   load() { this.currentTime = 0; }
 }
 
-async function popup({ initialState = idle(), assignments = [], assignmentError = false, userAgent = 'Chrome/135' } = {}) {
+async function popup({ initialState = idle(), assignments = [], assignmentError = false, armError = '', userAgent = 'Chrome/135' } = {}) {
   const elements = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => [match[1], new Element(match[1])]));
   const listeners = {};
   const env = { state: initialState, sent: [], closed: 0, tabs: [], assignmentReads: 0, elements, fetched: [], copied: [] };
-  env.respond = async () => ({ ok: true, state: structuredClone(env.state) });
+  env.respond = async (message) => message.type === 'ARM_SHORTCUTS' && armError
+    ? { ok: false, error: armError } : { ok: true, state: structuredClone(env.state) };
+  env.createTab = async (options) => { env.tabs.push(structuredClone(options)); };
   env.fetch = async (url) => { env.fetched.push(url); return { ok: true, blob: async () => new Blob(['GIF89a'], { type: 'image/gif' }) }; };
   env.copyGif = async (blob) => { env.copied.push(blob); return { mode: 'html-gif' }; };
   for (const id of ['pause-button', 'stop-button']) elements.get(id).parent = elements.get('recording-controls');
@@ -68,13 +70,16 @@ async function popup({ initialState = idle(), assignments = [], assignmentError 
     window: { setTimeout() {}, requestAnimationFrame() {}, cancelAnimationFrame() {},
       addEventListener() {}, close() { env.closed += 1; }, confirm() { return true; } },
     chrome: {
-      runtime: { async sendMessage(message) { env.sent.push(structuredClone(message)); return env.respond(message); } },
+      runtime: {
+        async sendMessage(message) { env.sent.push(structuredClone(message)); return env.respond(message); },
+        getURL(path) { return `chrome-extension://test/${path}`; },
+      },
       commands: { async getAll() {
         env.assignmentReads += 1;
         if (assignmentError) throw new Error('Could not read commands');
         return assignments;
       } },
-      tabs: { async create(options) { env.tabs.push(structuredClone(options)); } },
+      tabs: { create: (options) => env.createTab(options) },
     },
   });
   env.press = (key, overrides = {}) => {
@@ -668,4 +673,40 @@ test('content extraction locks its choice, shows progress and preserves it after
   assert.equal(reopening.elements.get('save-content').value, 'video');
   assert.equal(reopening.elements.get('save-content').disabled, true);
   assert.equal(reopening.text('status-label'), '무음 영상 만드는 중 52%');
+});
+
+test('file extraction opens independently of unsupported pages, unsaved results and pending recorder commands', async () => {
+  const env = await popup({ initialState: videoReady(), armError: '이 페이지에 연결할 수 없어요.' });
+  assert.match(env.text('shortcut-status'), /연결 불가/);
+  assert.equal(env.elements.get('open-extract-button').disabled, false);
+  env.click('open-extract-button');
+  await settle();
+  assert.deepEqual(env.tabs, [{ url: 'chrome-extension://test/extract.html' }]);
+  assert.equal(env.commands().length, 0);
+  assert.equal(env.elements.get('video-preview').src, 'blob:original-video');
+  const starting = await popup({ armError: '브라우저 설정 페이지예요.' });
+  const start = deferred();
+  starting.respond = () => start.promise;
+  starting.press('1');
+  starting.click('open-extract-button');
+  await settle();
+  assert.deepEqual(starting.tabs, [{ url: 'chrome-extension://test/extract.html' }]);
+  assert.deepEqual(starting.commands().map(({ type }) => type), ['START']);
+  start.resolve({ ok: true, state: { ...idle(), status: 'recording' } });
+  await settle();
+});
+
+test('opening the file extractor deduplicates clicks and recovers from tab creation failure', async () => {
+  const env = await popup();
+  const opening = deferred();
+  let attempts = 0;
+  env.createTab = async () => { attempts += 1; return opening.promise; };
+  env.click('open-extract-button');
+  env.click('open-extract-button');
+  assert.equal(attempts, 1);
+  opening.reject(new Error('Could not open tab'));
+  await settle();
+  assert.equal(env.elements.get('open-extract-button').disabled, false);
+  assert.match(env.text('error-message'), /추출 창을 열지 못/);
+  assert.equal(env.elements.get('start-button').disabled, false);
 });

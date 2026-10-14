@@ -15,6 +15,7 @@ const ui = {
   error: byId("error-message"),
   notice: byId("notice-message"),
   start: byId("start-button"),
+  openExtract: byId("open-extract-button"),
   startVideo: byId("start-video-button"),
   startLabel: byId("start-label"),
   recordingControls: byId("recording-controls"),
@@ -567,6 +568,18 @@ async function poll() {
 
 ui.start.addEventListener("click", () => {
   if (state.status === "idle" || state.status === "error") void command("START");
+});
+ui.openExtract.addEventListener("click", async () => {
+  if (ui.openExtract.disabled) return;
+  ui.openExtract.disabled = true;
+  try {
+    await chrome.tabs.create({ url: chrome.runtime.getURL("extract.html") });
+  } catch {
+    commandError = "소리 추출 창을 열지 못했어요. 다시 시도해 주세요.";
+    render();
+  } finally {
+    ui.openExtract.disabled = false;
+  }
 });
 ui.startVideo.addEventListener("click", () => {
   if (state.status !== "idle" && state.status !== "error") return;
