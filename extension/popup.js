@@ -26,6 +26,12 @@ const ui = {
   saveFormat: byId("save-format"),
   saveFormatField: byId("save-format-field"),
   saveRange: byId("save-range-button"),
+  rangeSaveRow: byId("range-save-row"),
+  saveRow: byId("save-row"),
+  copyGif: byId("copy-gif-button"),
+  copyRangeGif: byId("copy-range-gif-button"),
+  copyStatus: byId("copy-status"),
+  cancelExport: byId("cancel-export-button"),
   audio: byId("audio-preview"),
   video: byId("video-preview"),
   videoNote: byId("video-note"),
@@ -77,7 +83,12 @@ let previewUrl = "";
 let previewKind = "audio";
 let previewEnd = null;
 let previewFrame = null;
+let previewVersion = 0;
 let selectionVersion = 0;
+let cancellingExport = false;
+let copyingScope = null;
+let copyStatus = "";
+let copyMode = "";
 let shortcutConnection = "pending";
 let shortcutDetail = "";
 
@@ -160,7 +171,19 @@ function activePreview() {
 
 function trimAvailable() {
   const duration = durationSeconds();
-  return !videoResult() && duration !== null && duration >= 0.01;
+  return duration !== null && duration >= 0.01;
+}
+
+function exporting() {
+  return state.status === "trimming" || state.status === "exporting";
+}
+
+function exportPercent() {
+  return Math.floor(Math.max(0, Math.min(1, Number(state.exportProgress) || 0)) * 100);
+}
+
+function rangePreviewLabel() {
+  return videoResult() ? "선택 구간 보기" : "선택 구간 듣기";
 }
 
 function readSelection() {
@@ -177,7 +200,14 @@ function readSelection() {
   return { startSeconds, endSeconds, error: "" };
 }
 
+function selectedExportError(selection) {
+  return videoResult() && ui.saveFormat.value !== "gif" && !selection.error && trimAvailable()
+    && selection.endSeconds - selection.startSeconds < 0.04 - 1e-9
+    ? "영상 MP4 구간은 0.04초 이상 선택해 주세요. 더 짧은 구간은 GIF로 저장할 수 있어요." : "";
+}
+
 function stopRangePreview(pauseAudio = true) {
+  previewVersion += 1;
   previewEnd = null;
   if (previewFrame !== null) window.cancelAnimationFrame(previewFrame);
   previewFrame = null;
@@ -185,16 +215,17 @@ function stopRangePreview(pauseAudio = true) {
     ui.audio.pause();
     ui.video.pause();
   }
-  setText(ui.previewRange, "선택 구간 듣기");
+  setText(ui.previewRange, rangePreviewLabel());
   renderPreviewPosition();
 }
 
 function checkRangePreview() {
   if (previewEnd === null) return;
-  if (ui.audio.currentTime >= previewEnd) {
+  const media = activePreview();
+  if (media.currentTime >= previewEnd) {
     const end = previewEnd;
     stopRangePreview();
-    ui.audio.currentTime = end;
+    media.currentTime = end;
   }
 }
 
@@ -223,13 +254,16 @@ function renderEditor() {
   ui.audio.hidden = video;
   ui.video.hidden = !video;
   ui.videoNote.hidden = !video;
-  ui.audioTrimControls.hidden = video;
-  ui.saveRange.hidden = video;
+  ui.audioTrimControls.hidden = false;
+  ui.saveRange.hidden = false;
   ui.saveFormatField.hidden = !video;
-  setText(ui.trimTitle, video ? "녹화 영상 미리 보기" : "듣고, 원하는 구간만 저장하기");
+  setText(ui.trimTitle, video ? "보고, 원하는 구간만 저장하기" : "듣고, 원하는 구간만 저장하기");
+  if (previewEnd === null) setText(ui.previewRange, rangePreviewLabel());
   ui.previewPosition.setAttribute("aria-label", video ? "영상 현재 위치와 전체 길이" : "미리 듣기 현재 위치와 전체 길이");
   if (url !== previewUrl || kind !== previewKind) {
     stopRangePreview();
+    copyStatus = "";
+    copyMode = "";
     previewUrl = url;
     previewKind = kind;
     selectionVersion += 1;
@@ -244,17 +278,18 @@ function renderEditor() {
     const selection = state.selection || {};
     const validSavedSelection = Number.isFinite(selection.startSeconds) && Number.isFinite(selection.endSeconds)
       && selection.startSeconds >= 0 && selection.endSeconds > selection.startSeconds && selection.endSeconds <= duration;
-    ui.trimStart.value = duration === null || video ? "" : floorHundredths(validSavedSelection ? selection.startSeconds : 0).toFixed(2);
-    ui.trimEnd.value = duration === null || video ? "" : floorHundredths(validSavedSelection ? selection.endSeconds : duration).toFixed(2);
+    ui.trimStart.value = duration === null ? "" : floorHundredths(validSavedSelection ? selection.startSeconds : 0).toFixed(2);
+    ui.trimEnd.value = duration === null ? "" : floorHundredths(validSavedSelection ? selection.endSeconds : duration).toFixed(2);
   }
   const duration = durationSeconds();
   const available = trimAvailable();
   const selection = readSelection();
+  const exportError = selectedExportError(selection);
   const locked = busy || state.status !== "ready" || state.download?.status === "pending";
   ui.trimUnavailable.hidden = available;
   setText(ui.trimUnavailable, duration === null
-    ? "이 녹음의 길이를 확인할 수 없어 구간을 자를 수 없어요. 전체 파일은 저장할 수 있어요."
-    : "녹음이 0.01초보다 짧아 구간을 나눌 수 없어요. 전체 파일을 저장해 주세요.");
+    ? "파일 길이를 확인할 수 없어 구간을 자를 수 없어요. 전체 파일은 저장할 수 있어요."
+    : "파일이 0.01초보다 짧아 구간을 나눌 수 없어요. 전체 파일을 저장해 주세요.");
   ui.trimStart.disabled = locked || !available;
   ui.trimEnd.disabled = locked || !available;
   ui.setTrimStart.disabled = locked || !available;
@@ -264,11 +299,25 @@ function renderEditor() {
   ui.trimStart.setAttribute("aria-invalid", String(Boolean(selection.error)));
   ui.trimEnd.setAttribute("aria-invalid", String(Boolean(selection.error)));
   ui.previewRange.disabled = locked || !available || Boolean(selection.error);
-  ui.saveRange.disabled = locked || !available || Boolean(selection.error);
-  setText(ui.trimError, selection.error);
-  ui.trimError.hidden = !selection.error;
+  ui.saveRange.disabled = locked || !available || Boolean(selection.error || exportError);
+  setText(ui.trimError, selection.error || exportError);
+  ui.trimError.hidden = !(selection.error || exportError);
   setText(ui.trimSummary, !available ? "구간 편집 불가" : selection.error ? `전체 ${floorHundredths(duration).toFixed(2)}초` : `선택 ${(selection.endSeconds - selection.startSeconds).toFixed(2)}초 / 전체 ${floorHundredths(duration).toFixed(2)}초`);
-  setText(ui.saveRange, state.status === "trimming" ? "구간 만드는 중…" : "선택 구간 저장 · .mp4");
+  const format = video && ui.saveFormat.value === "gif" ? "gif" : "mp4";
+  const showCopy = video && format === "gif";
+  ui.rangeSaveRow.dataset.copy = String(showCopy);
+  ui.saveRow.dataset.copy = String(showCopy);
+  ui.copyGif.hidden = !showCopy;
+  ui.copyRangeGif.hidden = !showCopy;
+  ui.copyGif.disabled = locked || !state.result;
+  ui.copyRangeGif.disabled = locked || !available || Boolean(selection.error);
+  setText(ui.copyGif, copyingScope === "whole" ? "복사 준비 중…" : "전체 GIF 복사");
+  setText(ui.copyRangeGif, copyingScope === "range" ? "복사 준비 중…" : "선택 GIF 복사");
+  setText(ui.copyStatus, copyStatus);
+  ui.copyStatus.hidden = !showCopy || !copyStatus;
+  ui.copyStatus.dataset.mode = copyMode;
+  setText(ui.saveRange, state.status === "trimming" ? video ? `선택 구간 만드는 중 ${exportPercent()}%` : "선택 구간 만드는 중…"
+    : state.status === "exporting" && activeCommand === "SAVE_VIDEO_RANGE" ? `선택 GIF 만드는 중 ${exportPercent()}%` : `선택 구간 저장 · .${format}`);
   renderPreviewPosition();
 }
 
@@ -292,8 +341,8 @@ function render() {
   setText(ui.timer, time);
   ui.timer.setAttribute("aria-label", `${video ? "녹화" : "녹음"} 시간 ${time}`);
   ui.statusPill.dataset.status = status;
-  const exportPercent = Math.floor(Math.max(0, Math.min(1, Number(state.exportProgress) || 0)) * 100);
-  const statusLabel = video ? { starting: "녹화 준비 중", recording: "영상 녹화 중", ready: "녹화 완료", error: "녹화 확인 필요", exporting: `GIF 만드는 중 ${exportPercent}%` }[status] : null;
+  const progress = exportPercent();
+  const statusLabel = video ? { starting: "녹화 준비 중", recording: "영상 녹화 중", ready: "녹화 완료", error: "녹화 확인 필요", trimming: `영상 구간 만드는 중 ${progress}%`, exporting: `GIF 만드는 중 ${progress}%` }[status] : null;
   setText(ui.statusLabel, statusLabel || statusLabels[status] || "상태 확인 중");
   setText(ui.formatTag, video ? "MP4 / VIDEO + AUDIO" : "MP4 / AUDIO");
   setText(ui.timerCaption, selecting ? "페이지에서 녹화할 사각형 영역을 드래그해 주세요" : recording ? `팝업을 닫아도 계속 ${video ? "녹화" : "녹음"}돼요` : paused ? "잠시 쉬는 중 · 정지한 시간은 제외돼요" : ready ? `${video ? "녹화" : "녹음"} 파일을 기기에 저장하세요` : status === "stopping" ? "MP4 파일을 정리하고 있어요" : "녹음할 탭에서 시작해 주세요");
@@ -321,11 +370,16 @@ function render() {
   ui.readyControls.hidden = !ready;
   ui.save.disabled = busy || pending || status !== "ready" || !state.result;
   ui.saveFormat.disabled = busy || pending || status !== "ready";
+  if (exporting() && ["mp4", "gif"].includes(state.exportFormat)) ui.saveFormat.value = state.exportFormat;
+  ui.cancelExport.hidden = !exporting();
+  ui.cancelExport.disabled = cancellingExport;
+  setText(ui.cancelExport, cancellingExport ? "처리 중지 중…" : "처리 중지 · 원본 유지");
   ui.discard.disabled = busy || pending || status !== "ready";
   setText(ui.discard, videoResult() ? "새 녹화" : "새 녹음");
-  ui.save.classList.toggle("primary", videoResult());
-  ui.save.classList.toggle("secondary", !videoResult());
-  setText(ui.save, status === "exporting" ? `GIF 만드는 중 ${exportPercent}%` : videoResult() ? ui.saveFormat.value === "gif" ? "GIF 저장 · 소리 없음" : "영상 저장 · .mp4" : "전체 저장 · .mp4");
+  ui.save.classList.toggle("primary", !trimAvailable());
+  ui.save.classList.toggle("secondary", trimAvailable());
+  const format = videoResult() && ui.saveFormat.value === "gif" ? "gif" : "mp4";
+  setText(ui.save, status === "exporting" && activeCommand === "SAVE_VIDEO" ? `전체 GIF 만드는 중 ${progress}%` : `전체 저장 · .${format}`);
   setText(ui.hint, queuedStop ? "종료 요청을 기억했어요. 진행 중인 준비가 끝나면 바로 종료해요." : selecting ? "이 창을 닫고 페이지에서 영역을 선택하면 녹화가 시작돼요." : ready ? pending ? "저장이 끝날 때까지 파일을 보관해요." : complete ? "저장 완료 · 새 녹음을 시작할 수 있어요." : "브라우저를 닫기 전에 파일을 저장해 주세요." : recording || paused ? video ? "선택 영역 영상과 현재 탭 소리를 함께 녹화해요." : "현재 탭만 녹음해요 · 최대 2시간 또는 128 MB" : starting ? "잠시만 기다려 주세요. 준비 중에도 종료할 수 있어요." : transitional ? "잠시만 기다려 주세요." : "소리만 녹음하거나, 영역을 선택해 영상으로 저장하세요.");
 
   const error = commandError || connectionError || state.error || (interrupted ? download.error || "다운로드가 중단됐어요. 저장을 다시 시도해 주세요." : "");
@@ -389,7 +443,7 @@ async function loadShortcutAssignments() {
   }
 }
 
-async function command(type, payload = {}) {
+async function command(type, payload = {}, afterSuccess = null) {
   if (busy) return;
   const operationId = ["START", "OPEN_VIDEO_SELECTOR", "PAUSE", "RESUME"].includes(type) ? crypto.randomUUID() : null;
   busy = true;
@@ -398,12 +452,20 @@ async function command(type, payload = {}) {
   commandVersion += 1;
   commandError = "";
   connectionError = "";
+  if (type !== "PREPARE_GIF_COPY") {
+    copyStatus = "";
+    copyMode = "";
+  }
   render();
   let successful = false;
   try {
     const response = await request(type, operationId ? { ...payload, operationId } : payload);
     if (response.state) state = response.state;
-    if (!response.ok) commandError = response.error || "요청을 처리하지 못했어요. 다시 시도해 주세요.";
+    if (!response.ok && !response.cancelled) commandError = response.error || "요청을 처리하지 못했어요. 다시 시도해 주세요.";
+    if (response.ok && afterSuccess) {
+      render();
+      await afterSuccess(response);
+    }
     successful = response.ok;
   } catch (error) {
     commandError = error.message || "요청을 처리하지 못했어요. 팝업을 다시 열어 주세요.";
@@ -428,16 +490,21 @@ async function command(type, payload = {}) {
 
 function selectionChanged() {
   stopRangePreview();
+  const version = ++selectionVersion;
+  if (!copyingScope) {
+    copyStatus = "";
+    copyMode = "";
+  }
   const selection = readSelection();
   renderEditor();
   if (!trimAvailable() || selection.error || busy || state.status !== "ready" || state.download?.status === "pending") return;
-  const version = ++selectionVersion;
+  const commandAtSend = commandVersion;
   const url = previewUrl;
   const { startSeconds, endSeconds } = selection;
   // Persist each valid edit immediately so closing the popup keeps the selection.
   // STATUS responses never overwrite the in-progress input values.
   void request("SET_SELECTION", { startSeconds, endSeconds }).then((response) => {
-    if (version !== selectionVersion || url !== previewUrl) return;
+    if (version !== selectionVersion || url !== previewUrl || commandAtSend !== commandVersion) return;
     if (!response.ok) commandError = response.error || "선택 구간을 기억하지 못했어요. 다시 입력해 주세요.";
     else {
       commandError = "";
@@ -445,7 +512,7 @@ function selectionChanged() {
     }
     render();
   }).catch((error) => {
-    if (version !== selectionVersion || url !== previewUrl) return;
+    if (version !== selectionVersion || url !== previewUrl || commandAtSend !== commandVersion) return;
     commandError = error.message || "선택 구간을 기억하지 못했어요. 다시 입력해 주세요.";
     render();
   });
@@ -527,9 +594,67 @@ ui.shortcutSettings.addEventListener("click", async () => {
 });
 ui.saveRange.addEventListener("click", () => {
   const selection = readSelection();
-  if (busy || state.status !== "ready" || state.download?.status === "pending" || !trimAvailable() || selection.error) return;
+  if (busy || state.status !== "ready" || state.download?.status === "pending" || !trimAvailable() || selection.error || selectedExportError(selection)) return;
   stopRangePreview();
-  void command("SAVE_RANGE", { startSeconds: selection.startSeconds, endSeconds: selection.endSeconds });
+  const range = { startSeconds: selection.startSeconds, endSeconds: selection.endSeconds };
+  if (videoResult()) void command("SAVE_VIDEO_RANGE", { ...range, format: ui.saveFormat.value });
+  else void command("SAVE_RANGE", range);
+});
+async function copyGif(scope) {
+  if (busy || state.status !== "ready" || state.download?.status === "pending" || !videoResult() || ui.saveFormat.value !== "gif") return;
+  const selection = readSelection();
+  if (scope === "range" && (!trimAvailable() || selection.error)) return;
+  stopRangePreview();
+  copyingScope = scope;
+  copyStatus = "GIF를 준비하고 있어요. 복사가 끝날 때까지 이 창을 열어 두세요.";
+  copyMode = "";
+  const payload = scope === "range" ? { scope, startSeconds: selection.startSeconds, endSeconds: selection.endSeconds } : { scope };
+  const successful = await command("PREPARE_GIF_COPY", payload, async (response) => {
+    if (typeof response.output?.url !== "string" || typeof globalThis.__withoutMikeCopyGif !== "function") {
+      throw new Error("GIF 복사를 준비하지 못했어요. 팝업을 다시 열어 주세요.");
+    }
+    let blob;
+    try {
+      const file = await fetch(response.output.url);
+      if (!file.ok) throw new Error("GIF unavailable");
+      blob = await file.blob();
+    } catch {
+      throw new Error("GIF 파일을 불러오지 못했어요. 다시 복사해 주세요.");
+    }
+    const result = await globalThis.__withoutMikeCopyGif(blob);
+    if (!["native-gif", "html-gif"].includes(result?.mode)) throw new Error("GIF를 복사하지 못했어요. 파일로 저장해 첨부해 주세요.");
+    copyMode = result.mode;
+    copyStatus = result.mode === "html-gif"
+      ? "GIF 복사 완료 · 지원하는 문서·편집기에 붙여넣을 수 있어요. 메신저는 파일 첨부를 사용하세요."
+      : "GIF 복사 완료 · 일부 앱은 GIF 붙여넣기를 지원하지 않아요. 그때는 파일로 저장해 첨부하세요.";
+  });
+  copyingScope = null;
+  if (!successful) {
+    copyStatus = "";
+    copyMode = "";
+  }
+  render();
+}
+ui.copyGif.addEventListener("click", () => { void copyGif("whole"); });
+ui.copyRangeGif.addEventListener("click", () => { void copyGif("range"); });
+ui.cancelExport.addEventListener("click", async () => {
+  if (cancellingExport || !exporting()) return;
+  cancellingExport = true;
+  const version = commandVersion;
+  render();
+  try {
+    // Cancellation must reach the worker while the original export is pending.
+    const response = await request("CANCEL_EXPORT");
+    if (version === commandVersion) {
+      if (response.state) state = response.state;
+      if (!response.ok && !response.cancelled) commandError = response.error || "처리를 중지하지 못했어요. 다시 시도해 주세요.";
+    }
+  } catch (error) {
+    if (version === commandVersion) commandError = error.message || "처리를 중지하지 못했어요. 다시 시도해 주세요.";
+  } finally {
+    cancellingExport = false;
+    render();
+  }
 });
 ui.trimStart.addEventListener("input", selectionChanged);
 ui.trimEnd.addEventListener("input", selectionChanged);
@@ -544,12 +669,12 @@ for (const input of [ui.trimStart, ui.trimEnd]) {
   });
 }
 ui.setTrimStart.addEventListener("click", () => {
-  const position = Math.min(Math.max(0, ui.audio.currentTime), durationSeconds() || 0);
+  const position = Math.min(Math.max(0, activePreview().currentTime), durationSeconds() || 0);
   ui.trimStart.value = floorHundredths(position).toFixed(2);
   selectionChanged();
 });
 ui.setTrimEnd.addEventListener("click", () => {
-  const position = Math.min(ui.audio.currentTime, durationSeconds() || 0);
+  const position = Math.min(activePreview().currentTime, durationSeconds() || 0);
   ui.trimEnd.value = floorHundredths(position).toFixed(2);
   selectionChanged();
 });
@@ -560,19 +685,23 @@ ui.previewRange.addEventListener("click", async () => {
   }
   const selection = readSelection();
   if (busy || state.status !== "ready" || state.download?.status === "pending" || !trimAvailable() || selection.error) return;
+  const version = ++previewVersion;
   try {
-    ui.audio.currentTime = selection.startSeconds;
+    const media = activePreview();
+    media.currentTime = selection.startSeconds;
     previewEnd = selection.endSeconds;
-    await ui.audio.play();
+    await media.play();
+    if (version !== previewVersion) return;
     if (previewEnd === null || document.hidden) {
       stopRangePreview();
       return;
     }
-    setText(ui.previewRange, "구간 듣기 정지");
+    setText(ui.previewRange, videoResult() ? "구간 보기 정지" : "구간 듣기 정지");
     startPreviewClock();
   } catch {
+    if (version !== previewVersion) return;
     stopRangePreview();
-    commandError = "미리 듣기를 시작하지 못했어요. 다시 시도하거나 전체 파일을 저장해 주세요.";
+    commandError = "미리 재생을 시작하지 못했어요. 다시 시도하거나 전체 파일을 저장해 주세요.";
     render();
   }
 });

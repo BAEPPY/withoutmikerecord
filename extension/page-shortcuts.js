@@ -2,7 +2,7 @@
   'use strict';
 
   const installationKey = '__withoutMikePageShortcuts';
-  const installationVersion = 2;
+  const installationVersion = 3;
   const previous = globalThis[installationKey];
   try {
     if (previous?.version === installationVersion && previous.isAlive?.()) {
@@ -18,6 +18,8 @@
   let scheduledVideoStart = null;
   let videoRecording = false;
   let videoViewportWatch = null;
+  let videoControlsToken = null;
+  const finishedVideoTokens = new Set();
   let toastHost = null;
   let toastMessage = null;
   let toastTimer = null;
@@ -134,6 +136,7 @@
     try { globalThis.chrome?.runtime?.onMessage?.removeListener?.(onBackgroundMessage); }
     catch { /* An extension update can invalidate this API before cleanup. */ }
     removeVideoViewportWatch();
+    restoreVideoControls();
     cancelVideoSelection();
     removeToast();
     if (globalThis[installationKey] === installation) delete globalThis[installationKey];
@@ -216,6 +219,39 @@
       frame.removeEventListener('load', scheduleFrameRefresh);
       connectedFrames.delete(frame);
     }
+    globalThis.__withoutMikeYouTubeControls?.refresh?.();
+  }
+
+  async function hideVideoControls(selectionToken) {
+    if (!installation.active || finishedVideoTokens.has(selectionToken)) return;
+    videoControlsToken = selectionToken;
+    await globalThis.__withoutMikeYouTubeControls?.hide?.(selectionToken);
+  }
+
+  function restoreVideoControls(expectedToken = videoControlsToken) {
+    if (!expectedToken && !videoControlsToken) return;
+    if (expectedToken && videoControlsToken && expectedToken !== videoControlsToken) return;
+    globalThis.__withoutMikeYouTubeControls?.restore?.(expectedToken || undefined);
+    if (expectedToken) {
+      finishedVideoTokens.add(expectedToken);
+      if (finishedVideoTokens.size > 100) finishedVideoTokens.delete(finishedVideoTokens.values().next().value);
+    }
+    videoControlsToken = null;
+  }
+
+  function applyRecordingState(state, sessionToken) {
+    const token = state.videoSessionToken || state.selectionToken || sessionToken;
+    if (token && finishedVideoTokens.has(token)) return;
+    if (token && videoViewportWatch && token !== videoViewportWatch.selectionToken) return;
+    if (token && videoControlsToken && token !== videoControlsToken) return;
+    videoRecording = state.mode === 'video' && ['starting', 'recording', 'paused', 'stopping'].includes(state.status);
+    if (videoRecording) {
+      removeToast();
+      if (token) void hideVideoControls(token).catch(() => {});
+    } else if (state.status !== 'selecting') {
+      removeVideoViewportWatch();
+      restoreVideoControls(token);
+    }
   }
 
   function removeVideoViewportWatch(expected = videoViewportWatch) {
@@ -252,6 +288,7 @@
       // the same dimensions, so stop the scoped recording before detaching.
       signalGeometryChange();
       removeVideoViewportWatch(watch);
+      restoreVideoControls(selectionToken);
     };
     videoViewportWatch = watch;
     window.addEventListener('resize', watch.onResize, true);
@@ -267,19 +304,17 @@
       // A delayed resize/stop reply from an earlier recording must not remove
       // the new recording's watcher or make its page notifications visible.
       if (watchAtRequest !== videoViewportWatch && (watchAtRequest || videoViewportWatch)) return reply;
-      const replyToken = reply.state.videoSessionToken || reply.state.selectionToken;
-      if (videoViewportWatch && replyToken && replyToken !== videoViewportWatch.selectionToken) return reply;
-      videoRecording = reply.state.mode === 'video'
-        && ['starting', 'recording', 'paused', 'stopping'].includes(reply.state.status);
-      if (videoRecording) removeToast();
-      else removeVideoViewportWatch(watchAtRequest);
+      applyRecordingState(reply.state);
     }
     return reply;
   }
 
   function onBackgroundMessage(message, sender, respond) {
     if (sender.id !== chrome.runtime.id || sender.tab) return;
-    if (message.type === 'CANCEL_VIDEO_SELECTOR') {
+    if (message.type === 'RECORDING_STATE' && message.state) {
+      applyRecordingState(message.state, message.sessionToken);
+      respond({ ok: true });
+    } else if (message.type === 'CANCEL_VIDEO_SELECTOR') {
       const cancelled = cancelVideoSelection();
       respond({ ok: true, cancelled });
     } else if (message.type === 'SHOW_VIDEO_SELECTOR') {
@@ -309,6 +344,7 @@
       const stopped = await send({ target: 'background', type: 'PAGE_SHORTCUT', key: '4' });
       if (!stopped?.ok) throw new Error(stopped?.error || '녹화를 중지하지 못했어요. 4를 다시 눌러 주세요.');
       removeVideoViewportWatch();
+      restoreVideoControls();
       videoRecording = false;
       showToast('화면 녹화를 마쳤어요. 확장 아이콘을 눌러 파일을 저장해 주세요.');
       return;
@@ -338,6 +374,15 @@
       // The selector removes its dialog and waits two animation frames before
       // resolving. A success toast here would itself appear in the new video.
       selectionWatch = watchVideoViewport(selectionToken, region);
+      // Apply the YouTube control stylesheet before capture starts, then let it
+      // paint. The frozen selection screenshot itself stays unchanged.
+      await hideVideoControls(selectionToken);
+      if (cancelVideoRequested || selectionWatch.signalled) {
+        removeVideoViewportWatch(selectionWatch);
+        restoreVideoControls(selectionToken);
+        await cancel();
+        return;
+      }
       const started = await send({
         target: 'background', type: 'VIDEO_REGION_SELECTED', selectionToken, region,
       });
@@ -360,12 +405,14 @@
           return;
         }
         removeVideoViewportWatch(selectionWatch);
+        restoreVideoControls(selectionToken);
         videoRecording = false;
         showToast('화면 녹화를 마쳤어요. 확장 아이콘을 눌러 파일을 저장해 주세요.');
       }
     } catch (error) {
       if (!submitted) {
         removeVideoViewportWatch(selectionWatch);
+        restoreVideoControls(selectionToken);
         await cancel().catch(() => {});
       }
       throw error;
@@ -431,6 +478,7 @@
       if (key === '1' || key === '4') {
         videoRecording = false;
         removeVideoViewportWatch();
+        restoreVideoControls();
       }
       if (pendingKey === '1' && stopAfterStart) {
         stopAfterStart = false;

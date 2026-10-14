@@ -13,6 +13,9 @@ function harness(options = {}) {
   const urls = [];
   const revoked = [];
   const exports = [];
+  const exportSettings = [];
+  const inspections = [];
+  const trims = [];
   let elapsed = 0;
   class Track extends EventTarget {
     constructor(kind) { super(); this.kind = kind; this.stopped = false; }
@@ -77,8 +80,21 @@ function harness(options = {}) {
     },
     inspectMp4: () => { throw new Error('video must not use the audio-only parser'); },
     trimMp4: () => { throw new Error('video must not use the audio-only trimmer'); },
+    inspectVideo: async (blob) => {
+      inspections.push(blob);
+      return options.inspectVideo ? options.inspectVideo(blob)
+        : { durationSeconds: elapsed / 1000, width: 640, height: 360 };
+    },
+    trimVideo: async (blob, startSeconds, endSeconds, settings) => {
+      trims.push({ blob, startSeconds, endSeconds, settings });
+      if (options.trimVideo) return options.trimVideo(blob, startSeconds, endSeconds, settings);
+      settings.onProgress(1);
+      return { blob: new Blob(['trimmed-video'], { type: 'video/mp4;codecs=vp9,opus' }),
+        startSeconds, endSeconds, durationSeconds: endSeconds - startSeconds, width: 640, height: 360 };
+    },
     exportGif: async (blob, settings) => {
       exports.push(blob);
+      exportSettings.push(settings);
       if (options.exportGif) return options.exportGif(blob, settings);
       settings.onProgress(1);
       return { blob: new Blob(['GIF89a-frames'], { type: 'image/gif' }),
@@ -88,7 +104,7 @@ function harness(options = {}) {
     setInterval: () => 1, clearInterval() {},
     url: { createObjectURL: (blob) => { urls.push(blob); return `blob:test-${urls.length}`; }, revokeObjectURL: (url) => revoked.push(url) },
   });
-  return { engine, audio, video, cropped, captures, crops, recorders, urls, revoked, exports,
+  return { engine, audio, video, cropped, captures, crops, recorders, urls, revoked, exports, exportSettings, inspections, trims,
     advance: (ms) => { elapsed += ms; },
     select: () => engine.handle({ type: 'SELECT_VIDEO', tab, selectionToken: 'fresh-token' }),
     start: (overrides = {}) => engine.handle({ type: 'START', mode: 'video', tab, region,
@@ -134,15 +150,15 @@ test('records cropped video plus captured tab audio into native MP4 and releases
   assert.equal(stopped.state.result.width, 640);
   assert.equal(stopped.state.result.height, 360);
   assert.equal(stopped.state.result.durationSeconds, 2.35);
-  assert.equal(stopped.state.selection, null);
+  assert.deepEqual(stopped.state.selection, { startSeconds: 0, endSeconds: 2.35 });
   assert.equal(h.audio.stopped, true);
   assert.equal(h.video.stopped, true);
   assert.equal(h.cropped.stopped, true);
   assert.equal(h.crops[0].disposed, true);
-  assert.equal((await h.engine.handle({ type: 'PREPARE_EXPORT', startSeconds: 0, endSeconds: 1 })).ok, false);
-  assert.equal(stopped.state.result.url, h.engine.getState().result.url, 'rejected audio trim preserves video');
+  assert.equal((await h.engine.handle({ type: 'PREPARE_EXPORT', startSeconds: 0, endSeconds: 1 })).ok, true);
+  assert.equal(stopped.state.result.url, h.engine.getState().result.url, 'video trim preserves the full source');
   await h.engine.handle({ type: 'DISCARD' });
-  assert.deepEqual(h.revoked, ['blob:test-1']);
+  assert.deepEqual(h.revoked, ['blob:test-1', 'blob:test-2']);
 });
 
 test('video rejects malformed regions before requesting capture', async () => {
@@ -538,4 +554,220 @@ test('audio recordings cannot be converted to GIF', async () => {
   assert.equal(result.state.status, 'ready');
   assert.equal(h.exports.length, 0);
   assert.deepEqual(result.state.result, stopped.state.result);
+});
+
+test('video selection uses decoded duration and dimensions instead of the recording stopwatch', async () => {
+  const h = await recordedVideo({ inspectVideo: async () => ({ durationSeconds: 1.417, width: 638, height: 358 }) });
+  const state = h.engine.getState();
+  assert.equal(state.elapsedMs, 1500);
+  assert.equal(state.result.durationSeconds, 1.417);
+  assert.equal(state.result.width, 638);
+  assert.equal(state.result.height, 358);
+  assert.equal(state.result.trimError, null);
+  assert.deepEqual(state.selection, { startSeconds: 0, endSeconds: 1.417 });
+  assert.equal(h.inspections[0], h.urls[0]);
+});
+
+test('unreadable video metadata preserves the original for full saving without an invented trim range', async () => {
+  for (const inspectVideo of [
+    async () => { throw new Error('metadata failed'); },
+    async () => ({ durationSeconds: Infinity, width: 640, height: 360 }),
+    async () => ({ durationSeconds: 1.5, width: 0, height: 360 }),
+  ]) {
+    const h = await recordedVideo({ inspectVideo });
+    const state = h.engine.getState();
+    assert.equal(state.status, 'ready');
+    assert.equal(state.result.durationSeconds, null);
+    assert.ok(state.result.trimError);
+    assert.equal(state.selection, null);
+    assert.equal(await h.urls[0].text(), 'native-video');
+    for (const type of ['SET_SELECTION', 'PREPARE_EXPORT', 'PREPARE_GIF']) {
+      const rejected = await h.engine.handle({ type, startSeconds: 0, endSeconds: 1 });
+      assert.equal(rejected.ok, false);
+      assert.deepEqual(rejected.state.result, state.result);
+    }
+    assert.equal(h.trims.length, 0);
+    assert.equal(h.exports.length, 0);
+    assert.equal((await h.engine.handle({ type: 'PREPARE_GIF' })).ok, true,
+      'whole-file GIF decoding may still succeed independently');
+  }
+});
+
+test('video MP4 and GIF selection reject malformed, reversed, and out-of-bounds intervals', async () => {
+  const h = await recordedVideo();
+  const original = h.engine.getState();
+  for (const range of [
+    { startSeconds: '0', endSeconds: 1 }, { startSeconds: 0 }, { endSeconds: 1 },
+    { startSeconds: NaN, endSeconds: 1 }, { startSeconds: 0, endSeconds: Infinity },
+    { startSeconds: -0.1, endSeconds: 1 }, { startSeconds: 1, endSeconds: 1 },
+    { startSeconds: 1, endSeconds: 0 }, { startSeconds: 0, endSeconds: 1.501 },
+  ]) {
+    for (const type of ['SET_SELECTION', 'PREPARE_EXPORT', 'PREPARE_GIF']) {
+      const rejected = await h.engine.handle({ type, ...range });
+      assert.equal(rejected.ok, false, `${type} must reject ${JSON.stringify(range)}`);
+      assert.deepEqual(rejected.state.selection, original.selection);
+      assert.deepEqual(rejected.state.result, original.result);
+    }
+  }
+  assert.equal(h.trims.length, 0);
+  assert.equal(h.exports.length, 0);
+});
+
+test('video MP4 clips preserve the source, cache exact requested ranges, and replace only the prior clip', async () => {
+  const h = await recordedVideo();
+  const original = h.engine.getState().result;
+  const selection = { startSeconds: 0.25, endSeconds: 1.25 };
+  const first = await h.engine.handle({ type: 'PREPARE_EXPORT', ...selection });
+  assert.equal(first.ok, true);
+  assert.deepEqual(first.state.result, original);
+  assert.deepEqual(first.state.selection, selection);
+  assert.equal(first.state.exportResult.kind, 'video');
+  assert.equal(first.state.exportResult.mimeType, 'video/mp4;codecs=vp9,opus');
+  assert.equal(first.state.exportResult.width, 640);
+  assert.equal(first.state.exportResult.height, 360);
+  assert.equal(first.state.exportResult.durationSeconds, 1);
+  assert.equal(first.state.exportProgress, 1);
+  assert.equal(h.trims[0].blob, h.urls[0], 'video trimming always starts with the retained original');
+  assert.equal(h.trims[0].settings.signal.aborted, false);
+  const cached = await h.engine.handle({ type: 'PREPARE_EXPORT', ...selection });
+  assert.deepEqual(cached.state.exportResult, first.state.exportResult);
+  assert.equal(h.trims.length, 1);
+  first.state.exportResult.width = 1;
+  assert.equal(h.engine.getState().exportResult.width, 640);
+  const changed = await h.engine.handle({ type: 'PREPARE_EXPORT', startSeconds: 0.5, endSeconds: 1.5 });
+  assert.equal(changed.ok, true);
+  assert.equal(h.trims.length, 2);
+  assert.deepEqual(h.revoked, [cached.state.exportResult.url]);
+  assert.deepEqual(changed.state.result, original);
+});
+
+test('whole GIF, range GIF, video clip and original stay independent and all URLs are released once', async () => {
+  const h = await recordedVideo();
+  const original = h.engine.getState().result;
+  const selection = { startSeconds: 0.2, endSeconds: 1.2 };
+  const mp4 = await h.engine.handle({ type: 'PREPARE_EXPORT', ...selection });
+  const full = await h.engine.handle({ type: 'PREPARE_GIF' });
+  const range = await h.engine.handle({ type: 'PREPARE_GIF', ...selection });
+  assert.equal(range.ok, true);
+  assert.deepEqual(range.state.result, original);
+  assert.deepEqual(range.state.exportResult, mp4.state.exportResult);
+  assert.deepEqual(range.state.gifResult, full.state.gifResult);
+  assert.equal(range.state.rangeGifResult.mimeType, 'image/gif');
+  assert.equal(range.state.rangeGifResult.startSeconds, 0.2);
+  assert.equal(range.state.rangeGifResult.endSeconds, 1.2);
+  assert.notEqual(range.state.rangeGifResult.filename, full.state.gifResult.filename);
+  assert.deepEqual(h.exports, [h.urls[0], h.urls[0]], 'GIF ranges decode the original, never a previously encoded clip');
+  assert.equal(h.exportSettings[0].startSeconds, undefined);
+  assert.equal(h.exportSettings[1].startSeconds, 0.2);
+  assert.equal(h.exportSettings[1].endSeconds, 1.2);
+  assert.equal(h.exportSettings[1].signal.aborted, false);
+  const rangeUrl = range.state.rangeGifResult.url;
+  range.state.rangeGifResult.url = 'tampered';
+  assert.equal(h.engine.getState().rangeGifResult.url, rangeUrl);
+  assert.equal((await h.engine.handle({ type: 'PREPARE_GIF', ...selection })).state.rangeGifResult.url, rangeUrl);
+  assert.equal((await h.engine.handle({ type: 'PREPARE_GIF' })).state.gifResult.url, full.state.gifResult.url);
+  assert.equal(h.exports.length, 2);
+  const replaced = await h.engine.handle({ type: 'PREPARE_GIF', startSeconds: 0.4, endSeconds: 1.4 });
+  assert.equal(replaced.ok, true);
+  assert.deepEqual(h.revoked, [rangeUrl]);
+  assert.deepEqual(replaced.state.gifResult, full.state.gifResult);
+  const discarded = await h.engine.handle({ type: 'DISCARD' });
+  assert.equal(discarded.state.rangeGifResult, null);
+  assert.equal(discarded.state.exportResult, null);
+  assert.equal(discarded.state.gifResult, null);
+  assert.equal(discarded.state.result, null);
+  assert.equal(h.revoked.length, 5);
+  assert.equal(new Set(h.revoked).size, 5);
+  await h.select();
+  await h.start();
+  h.advance(1000);
+  await h.engine.handle({ type: 'STOP' });
+  await h.engine.handle({ type: 'PREPARE_GIF', ...selection });
+  assert.equal(h.exports.length, 4, 'a new recording cannot reuse the earlier range cache');
+  assert.notEqual(h.exports.at(-1), h.exports[0]);
+});
+
+test('video clip failures keep the prior usable clip and full original for retry', async () => {
+  for (const invalid of ['throw', 'wrong-container', 'empty', 'dimensions']) {
+    let attempts = 0;
+    const h = await recordedVideo({ trimVideo: async (_blob, startSeconds, endSeconds) => {
+      attempts++;
+      if (attempts === 2 && invalid === 'throw') throw new Error('encoder failed');
+      return {
+        blob: new Blob(attempts === 2 && invalid === 'empty' ? [] : ['clip'], {
+          type: attempts === 2 && invalid === 'wrong-container' ? 'video/webm' : 'video/mp4',
+        }),
+        durationSeconds: endSeconds - startSeconds, startSeconds, endSeconds,
+        width: attempts === 2 && invalid === 'dimensions' ? 0 : 640, height: 360,
+      };
+    } });
+    const first = await h.engine.handle({ type: 'PREPARE_EXPORT', startSeconds: 0, endSeconds: 1 });
+    const failed = await h.engine.handle({ type: 'PREPARE_EXPORT', startSeconds: 0.3, endSeconds: 1.3 });
+    assert.equal(failed.ok, false, invalid);
+    assert.equal(failed.state.status, 'ready');
+    assert.equal(failed.state.exportProgress, 0);
+    assert.deepEqual(failed.state.result, first.state.result);
+    assert.deepEqual(failed.state.exportResult, first.state.exportResult);
+    assert.equal(h.revoked.length, 0);
+    assert.equal(h.urls.length, 2);
+    assert.equal((await h.engine.handle({ type: 'PREPARE_EXPORT', startSeconds: 0.3, endSeconds: 1.3 })).ok, true);
+    assert.deepEqual(h.revoked, [first.state.exportResult.url]);
+  }
+});
+
+test('cancelling MP4 or GIF aborts immediately but waits for cleanup before allowing more work', async () => {
+  for (const type of ['PREPARE_EXPORT', 'PREPARE_GIF']) {
+    for (const lateResult of ['reject', 'resolve']) {
+      let enter;
+      let finish;
+      let activeSettings;
+      const entered = new Promise((resolve) => { enter = resolve; });
+      const cleanup = new Promise((resolve) => { finish = resolve; });
+      const createOutput = () => type === 'PREPARE_EXPORT'
+        ? { blob: new Blob(['clip'], { type: 'video/mp4' }), width: 640, height: 360,
+          durationSeconds: 1, startSeconds: 0, endSeconds: 1 }
+        : { blob: new Blob(['GIF89a'], { type: 'image/gif' }), width: 320, height: 180,
+          durationSeconds: 1, frameCount: 10 };
+      let attempt = 0;
+      const encode = async (settings) => {
+        if (++attempt > 1) return createOutput();
+        activeSettings = settings;
+        settings.onProgress(0.4);
+        enter();
+        await cleanup;
+        if (lateResult === 'reject') throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+        return createOutput();
+      };
+      const h = await recordedVideo({
+        trimVideo: (_blob, _start, _end, settings) => encode(settings),
+        exportGif: (_blob, settings) => encode(settings),
+      });
+      const original = h.engine.getState().result;
+      const pending = h.engine.handle({ type, startSeconds: 0, endSeconds: 1 });
+      await entered;
+      const cancel = await h.engine.handle({ type: 'CANCEL_EXPORT' });
+      assert.equal(cancel.ok, true);
+      assert.equal(activeSettings.signal.aborted, true);
+      assert.equal(cancel.state.status, type === 'PREPARE_EXPORT' ? 'trimming' : 'exporting');
+      activeSettings.onProgress(0.9);
+      assert.equal(h.engine.getState().exportProgress, 0.4, 'progress after cancellation is ignored');
+      assert.equal((await h.engine.handle({ type: 'DISCARD' })).ok, false, 'cleanup still owns the recording');
+      assert.equal((await h.engine.handle({ type, startSeconds: 0, endSeconds: 1 })).ok, false);
+      finish();
+      const cancelled = await pending;
+      assert.equal(cancelled.ok, false);
+      assert.equal(cancelled.cancelled, true);
+      assert.equal(cancelled.state.status, 'ready');
+      assert.equal(cancelled.state.exportProgress, 0);
+      assert.equal(cancelled.state.error, null);
+      assert.match(cancelled.state.notice, /취소/);
+      assert.deepEqual(cancelled.state.result, original);
+      assert.equal(cancelled.state.exportResult, null);
+      assert.equal(cancelled.state.rangeGifResult, null);
+      assert.equal(h.urls.length, 1, 'a late export result must never create a URL after cancellation');
+      assert.equal(h.revoked.length, 0);
+      assert.equal((await h.engine.handle({ type, startSeconds: 0, endSeconds: 1 })).ok, true);
+      assert.equal(h.urls.length, 2);
+    }
+  }
 });

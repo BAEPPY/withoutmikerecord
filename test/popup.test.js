@@ -11,20 +11,24 @@ const idle = () => ({ status: 'idle', mode: 'audio', elapsedMs: 0, result: null,
 
 function deferred() {
   let resolve;
-  const promise = new Promise((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 class Element {
   constructor(id = '') {
     Object.assign(this, { id, textContent: '', value: '', hidden: false, disabled: false,
-      dataset: {}, style: {}, currentTime: 0, duration: NaN, paused: true, attributes: {}, listeners: {} });
+      dataset: {}, style: {}, currentTime: 0, duration: NaN, paused: true, playCalls: 0, attributes: {}, listeners: {} });
     this.classList = { toggle() {} };
   }
   get valueAsNumber() { return this.value === '' ? NaN : Number(this.value); }
+  get src() { return this.attributes.src || ''; }
+  set src(value) { this.attributes.src = value; }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   removeAttribute(name) { delete this.attributes[name]; }
   addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
+  emit(type) { return Promise.all((this.listeners[type] || []).map((listener) => listener())); }
   closest(selector) {
     if (selector === '[hidden]') return this.hidden ? this : this.parent?.closest(selector);
     return this.editable ? this : null;
@@ -33,19 +37,27 @@ class Element {
     if (this.disabled || this.closest('[hidden]')) return;
     for (const listener of this.listeners.click || []) listener();
   }
-  pause() { this.paused = true; }
-  load() {}
+  async play() { this.playCalls += 1; this.paused = false; await this.emit('play'); }
+  pause() {
+    const playing = !this.paused;
+    this.paused = true;
+    if (playing) void this.emit('pause');
+  }
+  load() { this.currentTime = 0; }
 }
 
 async function popup({ initialState = idle(), assignments = [], assignmentError = false, userAgent = 'Chrome/135' } = {}) {
   const elements = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => [match[1], new Element(match[1])]));
   const listeners = {};
-  const env = { state: initialState, sent: [], closed: 0, tabs: [], assignmentReads: 0, elements };
+  const env = { state: initialState, sent: [], closed: 0, tabs: [], assignmentReads: 0, elements, fetched: [], copied: [] };
   env.respond = async () => ({ ok: true, state: structuredClone(env.state) });
+  env.fetch = async (url) => { env.fetched.push(url); return { ok: true, blob: async () => new Blob(['GIF89a'], { type: 'image/gif' }) }; };
+  env.copyGif = async (blob) => { env.copied.push(blob); return { mode: 'html-gif' }; };
   for (const id of ['pause-button', 'stop-button']) elements.get(id).parent = elements.get('recording-controls');
   elements.get('save-format').value = 'mp4';
   const context = vm.createContext({
     Element, crypto: { randomUUID }, navigator: { userAgent },
+    fetch: (...args) => env.fetch(...args), __withoutMikeCopyGif: (...args) => env.copyGif(...args),
     document: {
       hidden: false,
       getElementById(id) { assert.ok(elements.has(id), `Missing popup element: ${id}`); return elements.get(id); },
@@ -72,6 +84,7 @@ async function popup({ initialState = idle(), assignments = [], assignmentError 
   env.click = (id) => elements.get(id).click();
   env.text = (id) => elements.get(id).textContent;
   env.commands = () => env.sent.filter(({ type }) => !['STATUS', 'ARM_SHORTCUTS'].includes(type));
+  env.poll = () => vm.runInContext('poll()', context);
   vm.runInContext(source, context, { filename: 'extension/popup.js' });
   await settle();
   return env;
@@ -230,4 +243,326 @@ test('shortcut settings opens the correct Chrome or Edge settings page', async (
     assert.deepEqual(env.tabs, [{ url: `${scheme}://extensions/shortcuts` }]);
     assert.equal(env.elements.get('shortcut-settings').disabled, false);
   }
+});
+
+function videoReady() {
+  return {
+    ...idle(), status: 'ready', mode: 'video',
+    result: { kind: 'video', url: 'blob:original-video', durationSeconds: 6.25, bytes: 1000 },
+    selection: { startSeconds: 1.12, endSeconds: 4.56 },
+  };
+}
+
+test('video editor uses the video position and plays only the selected interval', async () => {
+  const env = await popup({ initialState: videoReady() });
+  const get = (id) => env.elements.get(id);
+  assert.equal(get('audio-trim-controls').hidden, false);
+  assert.equal(get('save-range-button').hidden, false);
+  assert.equal(get('trim-start').value, '1.12');
+  assert.equal(get('trim-end').value, '4.56');
+  assert.equal(env.text('preview-range'), '선택 구간 보기');
+  const video = get('video-preview');
+  const audio = get('audio-preview');
+  audio.currentTime = 5.99;
+  video.currentTime = 2.349;
+  env.click('set-trim-start');
+  await settle();
+  assert.equal(get('trim-start').value, '2.34');
+  video.currentTime = 3.456;
+  env.click('set-trim-end');
+  await settle();
+  assert.equal(get('trim-end').value, '3.45');
+  assert.deepEqual(env.commands().filter(({ type }) => type === 'SET_SELECTION').at(-1), {
+    target: 'background', type: 'SET_SELECTION', startSeconds: 2.34, endSeconds: 3.45,
+  });
+  env.click('preview-range');
+  await settle();
+  assert.equal(video.currentTime, 2.34);
+  assert.equal(video.playCalls, 1);
+  assert.equal(audio.playCalls, 0);
+  video.currentTime = 3.50;
+  await video.emit('timeupdate');
+  assert.equal(video.paused, true);
+  assert.equal(video.currentTime, 3.45);
+  assert.equal(audio.currentTime, 5.99);
+  assert.equal(env.text('preview-range'), '선택 구간 보기');
+});
+
+test('stopping a pending video preview does not report its expected playback rejection', async () => {
+  const env = await popup({ initialState: videoReady() });
+  const playing = deferred();
+  const video = env.elements.get('video-preview');
+  video.play = () => { video.paused = false; return playing.promise; };
+  env.click('preview-range');
+  env.click('preview-range');
+  playing.reject(new Error('Playback aborted by pause'));
+  await settle();
+  assert.equal(video.paused, true);
+  assert.equal(env.elements.get('error-message').hidden, true);
+  assert.equal(env.text('preview-range'), '선택 구간 보기');
+});
+
+test('video save format applies to both whole and selected output without changing the source', async () => {
+  const env = await popup({ initialState: videoReady() });
+  const format = env.elements.get('save-format');
+  format.value = 'gif';
+  await format.emit('change');
+  assert.equal(env.text('save-button'), '전체 저장 · .gif');
+  assert.equal(env.text('save-range-button'), '선택 구간 저장 · .gif');
+  env.click('save-range-button');
+  await settle();
+  assert.deepEqual(env.commands().at(-1), {
+    target: 'background', type: 'SAVE_VIDEO_RANGE', format: 'gif', startSeconds: 1.12, endSeconds: 4.56,
+  });
+  env.click('save-button');
+  await settle();
+  assert.deepEqual(env.commands().at(-1), { target: 'background', type: 'SAVE_VIDEO', format: 'gif' });
+  format.value = 'mp4';
+  await format.emit('change');
+  env.click('save-range-button');
+  await settle();
+  assert.equal(env.commands().at(-1).format, 'mp4');
+  assert.equal(env.elements.get('video-preview').src, 'blob:original-video');
+});
+
+test('switching media kind even at the same URL clears inactive preview and preserves audio MP4 behavior', async () => {
+  const env = await popup({ initialState: videoReady() });
+  const video = env.elements.get('video-preview');
+  await video.play();
+  env.elements.get('save-format').value = 'gif';
+  env.state = { ...videoReady(), mode: 'audio',
+    result: { ...videoReady().result, kind: 'audio' }, selection: { startSeconds: 0, endSeconds: 2.5 } };
+  await env.poll();
+  assert.equal(video.paused, true);
+  assert.equal(video.src, '');
+  assert.equal(env.elements.get('audio-preview').src, 'blob:original-video');
+  assert.equal(env.elements.get('trim-end').value, '2.50');
+  assert.equal(env.elements.get('save-format-field').hidden, true);
+  assert.equal(env.text('save-button'), '전체 저장 · .mp4');
+  assert.equal(env.text('save-range-button'), '선택 구간 저장 · .mp4');
+  assert.equal(env.text('preview-range'), '선택 구간 듣기');
+  env.click('save-range-button');
+  await settle();
+  assert.deepEqual(env.commands().at(-1), {
+    target: 'background', type: 'SAVE_RANGE', startSeconds: 0, endSeconds: 2.5,
+  });
+});
+
+test('polling and failed video exports preserve edited bounds and the original for retry', async () => {
+  const env = await popup({ initialState: videoReady() });
+  const start = env.elements.get('trim-start');
+  start.value = '';
+  await start.emit('input');
+  await env.poll();
+  assert.equal(start.value, '');
+  assert.equal(env.elements.get('save-range-button').disabled, true);
+  assert.equal(env.elements.get('save-button').disabled, false);
+  start.value = '2.20';
+  await start.emit('input');
+  await settle();
+  let fail = true;
+  env.respond = async (message) => message.type === 'SAVE_VIDEO_RANGE' && fail
+    ? { ok: false, error: '변환 실패', state: structuredClone(env.state) }
+    : { ok: true, state: { ...structuredClone(env.state), exportResult: { url: 'blob:short-clip' } } };
+  env.click('save-range-button');
+  await settle();
+  assert.match(env.text('error-message'), /변환 실패/);
+  assert.equal(start.value, '2.20');
+  assert.equal(env.elements.get('video-preview').src, 'blob:original-video');
+  assert.equal(env.elements.get('save-range-button').disabled, false);
+  fail = false;
+  env.click('save-range-button');
+  await settle();
+  assert.equal(env.elements.get('error-message').hidden, true);
+  assert.equal(env.elements.get('video-preview').src, 'blob:original-video');
+  assert.equal(start.value, '2.20');
+});
+
+test('video processing locks edits and cancellation bypasses the pending export without discarding it', async () => {
+  const env = await popup({ initialState: videoReady() });
+  const conversion = deferred();
+  env.respond = async (message) => {
+    if (message.type === 'SAVE_VIDEO_RANGE') {
+      env.state = { ...env.state, status: 'trimming', exportProgress: 0.42, exportFormat: 'mp4' };
+      return conversion.promise;
+    }
+    if (message.type === 'CANCEL_EXPORT') env.state = { ...env.state, status: 'ready', notice: '중지했어요. 원본은 유지돼요.' };
+    return { ok: true, state: structuredClone(env.state) };
+  };
+  env.click('save-range-button');
+  await env.poll();
+  assert.equal(env.text('status-label'), '영상 구간 만드는 중 42%');
+  for (const id of ['trim-start', 'trim-end', 'save-button', 'save-range-button', 'save-format', 'discard-button']) {
+    assert.equal(env.elements.get(id).disabled, true, id);
+  }
+  assert.equal(env.elements.get('cancel-export-button').hidden, false);
+  env.click('cancel-export-button');
+  await settle();
+  assert.deepEqual(env.commands().map(({ type }) => type), ['SAVE_VIDEO_RANGE', 'CANCEL_EXPORT']);
+  assert.equal(env.elements.get('save-button').disabled, true, 'original export is still pending');
+  conversion.resolve({ ok: false, cancelled: true, state: structuredClone(env.state) });
+  await settle();
+  assert.equal(env.elements.get('save-button').disabled, false);
+  assert.equal(env.elements.get('trim-start').value, '1.12');
+  assert.equal(env.elements.get('video-preview').src, 'blob:original-video');
+  assert.equal(env.elements.get('error-message').hidden, true);
+});
+
+test('reopened GIF processing restores format and videos without editable duration keep whole save', async () => {
+  const pending = await popup({ initialState: {
+    ...videoReady(), status: 'exporting', exportProgress: 0.43, exportFormat: 'gif',
+  } });
+  assert.equal(pending.elements.get('save-format').value, 'gif');
+  assert.equal(pending.text('status-label'), 'GIF 만드는 중 43%');
+  assert.equal(pending.text('save-button'), '전체 저장 · .gif');
+  assert.equal(pending.text('save-range-button'), '선택 구간 저장 · .gif');
+  assert.equal(pending.elements.get('cancel-export-button').disabled, false);
+  for (const durationSeconds of [null, NaN, Infinity, 0.005]) {
+    const env = await popup({ initialState: {
+      ...videoReady(), result: { ...videoReady().result, durationSeconds }, selection: null,
+    } });
+    assert.equal(env.elements.get('save-range-button').disabled, true);
+    assert.equal(env.elements.get('preview-range').disabled, true);
+    assert.equal(env.elements.get('save-button').disabled, false);
+  }
+});
+
+test('short video ranges keep preview and GIF available while MP4 requires 0.04 seconds', async () => {
+  const env = await popup({ initialState: {
+    ...videoReady(), selection: { startSeconds: 1.12, endSeconds: 1.15 },
+  } });
+  assert.equal(env.elements.get('preview-range').disabled, false);
+  assert.equal(env.elements.get('save-button').disabled, false);
+  assert.equal(env.elements.get('save-range-button').disabled, true);
+  assert.match(env.text('trim-error'), /0\.04초 이상/);
+  env.elements.get('save-format').value = 'gif';
+  await env.elements.get('save-format').emit('change');
+  assert.equal(env.elements.get('save-range-button').disabled, false);
+  assert.equal(env.elements.get('copy-range-gif-button').disabled, false);
+  assert.equal(env.elements.get('trim-error').hidden, true);
+});
+
+test('whole and selected GIF copies prepare without downloading and describe actual clipboard support', async () => {
+  const env = await popup({ initialState: videoReady() });
+  assert.equal(env.elements.get('copy-gif-button').hidden, true);
+  env.elements.get('save-format').value = 'gif';
+  await env.elements.get('save-format').emit('change');
+  for (const id of ['copy-gif-button', 'copy-range-gif-button']) assert.equal(env.elements.get(id).hidden, false);
+  env.respond = async () => ({ ok: true, state: structuredClone(env.state), output: { url: 'blob:animated-gif' } });
+  env.click('copy-range-gif-button');
+  await settle();
+  assert.deepEqual(env.commands(), [{
+    target: 'background', type: 'PREPARE_GIF_COPY', scope: 'range', startSeconds: 1.12, endSeconds: 4.56,
+  }]);
+  assert.deepEqual(env.fetched, ['blob:animated-gif']);
+  assert.equal(env.copied[0].type, 'image/gif');
+  assert.equal(env.elements.get('copy-status').dataset.mode, 'html-gif');
+  assert.match(env.text('copy-status'), /문서·편집기/);
+  assert.match(env.text('copy-status'), /메신저는 파일 첨부/);
+  assert.equal(env.elements.get('video-preview').src, 'blob:original-video');
+  env.copyGif = async () => ({ mode: 'native-gif' });
+  env.click('copy-gif-button');
+  await settle();
+  assert.deepEqual(env.commands().at(-1), { target: 'background', type: 'PREPARE_GIF_COPY', scope: 'whole' });
+  assert.match(env.text('copy-status'), /일부 앱은 GIF 붙여넣기를 지원하지 않아요/);
+  assert.equal(env.elements.get('copy-status').dataset.mode, 'native-gif');
+  env.state = { ...videoReady(), mode: 'audio', result: { ...videoReady().result, kind: 'audio' } };
+  await env.poll();
+  assert.equal(env.elements.get('copy-gif-button').hidden, true);
+  assert.equal(env.elements.get('copy-range-gif-button').hidden, true);
+  assert.equal(env.elements.get('copy-status').hidden, true);
+});
+
+test('copy keeps edits locked through clipboard write and never reports success for rejected writes', async () => {
+  const env = await popup({ initialState: videoReady() });
+  env.elements.get('save-format').value = 'gif';
+  await env.elements.get('save-format').emit('change');
+  const writing = deferred();
+  env.respond = async () => ({ ok: true, state: structuredClone(env.state), output: { url: 'blob:animated-gif' } });
+  env.copyGif = () => writing.promise;
+  env.click('copy-gif-button');
+  await settle();
+  for (const id of ['trim-start', 'save-button', 'save-range-button', 'save-format', 'copy-gif-button', 'copy-range-gif-button', 'discard-button']) {
+    assert.equal(env.elements.get(id).disabled, true, id);
+  }
+  assert.match(env.text('copy-status'), /창을 열어 두세요/);
+  assert.doesNotMatch(env.text('copy-status'), /완료/);
+  writing.reject(new Error('클립보드 권한을 확인해 주세요.'));
+  await settle();
+  assert.equal(env.elements.get('copy-status').hidden, true);
+  assert.match(env.text('error-message'), /클립보드 권한/);
+  assert.equal(env.elements.get('copy-gif-button').disabled, false);
+  assert.equal(env.elements.get('video-preview').src, 'blob:original-video');
+});
+
+test('invalid ranges block selected copy only and cancelled preparation never touches the clipboard', async () => {
+  const env = await popup({ initialState: videoReady() });
+  env.elements.get('save-format').value = 'gif';
+  env.elements.get('trim-start').value = '';
+  await env.elements.get('trim-start').emit('input');
+  assert.equal(env.elements.get('copy-range-gif-button').disabled, true);
+  assert.equal(env.elements.get('copy-gif-button').disabled, false);
+  const preparing = deferred();
+  env.respond = async (message) => {
+    if (message.type === 'PREPARE_GIF_COPY') {
+      env.state = { ...env.state, status: 'exporting', exportFormat: 'gif', exportProgress: 0.2 };
+      return preparing.promise;
+    }
+    if (message.type === 'CANCEL_EXPORT') env.state = { ...env.state, status: 'ready' };
+    return { ok: true, state: structuredClone(env.state) };
+  };
+  env.click('copy-range-gif-button');
+  env.click('copy-gif-button');
+  await env.poll();
+  env.click('cancel-export-button');
+  await settle();
+  assert.deepEqual(env.commands().map(({ type }) => type), ['PREPARE_GIF_COPY', 'CANCEL_EXPORT']);
+  assert.equal(env.elements.get('copy-gif-button').disabled, true);
+  preparing.resolve({ ok: false, cancelled: true, state: structuredClone(env.state) });
+  await settle();
+  assert.equal(env.elements.get('copy-gif-button').disabled, false);
+  assert.equal(env.elements.get('error-message').hidden, true);
+  assert.equal(env.elements.get('copy-status').hidden, true);
+  assert.equal(env.fetched.length, 0);
+  assert.equal(env.copied.length, 0);
+});
+
+test('late selection acknowledgements cannot erase later video export or clipboard errors', async () => {
+  for (const action of ['save-range-button', 'copy-range-gif-button']) {
+    const env = await popup({ initialState: videoReady() });
+    env.elements.get('save-format').value = 'gif';
+    const selection = deferred();
+    env.respond = async (message) => {
+      if (message.type === 'SET_SELECTION') return selection.promise;
+      if (message.type === 'SAVE_VIDEO_RANGE') return { ok: false, error: '영상 변환 실패', state: structuredClone(env.state) };
+      return { ok: true, state: structuredClone(env.state), output: { url: 'blob:animated-gif' } };
+    };
+    env.copyGif = async () => { throw new Error('클립보드 쓰기 실패'); };
+    env.elements.get('trim-start').value = '1.23';
+    await env.elements.get('trim-start').emit('input');
+    env.click(action);
+    await settle();
+    const failure = env.text('error-message');
+    assert.match(failure, /실패/);
+    selection.resolve({ ok: true, state: structuredClone(env.state) });
+    await settle();
+    assert.equal(env.text('error-message'), failure);
+    assert.equal(env.elements.get('error-message').hidden, false);
+    assert.equal(env.elements.get('trim-start').value, '1.23');
+  }
+});
+
+test('invalidating a pending selection ignores its obsolete persistence error', async () => {
+  const env = await popup({ initialState: videoReady() });
+  const selection = deferred();
+  env.respond = () => selection.promise;
+  env.elements.get('trim-start').value = '1.23';
+  await env.elements.get('trim-start').emit('input');
+  env.elements.get('trim-start').value = '';
+  await env.elements.get('trim-start').emit('input');
+  selection.resolve({ ok: false, error: 'Old invalid selection' });
+  await settle();
+  assert.equal(env.elements.get('error-message').hidden, true);
+  assert.equal(env.elements.get('trim-start').value, '');
+  assert.match(env.text('trim-error'), /숫자로 입력/);
 });

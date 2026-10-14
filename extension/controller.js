@@ -1,11 +1,11 @@
 export const EMPTY_STATE = {
   status: 'idle', tab: null, elapsedMs: 0, bytes: 0, level: 0,
   error: null, notice: null, result: null, selection: null, exportResult: null,
-  mode: 'audio', selectionToken: null, selectionUrl: null, videoSessionToken: null, gifResult: null, exportProgress: 0,
+  mode: 'audio', selectionToken: null, selectionUrl: null, videoSessionToken: null, gifResult: null, rangeGifResult: null, exportProgress: 0,
   download: { id: null, status: 'idle', error: null },
 };
 
-export function createController(api) {
+export function createController(api, { onStateChange = () => {} } = {}) {
   let creatingDocument;
   let saveInFlight = false;
   let commands = Promise.resolve();
@@ -53,6 +53,7 @@ export function createController(api) {
       api.action.setTitle({ title: current.status === 'recording'
         ? current.mode === 'video' ? '화면과 소리 녹화 중 — 4로 종료' : '탭 소리 녹음 중 — 2로 종료'
         : '탭 소리 · 화면 녹화' }),
+      onStateChange(current),
     ]);
   }
 
@@ -97,11 +98,27 @@ export function createController(api) {
 
   function connectShortcuts(tabId) {
     return api.scripting.executeScript({
-      target: { tabId }, files: ['region-selector.js', 'page-shortcuts.js'],
+      target: { tabId }, files: ['region-selector.js', 'youtube-controls.js', 'page-shortcuts.js'],
     });
   }
 
+  function selectedVideoRange(message, current) {
+    const { startSeconds, endSeconds } = message;
+    const duration = current.result?.durationSeconds;
+    if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) ||
+        !Number.isFinite(duration) || startSeconds < 0 || endSeconds <= startSeconds || endSeconds > duration) {
+      throw new Error('시작과 끝을 영상 길이 안에서 입력해 주세요. 끝은 시작보다 뒤여야 해요.');
+    }
+    return { startSeconds, endSeconds };
+  }
+
   async function run(message) {
+    if (message.type === 'CANCEL_EXPORT') {
+      if (!await hasDocument()) return { ok: true, state: structuredClone(EMPTY_STATE) };
+      const reply = await send('CANCEL_EXPORT');
+      await badge(reply.state);
+      return reply;
+    }
     if (message.type === 'VIDEO_VIEWPORT_CHANGED') {
       if (!Number.isInteger(message.targetTabId) || typeof message.selectionToken !== 'string') {
         throw new Error('화면 변경 요청이 올바르지 않아요.');
@@ -228,25 +245,40 @@ export function createController(api) {
       await badge(reply.state);
       return reply;
     }
-    if (['SAVE', 'SAVE_RANGE', 'SAVE_VIDEO'].includes(message.type)) {
+    if (message.type === 'PREPARE_GIF_COPY') {
+      if (current.status !== 'ready' || current.result?.kind !== 'video' || !['whole', 'range'].includes(message.scope)) {
+        throw new Error('화면 녹화를 마친 뒤 복사할 GIF 구간을 선택해 주세요.');
+      }
+      if (current.download.status === 'pending') throw new Error('파일 저장이 진행 중이에요.');
+      const prepared = await send('PREPARE_GIF', message.scope === 'range' ? selectedVideoRange(message, current) : {});
+      if (!prepared.ok) return prepared;
+      const output = message.scope === 'range' ? prepared.state.rangeGifResult : prepared.state.gifResult;
+      if (!output?.url) throw new Error('복사할 GIF를 만들지 못했어요. 다시 시도해 주세요.');
+      return { ...prepared, output };
+    }
+    if (['SAVE', 'SAVE_RANGE', 'SAVE_VIDEO', 'SAVE_VIDEO_RANGE'].includes(message.type)) {
       if (current.status !== 'ready' || !current.result) throw new Error('녹음을 먼저 마쳐 주세요.');
       if (current.download.status === 'pending') throw new Error('파일 저장이 진행 중이에요.');
-      if (message.type === 'SAVE_VIDEO') {
+      if (message.type === 'SAVE_VIDEO' || message.type === 'SAVE_VIDEO_RANGE') {
         if (current.result.kind !== 'video' || !['mp4', 'gif'].includes(message.format)) throw new Error('영상 저장 형식을 선택해 주세요.');
+        if (message.type === 'SAVE_VIDEO_RANGE') selectedVideoRange(message, current);
         if (message.format === 'gif') {
-          const prepared = await send('PREPARE_GIF');
+          const prepared = await send('PREPARE_GIF', message.type === 'SAVE_VIDEO_RANGE' ? {
+            startSeconds: message.startSeconds, endSeconds: message.endSeconds,
+          } : {});
           if (!prepared.ok) return prepared;
           current = prepared.state;
         }
       }
-      if (message.type === 'SAVE_RANGE') {
+      if (message.type === 'SAVE_RANGE' || (message.type === 'SAVE_VIDEO_RANGE' && message.format === 'mp4')) {
         const prepared = await send('PREPARE_EXPORT', {
           startSeconds: message.startSeconds, endSeconds: message.endSeconds,
         });
         if (!prepared.ok) return prepared;
         current = prepared.state;
       }
-      const output = message.type === 'SAVE_RANGE' ? current.exportResult
+      const output = message.type === 'SAVE_VIDEO_RANGE' ? message.format === 'gif' ? current.rangeGifResult : current.exportResult
+        : message.type === 'SAVE_RANGE' ? current.exportResult
         : message.type === 'SAVE_VIDEO' && message.format === 'gif' ? current.gifResult : current.result;
       if (!output?.url) throw new Error('저장할 파일을 준비하지 못했어요. 다시 시도해 주세요.');
       saveInFlight = true;
@@ -312,7 +344,7 @@ export function createController(api) {
     badge,
     // Reads remain responsive while a native Save As dialog is open.
     handle(message) {
-      if (message.type === 'STATUS' || message.type === 'VIDEO_VIEWPORT_CHANGED') return safeRun(message);
+      if (['STATUS', 'VIDEO_VIEWPORT_CHANGED', 'CANCEL_EXPORT'].includes(message.type)) return safeRun(message);
       const previous = previousControlRequest;
       const result = commands.then(() => message.type === 'STOP_PENDING'
         ? stopPending(message, previous).catch((error) => ({ ok: false, error: error.message }))

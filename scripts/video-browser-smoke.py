@@ -56,7 +56,10 @@ async def main():
     async with async_playwright() as p:
         browser = await p.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH', '/usr/bin/chromium'),
             headless=True, args=['--no-sandbox', '--autoplay-policy=no-user-gesture-required'])
-        context = await browser.new_context(viewport={'width': VIEWPORT_WIDTH, 'height': VIEWPORT_HEIGHT})
+        # Clipboard read permission is only for assertions in this test; the
+        # extension itself requests write permission only.
+        context = await browser.new_context(viewport={'width': VIEWPORT_WIDTH, 'height': VIEWPORT_HEIGHT},
+            permissions=['clipboard-read','clipboard-write'])
         owner = await context.new_page()
         await owner.goto(f'http://127.0.0.1:{server.server_port}/')
         await owner.evaluate('''async ({viewportWidth, viewportHeight, captureWidth, captureHeight}) => {
@@ -191,11 +194,35 @@ async def main():
         await popup.add_init_script('window.chrome={runtime:{sendMessage:message=>window.testBridge(message)}}')
         await popup.goto(f'http://127.0.0.1:{server.server_port}/popup.html')
         await popup.wait_for_selector('#video-preview:visible')
-        assert await popup.locator('#audio-trim-controls').is_hidden()
-        assert await popup.locator('#save-range-button').is_hidden()
+        assert await popup.locator('#audio-trim-controls').is_visible()
+        assert await popup.locator('#save-range-button').is_visible()
+        assert state['selection']['startSeconds'] == 0
+        assert state['result']['trimError'] is None
+        await popup.fill('#trim-start','0.35')
+        await popup.fill('#trim-end','1.25')
+        await popup.locator('#trim-end').blur()
+        await owner.wait_for_function("recorder.getState().selection.endSeconds === 1.25")
+        assert await popup.input_value('#trim-start') == '0.35'
+        assert await popup.input_value('#trim-end') == '1.25'
+        await popup.click('#preview-range')
+        await popup.wait_for_function("document.querySelector('#video-preview').paused && document.querySelector('#video-preview').currentTime >= 1.2")
+        assert await popup.locator('#video-preview').evaluate('(video)=>video.currentTime') < 1.4
+        await popup.click('#save-range-button')
+        await owner.wait_for_function('downloaded.length === 1',timeout=60000)
+        await popup.wait_for_function("!document.querySelector('#save-range-button').disabled")
+        clip_state = await owner.evaluate('recorder.getState()')
+        assert clip_state['result']['url'] == state['result']['url']
+        assert clip_state['exportResult']['kind'] == 'video'
+        clip_path = OUTPUT / f'test-region-clip{CASE_SUFFIX}.mp4'
+        await save_blob('recorder.getState().exportResult.url',clip_path)
+        clip_probe = probe(clip_path)
+        assert sorted(s['codec_type'] for s in clip_probe['streams']) == ['audio','video']
+        assert abs(float(clip_probe['format']['duration'])-0.9) < 0.15, clip_probe
+        clip_frames = assert_cropped_pixels(clip_path,*EXPECTED_CROP)
         await popup.select_option('#save-format','gif')
         await popup.click('#save-button')
-        await popup.wait_for_function("document.querySelector('#notice-message').textContent.includes('완료')",timeout=60000)
+        await owner.wait_for_function('downloaded.length === 2',timeout=60000)
+        await popup.wait_for_function("!document.querySelector('#save-button').disabled")
         gif_state = await owner.evaluate('recorder.getState()')
         assert gif_state['gifResult']['mimeType'] == 'image/gif'
         assert gif_state['result']['url'] == state['result']['url']
@@ -208,11 +235,57 @@ async def main():
         gif_stream = gif_probe['streams'][0]
         gif_frames = assert_cropped_pixels(gif_path, gif_stream['width'], gif_stream['height'])
         assert abs(float(gif_probe['format']['duration'])-float(video_probe['format']['duration'])) < 0.12
+        await popup.click('#save-range-button')
+        await owner.wait_for_function('downloaded.length === 3',timeout=60000)
+        await popup.wait_for_function("!document.querySelector('#save-range-button').disabled")
+        range_gif_state = await owner.evaluate('recorder.getState()')
+        assert range_gif_state['gifResult']['url'] == gif_state['gifResult']['url']
+        assert range_gif_state['result']['url'] == state['result']['url']
+        assert abs(range_gif_state['rangeGifResult']['durationSeconds']-0.9) < 0.001
+        range_gif_path = OUTPUT / f'test-region-clip{CASE_SUFFIX}.gif'
+        await save_blob('recorder.getState().rangeGifResult.url',range_gif_path)
+        range_gif_probe = probe(range_gif_path)
+        assert len(range_gif_probe['streams']) == 1 and range_gif_probe['streams'][0]['codec_name'] == 'gif'
+        assert abs(float(range_gif_probe['format']['duration'])-0.9) < 0.011
+        range_gif_frames = assert_cropped_pixels(range_gif_path,*EXPECTED_CROP)
+        for button, result_key in [('copy-gif-button','gifResult'),('copy-range-gif-button','rangeGifResult')]:
+            await popup.click('#'+button)
+            await popup.wait_for_function("!document.querySelector('#copy-gif-button').disabled && document.querySelector('#copy-status').textContent.includes('복사 완료')")
+            assert await popup.locator('#copy-status').get_attribute('data-mode') == 'html-gif'
+            copied = await popup.evaluate('''async()=>{
+              const [item] = await navigator.clipboard.read();
+              const bytes = await (await item.getType('web image/gif')).arrayBuffer();
+              const hash = await crypto.subtle.digest('SHA-256',bytes);
+              const html = await (await item.getType('text/html')).text();
+              return {hash:Array.from(new Uint8Array(hash)),animatedHtml:html.includes('data:image/gif;base64,'),types:item.types};
+            }''')
+            expected_hash = await owner.evaluate('''async(key)=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',
+              await(await fetch(recorder.getState()[key].url)).arrayBuffer())))''',result_key)
+            assert copied['hash'] == expected_hash and copied['animatedHtml'], copied
+            assert 'image/png' not in copied['types']
+            assert await owner.evaluate('downloaded.length') == 3
         await popup.select_option('#save-format','mp4')
         await popup.click('#save-button')
+        await owner.wait_for_function('downloaded.length === 4')
         await popup.wait_for_function("document.querySelector('#save-button').disabled === false")
         assert await owner.evaluate('downloaded.at(-1).url === recorder.getState().result.url')
         await popup.locator('body').screenshot(path=str(OUTPUT / f'video-popup-ready{CASE_SUFFIX}.png'))
+        # A different native trim can be cancelled without deleting either the
+        # original, previous clip, or previously created whole/range GIFs.
+        await popup.fill('#trim-start','0.05')
+        await popup.fill('#trim-end','1.90')
+        await popup.locator('#trim-end').blur()
+        await popup.click('#save-range-button')
+        await owner.wait_for_function("recorder.getState().status === 'trimming'")
+        await popup.click('#cancel-export-button')
+        await owner.wait_for_function("recorder.getState().status === 'ready'")
+        await popup.wait_for_function("!document.querySelector('#save-range-button').disabled")
+        cancelled = await owner.evaluate('recorder.getState()')
+        assert cancelled['result']['url'] == state['result']['url']
+        assert cancelled['exportResult']['url'] == clip_state['exportResult']['url']
+        assert '취소' in cancelled['notice']
+        assert await owner.evaluate('downloaded.length') == 4
+        assert await popup.locator('#error-message').is_hidden()
         await popup.close()
         await owner.bring_to_front()
         await owner.evaluate("controller.handle({type:'DISCARD'})")
@@ -231,8 +304,9 @@ async def main():
           'region':[video_stream['width'],video_stream['height']], 'duration':video_probe['format']['duration'],
           'audioFrequency':frequency,
           'gifFrames':gif_probe['streams'][0]['nb_frames'],'gifDuration':gif_probe['format']['duration'],
-          'checkedPixels':{'videoFrames':video_frames,'gifFrames':gif_frames,'allCorners':True},
-          'verified':'3 frozen selector, Escape cancel, letterboxed drag crop, 4 stop, audio/video MP4, every cropped pixel, silent GIF, original MP4 save, viewport resize stops recording',
+          'checkedPixels':{'videoFrames':video_frames,'gifFrames':gif_frames,'clipFrames':clip_frames,'rangeGifFrames':range_gif_frames,'allCorners':True},
+          'clipDuration':clip_probe['format']['duration'],'rangeGifDuration':range_gif_probe['format']['duration'],
+          'verified':'3 frozen selector, Escape cancel, letterboxed drag crop, 4 stop, audio/video MP4, every cropped pixel, silent GIF, hundredths video editor/preview, selected MP4/GIF, whole/range animated GIF clipboard bytes, native trim cancellation, original/cache preservation, viewport resize stops recording',
           'scope':'real keyboard, selector, native media/canvas/worker/UI; synthetic tabCapture and download APIs'},ensure_ascii=False))
         await browser.close()
 

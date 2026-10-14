@@ -1,6 +1,32 @@
 import { createController } from './controller.js';
 
-const controller = createController(chrome);
+let lastVideoSession = null;
+let lastStateKey = null;
+
+async function notifyRecordingState(state) {
+  const sessionToken = state.mode === 'video' ? state.videoSessionToken || state.selectionToken : null;
+  const current = typeof sessionToken === 'string' && Number.isInteger(state.tab?.id)
+    ? { sessionToken, tabId: state.tab.id } : null;
+  const previous = lastVideoSession;
+  const key = current ? `${current.tabId}:${sessionToken}:${state.status}` : null;
+  if (key === lastStateKey && (!previous || current)) return;
+  lastVideoSession = current;
+  lastStateKey = key;
+  const updates = [];
+  const push = (tabId, token, snapshot) => updates.push(chrome.tabs.sendMessage(tabId, {
+    type: 'RECORDING_STATE', sessionToken: token, state: snapshot,
+  }, { frameId: 0 }).catch(() => {}));
+  if (previous && (previous.tabId !== current?.tabId || previous.sessionToken !== current?.sessionToken)) {
+    push(previous.tabId, previous.sessionToken, { status: 'idle', mode: 'video', tab: { id: previous.tabId } });
+  }
+  if (current) push(current.tabId, sessionToken, {
+    status: state.status, mode: state.mode, tab: { id: current.tabId },
+    selectionToken: state.selectionToken, videoSessionToken: state.videoSessionToken,
+  });
+  await Promise.all(updates);
+}
+
+const controller = createController(chrome, { onStateChange: notifyRecordingState });
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id || message?.target !== 'background') return;
   if (sender.tab) {

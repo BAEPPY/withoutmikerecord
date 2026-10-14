@@ -23,6 +23,11 @@ const recordedGif = {
   mimeType: 'image/gif', durationSeconds: 12, kind: 'gif',
 };
 
+const recordedRangeGif = {
+  ...recordedGif, url: 'blob:chrome-extension://recorder/range-gif-1',
+  filename: 'tab-video-2026-10-14-range.gif',
+};
+
 const selectedRegion = { x: 0.1, y: 0.2, width: 0.4, height: 0.3, viewportWidth: 1920, viewportHeight: 1080 };
 const screenshot = 'data:image/png;base64,aW1hZ2U=';
 
@@ -35,7 +40,7 @@ function deferred() {
 
 // The offscreen document owns this state independently of each controller instance.
 // All messages return copies, matching Chrome's message serialization boundary.
-function browser({ status = 'idle', mode = 'audio', download, document = status !== 'idle' } = {}) {
+function browser({ status = 'idle', mode = 'audio', download, document = status !== 'idle', onStateChange } = {}) {
   const calls = [];
   const state = structuredClone(EMPTY_STATE);
   Object.assign(state, {
@@ -56,7 +61,12 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
     async executeScript() {},
     async captureVisibleTab() { return screenshot; },
     async sendTabMessage() { return { ok: true }; },
-    async prepareGif() { return structuredClone(recordedGif); },
+    async prepareGif(startSeconds, endSeconds) {
+      return startSeconds === undefined && endSeconds === undefined ? structuredClone(recordedGif) : {
+        ...recordedRangeGif, startSeconds, endSeconds, durationSeconds: endSeconds - startSeconds,
+      };
+    },
+    async cancelExport() {},
     async startRecording() {},
     async viewportChanged() {},
     async getTab(tabId) {
@@ -68,7 +78,7 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
       return {
         url: 'blob:chrome-extension://recorder/clip-1',
         filename: 'tab-audio-2026-10-13-trim.mp4',
-        bytes: 768, mimeType: recordedFile.mimeType,
+        bytes: 768, mimeType: state.result?.mimeType || recordedFile.mimeType,
         durationSeconds: endSeconds - startSeconds, startSeconds, endSeconds,
       };
     },
@@ -113,7 +123,12 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
           case 'PREPARE_EXPORT':
             state.status = 'trimming';
             try {
-              state.exportResult = await env.prepareExport(message.startSeconds, message.endSeconds);
+              const output = await env.prepareExport(message.startSeconds, message.endSeconds);
+              if (output?.cancelled) {
+                state.status = 'ready';
+                return { ok: false, cancelled: true, state: structuredClone(state) };
+              }
+              state.exportResult = output;
               state.selection = { startSeconds: message.startSeconds, endSeconds: message.endSeconds };
             } catch (error) {
               state.status = 'ready';
@@ -124,13 +139,20 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
           case 'PREPARE_GIF':
             state.status = 'exporting';
             try {
-              state.gifResult = await env.prepareGif();
+              const output = await env.prepareGif(message.startSeconds, message.endSeconds);
+              if (output?.cancelled) {
+                state.status = 'ready';
+                return { ok: false, cancelled: true, state: structuredClone(state) };
+              }
+              if (message.startSeconds !== undefined || message.endSeconds !== undefined) state.rangeGifResult = output;
+              else state.gifResult = output;
             } catch (error) {
               state.status = 'ready';
               return { ok: false, error: error.message, state: structuredClone(state) };
             }
             state.status = 'ready';
             break;
+          case 'CANCEL_EXPORT': await env.cancelExport(); break;
           case 'DISCARD': Object.assign(state, structuredClone(EMPTY_STATE)); break;
           case 'DOWNLOAD_UPDATE': state.download = structuredClone(message.download); break;
           default: throw new Error(`Unexpected offscreen command: ${message.type}`);
@@ -189,7 +211,7 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
       method, async (options) => record(method, options),
     ])),
   };
-  env.controller = createController(env.api);
+  env.controller = createController(env.api, { onStateChange });
   return env;
 }
 
@@ -568,7 +590,7 @@ test('arming page shortcuts injects only into the active tab without starting ca
   assert.equal(reply.state.status, 'idle');
   assert.deepEqual(events(env, 'queryTabs').map(({ data }) => data), [{ active: true, currentWindow: true }]);
   assert.deepEqual(events(env, 'executeScript').map(({ data }) => data), [{
-    target: { tabId: 17 }, files: ['region-selector.js', 'page-shortcuts.js'],
+    target: { tabId: 17 }, files: ['region-selector.js', 'youtube-controls.js', 'page-shortcuts.js'],
   }]);
   assert.equal(events(env, 'capture').length, 0);
   assert.equal(events(env, 'createDocument').length, 0);
@@ -896,7 +918,7 @@ test('opening the video selector injects the page UI and waits for acknowledgeme
   const reply = await env.controller.handle({ type: 'OPEN_VIDEO_SELECTOR', targetTabId: 17 });
   assert.equal(reply.ok, true);
   assert.deepEqual(events(env, 'executeScript')[0].data, {
-    target: { tabId: 17 }, files: ['region-selector.js', 'page-shortcuts.js'],
+    target: { tabId: 17 }, files: ['region-selector.js', 'youtube-controls.js', 'page-shortcuts.js'],
   });
   const shown = events(env, 'sendTabMessage')[0].data;
   assert.equal(shown.tabId, 17);
@@ -1216,7 +1238,7 @@ test('browser audio start arms page shortcuts before requesting its source strea
   assert.equal(reply.ok, true);
   assert.equal(reply.state.status, 'recording');
   assert.deepEqual(events(env, 'executeScript').map(({ data }) => data), [{
-    target: { tabId: 17 }, files: ['region-selector.js', 'page-shortcuts.js'],
+    target: { tabId: 17 }, files: ['region-selector.js', 'youtube-controls.js', 'page-shortcuts.js'],
   }]);
   const injectionIndex = env.calls.findIndex((call) => call.kind === 'executeScript');
   const captureIndex = env.calls.findIndex((call) => call.kind === 'capture');
@@ -1244,7 +1266,7 @@ test('completed page navigation restores shortcuts using the browser permission 
   const env = browser();
   await env.controller.onTabUpdated(88, { status: 'complete' });
   assert.deepEqual(events(env, 'executeScript').map(({ data }) => data), [{
-    target: { tabId: 88 }, files: ['region-selector.js', 'page-shortcuts.js'],
+    target: { tabId: 88 }, files: ['region-selector.js', 'youtube-controls.js', 'page-shortcuts.js'],
   }]);
   assert.equal(events(env, 'contexts').length, 0);
   assert.equal(events(env, 'message').length, 0);
@@ -1459,5 +1481,196 @@ test('STOP_PENDING also preserves a stop requested while pause or resume is awai
     assert.equal(stopped.state.status, 'ready');
     assert.equal(stopped.state.mode, mode);
     assert.equal(messages(env, 'STOP').length, 1);
+  }
+});
+
+test('SAVE_VIDEO_RANGE downloads the selected MP4 or GIF and retains both full recording outputs', async () => {
+  const range = { startSeconds: 1.25, endSeconds: 5.75 };
+  for (const format of ['mp4', 'gif']) {
+    const env = browser({ status: 'ready', mode: 'video' });
+    env.state.gifResult = structuredClone(recordedGif);
+    env.items.set(91, { id: 91, state: 'complete' });
+    const saved = await env.controller.handle({ type: 'SAVE_VIDEO_RANGE', format, ...range });
+    assert.equal(saved.ok, true);
+    assert.equal(saved.state.download.status, 'complete');
+    assert.deepEqual(saved.state.result, recordedVideo);
+    assert.deepEqual(saved.state.gifResult, recordedGif);
+    const preparation = format === 'mp4' ? 'PREPARE_EXPORT' : 'PREPARE_GIF';
+    assert.deepEqual(messages(env, preparation)[0].data, { target: 'offscreen', type: preparation, ...range });
+    const output = format === 'mp4' ? saved.state.exportResult : saved.state.rangeGifResult;
+    assert.equal(output.startSeconds, range.startSeconds);
+    assert.equal(output.endSeconds, range.endSeconds);
+    assert.deepEqual(events(env, 'download')[0].data, {
+      url: output.url, filename: output.filename, saveAs: true, conflictAction: 'uniquify',
+    });
+    assert.notEqual(output.url, recordedVideo.url);
+    assert.notEqual(output.url, recordedGif.url);
+    assert.equal(events(env, 'capture').length, 0);
+    const whole = await env.controller.handle({ type: 'SAVE_VIDEO', format });
+    assert.equal(whole.ok, true);
+    assert.equal(events(env, 'download')[1].data.url, format === 'mp4' ? recordedVideo.url : recordedGif.url);
+  }
+});
+
+test('cancelled range GIF saving preserves the original and range file for retry', async () => {
+  const env = browser({ status: 'ready', mode: 'video' });
+  const range = { startSeconds: 2, endSeconds: 9 };
+  env.state.gifResult = structuredClone(recordedGif);
+  env.download = async () => { throw new Error('USER_CANCELED'); };
+  const cancelled = await env.controller.handle({ type: 'SAVE_VIDEO_RANGE', format: 'gif', ...range });
+  assert.equal(cancelled.ok, false);
+  assert.equal(cancelled.state.download.status, 'interrupted');
+  assert.deepEqual(cancelled.state.result, recordedVideo);
+  assert.deepEqual(cancelled.state.gifResult, recordedGif);
+  assert.equal(cancelled.state.rangeGifResult.startSeconds, 2);
+  const cached = cancelled.state.rangeGifResult;
+  env.download = async () => 92;
+  env.items.set(92, { id: 92, state: 'complete' });
+  const retried = await env.controller.handle({ type: 'SAVE_VIDEO_RANGE', format: 'gif', ...range });
+  assert.equal(retried.ok, true);
+  assert.deepEqual(retried.state.rangeGifResult, cached);
+  assert.equal(events(env, 'download').at(-1).data.url, cached.url);
+  assert.equal(messages(env, 'DISCARD').length, 0);
+});
+
+test('invalid video range save formats or audio sources never begin conversion or download', async () => {
+  for (const [mode, format] of [['audio', 'mp4'], ['audio', 'gif'], ['video', 'webm']]) {
+    const env = browser({ status: 'ready', mode });
+    const reply = await env.controller.handle({ type: 'SAVE_VIDEO_RANGE', format, startSeconds: 1, endSeconds: 4 });
+    assert.equal(reply.ok, false);
+    assert.equal(messages(env, 'PREPARE_EXPORT').length, 0);
+    assert.equal(messages(env, 'PREPARE_GIF').length, 0);
+    assert.equal(events(env, 'download').length, 0);
+  }
+});
+
+test('CANCEL_EXPORT interrupts a pending range conversion and propagates cancellation without opening a picker', { timeout: 3000 }, async () => {
+  for (const format of ['mp4', 'gif']) {
+    const env = browser({ status: 'ready', mode: 'video' });
+    env.state.gifResult = structuredClone(recordedGif);
+    env.state.rangeGifResult = { ...recordedRangeGif, startSeconds: 0, endSeconds: 1, durationSeconds: 1 };
+    const priorRange = structuredClone(env.state.rangeGifResult);
+    const entered = deferred();
+    const conversion = deferred();
+    const preparing = async () => { entered.resolve(); return conversion.promise; };
+    if (format === 'mp4') env.prepareExport = preparing;
+    else env.prepareGif = preparing;
+    env.cancelExport = async () => { conversion.resolve({ cancelled: true }); };
+    const saving = env.controller.handle({ type: 'SAVE_VIDEO_RANGE', format, startSeconds: 3, endSeconds: 8 });
+    await entered.promise;
+    try {
+      const cancelled = await env.controller.handle({ type: 'CANCEL_EXPORT' });
+      assert.equal(cancelled.ok, true);
+      const originalReply = await saving;
+      assert.equal(originalReply.ok, false);
+      assert.equal(originalReply.cancelled, true);
+      assert.equal(originalReply.state.status, 'ready');
+      assert.deepEqual(originalReply.state.result, recordedVideo);
+      assert.deepEqual(originalReply.state.gifResult, recordedGif);
+      assert.deepEqual(originalReply.state.rangeGifResult, priorRange);
+      assert.equal(messages(env, 'CANCEL_EXPORT').length, 1);
+      assert.equal(events(env, 'download').length, 0);
+      assert.equal(messages(env, 'DOWNLOAD_UPDATE').length, 0);
+    } finally {
+      conversion.resolve({ cancelled: true });
+    }
+  }
+});
+
+test('CANCEL_EXPORT without a media document is a harmless no-op', async () => {
+  const env = browser();
+  const reply = await env.controller.handle({ type: 'CANCEL_EXPORT' });
+  assert.equal(reply.ok, true);
+  assert.equal(reply.state.status, 'idle');
+  assert.equal(events(env, 'message').length, 0);
+  assert.equal(events(env, 'createDocument').length, 0);
+});
+
+test('PREPARE_GIF_COPY returns the requested whole or range file without requesting a download', async () => {
+  for (const scope of ['whole', 'range']) {
+    const env = browser({ status: 'ready', mode: 'video' });
+    env.state.gifResult = structuredClone(recordedGif);
+    const range = { startSeconds: 1.125, endSeconds: 8.875 };
+    const reply = await env.controller.handle({ type: 'PREPARE_GIF_COPY', scope, ...range });
+    assert.equal(reply.ok, true);
+    assert.deepEqual(reply.state.result, recordedVideo);
+    assert.deepEqual(reply.state.gifResult, recordedGif);
+    assert.deepEqual(reply.output, scope === 'range' ? reply.state.rangeGifResult : recordedGif);
+    assert.equal(reply.output.mimeType, 'image/gif');
+    assert.deepEqual(messages(env, 'PREPARE_GIF')[0].data, {
+      target: 'offscreen', type: 'PREPARE_GIF', ...(scope === 'range' ? range : {}),
+    });
+    assert.equal(events(env, 'download').length, 0);
+    assert.equal(messages(env, 'DOWNLOAD_UPDATE').length, 0);
+  }
+});
+
+test('GIF copy preparation rejects audio and invalid scopes before conversion', async () => {
+  for (const [mode, scope] of [['audio', 'whole'], ['video', 'invalid']]) {
+    const env = browser({ status: 'ready', mode });
+    const reply = await env.controller.handle({ type: 'PREPARE_GIF_COPY', scope });
+    assert.equal(reply.ok, false);
+    assert.equal(messages(env, 'PREPARE_GIF').length, 0);
+    assert.equal(events(env, 'download').length, 0);
+  }
+});
+
+test('GIF copy conversion cancellation returns its cancelled reply and leaves the video available', { timeout: 3000 }, async () => {
+  const env = browser({ status: 'ready', mode: 'video' });
+  const entered = deferred();
+  const conversion = deferred();
+  env.prepareGif = async () => { entered.resolve(); return conversion.promise; };
+  env.cancelExport = async () => { conversion.resolve({ cancelled: true }); };
+  const copying = env.controller.handle({ type: 'PREPARE_GIF_COPY', scope: 'range', startSeconds: 1, endSeconds: 5 });
+  await entered.promise;
+  try {
+    assert.equal((await env.controller.handle({ type: 'CANCEL_EXPORT' })).ok, true);
+    const reply = await copying;
+    assert.equal(reply.ok, false);
+    assert.equal(reply.cancelled, true);
+    assert.equal(reply.state.status, 'ready');
+    assert.deepEqual(reply.state.result, recordedVideo);
+    assert.equal(reply.output, undefined);
+    assert.equal(events(env, 'download').length, 0);
+    assert.equal(messages(env, 'DOWNLOAD_UPDATE').length, 0);
+  } finally {
+    conversion.resolve({ cancelled: true });
+  }
+});
+
+test('controller badge updates also report canonical state to the injected state observer', async () => {
+  const snapshots = [];
+  const env = browser({ onStateChange: (state) => { snapshots.push(structuredClone(state)); } });
+  await env.controller.handle({ type: 'START' });
+  await env.controller.handle({ type: 'PAUSE' });
+  await env.controller.handle({ type: 'STOP' });
+  await env.controller.handle({ type: 'DISCARD' });
+  assert.deepEqual(snapshots.map((state) => state.status), ['recording', 'paused', 'ready', 'idle']);
+  assert.equal(snapshots[0].tab.id, 17);
+  assert.deepEqual(snapshots[2].result, recordedFile);
+  assert.equal(snapshots[3].tab, null);
+});
+
+test('range video saving and GIF copying reject missing or invalid bounds before conversion', async () => {
+  for (const request of [
+    { type: 'SAVE_VIDEO_RANGE', format: 'mp4' },
+    { type: 'SAVE_VIDEO_RANGE', format: 'gif' },
+    { type: 'PREPARE_GIF_COPY', scope: 'range' },
+  ]) {
+    const env = browser({ status: 'ready', mode: 'video' });
+    for (const range of [
+      {}, { startSeconds: 1 }, { endSeconds: 3 },
+      { startSeconds: null, endSeconds: 3 }, { startSeconds: '1', endSeconds: 3 },
+      { startSeconds: 1, endSeconds: NaN }, { startSeconds: -1, endSeconds: 3 },
+      { startSeconds: 3, endSeconds: 3 }, { startSeconds: 4, endSeconds: 3 },
+      { startSeconds: 1, endSeconds: 13 },
+    ]) {
+      const reply = await env.controller.handle({ ...request, ...range });
+      assert.equal(reply.ok, false, `${request.type}: ${JSON.stringify(range)}`);
+      assert.deepEqual(reply.state.result, recordedVideo);
+    }
+    assert.equal(messages(env, 'PREPARE_GIF').length, 0, 'invalid selected bounds must never fall back to a whole GIF');
+    assert.equal(messages(env, 'PREPARE_EXPORT').length, 0);
+    assert.equal(events(env, 'download').length, 0);
   }
 });

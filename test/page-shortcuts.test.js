@@ -804,6 +804,126 @@ function videoState(status, selectionToken = videoSelection.selectionToken) {
   return { mode: 'video', status, videoSessionToken: selectionToken };
 }
 
+function youtubeControls(env) {
+  const controls = {
+    activeToken: null, hidden: [], restored: [],
+    async paint() {},
+    async hide(token) {
+      this.activeToken = token;
+      this.hidden.push(token);
+      await this.paint();
+    },
+    restore(token) {
+      if (token && token !== this.activeToken) return false;
+      this.restored.push(token);
+      this.activeToken = null;
+      return true;
+    },
+    refresh() {},
+  };
+  env.context.__withoutMikeYouTubeControls = controls;
+  return controls;
+}
+
+test('audio-only recording and dismissed video selection leave YouTube controls untouched', async () => {
+  const env = page();
+  const controls = youtubeControls(env);
+  env.respond = (message) => message.key === '3' ? videoSelection : { ok: true };
+  await env.press('1').completion;
+  await env.press('2').completion;
+  await env.press('3').completion;
+  assert.deepEqual(controls.hidden, []);
+  assert.deepEqual(controls.restored, []);
+});
+
+test('video START waits for hidden controls to paint and stopping restores the same session', async () => {
+  const env = page();
+  const controls = youtubeControls(env);
+  const hiding = deferred();
+  const painted = deferred();
+  controls.paint = () => { hiding.resolve(); return painted.promise; };
+  env.selectRegion = async () => videoRegion;
+  env.respond = (message) => message.key === '3' ? videoSelection
+    : { ok: true, state: videoState(message.key === '4' ? 'ready' : 'recording') };
+  const starting = env.press('3');
+  await hiding.promise;
+  assert.equal(controls.activeToken, videoSelection.selectionToken);
+  assert.deepEqual(env.sent.map((message) => message.type), ['PAGE_SHORTCUT']);
+  painted.resolve();
+  await starting.completion;
+  assert.deepEqual(env.sent.map((message) => message.type), ['PAGE_SHORTCUT', 'VIDEO_REGION_SELECTED']);
+  assert.equal(controls.activeToken, videoSelection.selectionToken);
+  await env.press('4').completion;
+  assert.equal(controls.activeToken, null);
+});
+
+test('cancelling while controls paint restores them and never starts video capture', async () => {
+  const env = page();
+  const controls = youtubeControls(env);
+  const hiding = deferred();
+  const painted = deferred();
+  controls.paint = () => { hiding.resolve(); return painted.promise; };
+  env.selectRegion = async () => videoRegion;
+  env.respond = (message) => message.key === '3' ? videoSelection : { ok: true };
+  const starting = env.press('3');
+  await hiding.promise;
+  await env.press('4').completion;
+  painted.resolve();
+  await starting.completion;
+  assert.equal(controls.activeToken, null);
+  assert.deepEqual(env.sent.map((message) => message.type), ['PAGE_SHORTCUT', 'CANCEL_VIDEO_SELECTION']);
+});
+
+test('a failed video start restores controls even when the failure has no state', async () => {
+  const env = page();
+  const controls = youtubeControls(env);
+  env.selectRegion = async () => videoRegion;
+  env.respond = (message) => message.key === '3' ? videoSelection
+    : message.type === 'VIDEO_REGION_SELECTED' ? { ok: false, error: 'capture failed' } : { ok: true };
+  await env.press('3').completion;
+  assert.equal(controls.activeToken, null);
+  assert.match(env.toast(), /capture failed/);
+});
+
+test('background recording states retain hidden controls through stopping and restore them at completion', async () => {
+  const env = page({ runtimeMessages: true });
+  const controls = youtubeControls(env);
+  for (const status of ['starting', 'recording', 'paused', 'stopping']) {
+    await env.message({ type: 'RECORDING_STATE', state: videoState(status), sessionToken: videoSelection.selectionToken });
+    assert.equal(controls.activeToken, videoSelection.selectionToken);
+  }
+  await env.message({ type: 'RECORDING_STATE', state: videoState('ready'), sessionToken: videoSelection.selectionToken });
+  assert.equal(controls.activeToken, null);
+  await env.message({ type: 'RECORDING_STATE', state: videoState('recording'), sessionToken: videoSelection.selectionToken });
+  assert.equal(controls.activeToken, null, 'a late active snapshot must not hide a completed recording again');
+});
+
+test('stale video completion cannot restore a newer session and a scoped reset can restore it', async () => {
+  const env = page({ runtimeMessages: true });
+  const controls = youtubeControls(env);
+  await env.message({ type: 'RECORDING_STATE', state: videoState('recording', 'old'), sessionToken: 'old' });
+  await env.message({ type: 'RECORDING_STATE', state: videoState('ready', 'old'), sessionToken: 'old' });
+  await env.message({ type: 'RECORDING_STATE', state: videoState('recording', 'new'), sessionToken: 'new' });
+  await env.message({ type: 'RECORDING_STATE', state: videoState('ready', 'old'), sessionToken: 'old' });
+  assert.equal(controls.activeToken, 'new');
+  await env.message({ type: 'RECORDING_STATE', state: { status: 'idle', mode: 'audio' }, sessionToken: 'new' });
+  assert.equal(controls.activeToken, null);
+});
+
+for (const reason of ['pagehide', 'disconnect']) {
+  test(`${reason} restores YouTube controls for a running page recording`, async () => {
+    const env = page();
+    const controls = youtubeControls(env);
+    env.selectRegion = async () => videoRegion;
+    env.respond = (message) => message.key === '3' ? videoSelection : { ok: true, state: videoState('recording') };
+    await env.press('3').completion;
+    assert.equal(controls.activeToken, videoSelection.selectionToken);
+    if (reason === 'pagehide') await env.windowEvent('pagehide');
+    else env.context.__withoutMikePageShortcuts.dispose();
+    assert.equal(controls.activeToken, null);
+  });
+}
+
 function watcherCount(env, type) {
   return env.windowListeners.get(type)?.size || 0;
 }

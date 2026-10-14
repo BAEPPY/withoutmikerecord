@@ -18,7 +18,9 @@ async function harness() {
   const removedTabs = [];
   const updatedTabs = [];
   const downloads = [];
+  const pageMessages = [];
   const listeners = {};
+  let onStateChange = async () => {};
   const chrome = {
     runtime: {
       id: 'withoutmic-test',
@@ -29,6 +31,10 @@ async function harness() {
     tabs: {
       onRemoved: { addListener: (listener) => { listeners.tabRemoved = listener; } },
       onUpdated: { addListener: (listener) => { listeners.tabUpdated = listener; } },
+      async sendMessage(tabId, message, options) {
+        pageMessages.push(structuredClone({ tabId, message, options }));
+        return { ok: true };
+      },
     },
     commands: { onCommand: { addListener: (listener) => { listeners.command = listener; } } },
   };
@@ -37,19 +43,23 @@ async function harness() {
       calls.push(structuredClone(message));
       return { ok: true, state: structuredClone(idleState) };
     },
-    async badge(state) { badges.push(structuredClone(state)); },
+    async badge(state) { badges.push(structuredClone(state)); await onStateChange(state); },
     async onDownloadChanged(delta) { downloads.push(structuredClone(delta)); },
     async onTabRemoved(tabId) { removedTabs.push(tabId); },
     async onTabUpdated(tabId, change) { updatedTabs.push({ tabId, change: structuredClone(change) }); },
   };
   vm.runInNewContext(backgroundSource.replace(controllerImport, ''), {
-    chrome, console, createController: () => controller,
+    chrome, console, createController: (_api, options) => {
+      onStateChange = options?.onStateChange || onStateChange;
+      return controller;
+    },
   }, { filename: 'extension/background.js' });
   await settle();
   calls.length = 0;
   badges.length = 0;
   return {
-    chrome, calls, badges, removedTabs, updatedTabs, downloads, listeners,
+    chrome, calls, badges, removedTabs, updatedTabs, downloads, listeners, pageMessages,
+    stateChange: (state) => onStateChange(state),
     popup: { id: chrome.runtime.id, url: chrome.runtime.getURL('popup.html') },
     page: { id: chrome.runtime.id, tab: { id: 17 }, frameId: 0, url: 'https://example.test/player' },
     async dispatch(message, sender) {
@@ -81,6 +91,7 @@ test('content scripts cannot invoke popup-only commands or forge offscreen state
     'START', 'BROWSER_START', 'STOP', 'STOP_PENDING', 'PAUSE', 'RESUME', 'SAVE', 'SAVE_RANGE', 'DISCARD',
     'SET_SELECTION', 'ARM_SHORTCUTS', 'STATUS', 'STATE_CHANGED',
     'BEGIN_VIDEO', 'START_VIDEO', 'CANCEL_VIDEO', 'STOP_VIDEO', 'OPEN_VIDEO_SELECTOR', 'SAVE_VIDEO',
+    'SAVE_VIDEO_RANGE', 'PREPARE_GIF_COPY', 'CANCEL_EXPORT',
   ]) {
     await h.dispatch({
       target: 'background', type, targetTabId: 17,
@@ -118,6 +129,9 @@ test('the extension popup still routes regular recording and trim commands', asy
     { target: 'background', type: 'OPEN_VIDEO_SELECTOR' },
     { target: 'background', type: 'CANCEL_VIDEO' },
     { target: 'background', type: 'SAVE_VIDEO', format: 'gif' },
+    { target: 'background', type: 'SAVE_VIDEO_RANGE', format: 'mp4', startSeconds: 1, endSeconds: 4 },
+    { target: 'background', type: 'PREPARE_GIF_COPY', scope: 'range', startSeconds: 1, endSeconds: 4 },
+    { target: 'background', type: 'CANCEL_EXPORT' },
     { target: 'background', type: 'SET_SELECTION', startSeconds: 1.25, endSeconds: 5.75 },
     { target: 'background', type: 'SAVE_RANGE', startSeconds: 1.25, endSeconds: 5.75 },
   ]) {
@@ -248,4 +262,79 @@ test('viewport change notifications use the authenticated source tab and only fo
   assert.deepEqual(h.calls, [{
     type: 'VIDEO_VIEWPORT_CHANGED', targetTabId: 17, selectionToken: 'selection-a',
   }]);
+});
+
+test('trusted video state notifications expose only source-frame session state and deduplicate unchanged snapshots', async () => {
+  const h = await harness();
+  const state = {
+    status: 'recording', mode: 'video', tab: { id: 17, title: 'Private title', url: 'https://example.test/private' },
+    selectionToken: null, videoSessionToken: 'video-a', elapsedMs: 10,
+    result: { url: 'blob:private-recording', filename: 'private.mp4', bytes: 1000 },
+    gifResult: { url: 'blob:private-gif' }, rangeGifResult: { url: 'blob:private-range' },
+    download: { id: 91, status: 'complete' },
+  };
+  const offscreen = { id: h.chrome.runtime.id, url: h.chrome.runtime.getURL('offscreen.html') };
+  await h.dispatch({ target: 'background', type: 'STATE_CHANGED', state }, offscreen);
+  assert.deepEqual(h.pageMessages, [{
+    tabId: 17, options: { frameId: 0 }, message: {
+      type: 'RECORDING_STATE', sessionToken: 'video-a', state: {
+        status: 'recording', mode: 'video', tab: { id: 17 }, selectionToken: null, videoSessionToken: 'video-a',
+      },
+    },
+  }]);
+  await h.dispatch({ target: 'background', type: 'STATE_CHANGED', state: { ...state, elapsedMs: 20 } }, offscreen);
+  assert.equal(h.pageMessages.length, 1, 'progress-only changes do not repeat the page notification');
+  for (const sender of [h.page, h.popup, { ...offscreen, id: 'another-extension' }, { ...h.page, url: offscreen.url }]) {
+    await h.dispatch({ target: 'background', type: 'STATE_CHANGED', state: { ...state, status: 'paused' } }, sender);
+  }
+  assert.equal(h.pageMessages.length, 1, 'untrusted updates cannot change page control visibility');
+  await h.dispatch({ target: 'background', type: 'STATE_CHANGED', state: { ...state, status: 'paused' } }, offscreen);
+  assert.equal(h.pageMessages.length, 2);
+  assert.equal(h.pageMessages[1].message.state.status, 'paused');
+});
+
+test('normal video stop and reset notify the same session before clearing its page state', async () => {
+  const h = await harness();
+  const session = { mode: 'video', tab: { id: 17 }, selectionToken: null, videoSessionToken: 'video-a' };
+  for (const status of ['recording', 'stopping', 'ready']) {
+    await h.stateChange({ ...session, status, result: { url: 'blob:private-video' } });
+  }
+  await h.stateChange({ status: 'idle', mode: 'audio', tab: null, videoSessionToken: null, selectionToken: null });
+  await h.stateChange({ status: 'idle', mode: 'audio', tab: null });
+  assert.deepEqual(h.pageMessages.map(({ message }) => [message.sessionToken, message.state.status]), [
+    ['video-a', 'recording'], ['video-a', 'stopping'], ['video-a', 'ready'], ['video-a', 'idle'],
+  ]);
+  assert.deepEqual(h.pageMessages.at(-1), {
+    tabId: 17, options: { frameId: 0 }, message: {
+      type: 'RECORDING_STATE', sessionToken: 'video-a', state: { status: 'idle', mode: 'video', tab: { id: 17 } },
+    },
+  });
+  assert.ok(h.pageMessages.every(({ tabId }) => tabId === 17));
+});
+
+test('switching video sessions clears the old token before sending the new session state', async () => {
+  for (const nextTabId of [17, 88]) {
+    const h = await harness();
+    await h.stateChange({ status: 'recording', mode: 'video', tab: { id: 17 }, selectionToken: null, videoSessionToken: 'old-token' });
+    await h.stateChange({ status: 'selecting', mode: 'video', tab: { id: nextTabId }, selectionToken: 'new-token', videoSessionToken: null });
+    assert.deepEqual(h.pageMessages.map(({ tabId, message }) => [tabId, message.sessionToken, message.state.status]), [
+      [17, 'old-token', 'recording'], [17, 'old-token', 'idle'], [nextTabId, 'new-token', 'selecting'],
+    ]);
+    await h.stateChange({ status: 'recording', mode: 'audio', tab: { id: 99 } });
+    assert.deepEqual(h.pageMessages.at(-1), {
+      tabId: nextTabId, options: { frameId: 0 }, message: {
+        type: 'RECORDING_STATE', sessionToken: 'new-token', state: { status: 'idle', mode: 'video', tab: { id: nextTabId } },
+      },
+    });
+    assert.ok(h.pageMessages.every(({ tabId }) => tabId !== 99), 'audio never sends another page a video visibility command');
+  }
+});
+
+test('a closed source page cannot break recording state handling', async () => {
+  const h = await harness();
+  h.chrome.tabs.sendMessage = async () => { throw new Error('No tab with id: 17'); };
+  await assert.doesNotReject(h.stateChange({
+    status: 'ready', mode: 'video', tab: { id: 17 }, selectionToken: null, videoSessionToken: 'ended-video',
+  }));
+  await assert.doesNotReject(h.stateChange({ status: 'idle', mode: 'audio', tab: null }));
 });

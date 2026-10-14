@@ -1,12 +1,14 @@
 import { inspectMp4, trimMp4 } from './mp4-trim.js';
 import { createVideoCropper, validateVideoRegion, videoCaptureSize } from './video-crop.js';
 import { exportGif } from './gif-export.js';
+import { inspectVideo, trimVideo } from './video-trim.js';
 
 export const MAX_RECORDING_BYTES = 128 * 1024 * 1024;
 export const MAX_RECORDING_MS = 2 * 60 * 60 * 1000;
 
 const ACTIVE_STATUSES = new Set(['recording', 'paused', 'stopping']);
 const DOWNLOAD_STATUSES = new Set(['idle', 'pending', 'complete', 'interrupted']);
+const EXPORT_CANCELLED_NOTICE = '파일 만들기를 취소했어요. 원본은 그대로 남아 있어요.';
 
 function initialState() {
   return {
@@ -16,6 +18,7 @@ function initialState() {
     selectionUrl: null,
     videoSessionToken: null,
     gifResult: null,
+    rangeGifResult: null,
     exportProgress: 0,
     tab: null,
     elapsedMs: 0,
@@ -73,9 +76,13 @@ export class TabAudioRecorder {
     this.onStateChange = options.onStateChange ?? (() => {});
     this.inspectMp4 = options.inspectMp4 ?? inspectMp4;
     this.trimMp4 = options.trimMp4 ?? trimMp4;
+    this.inspectVideo = options.inspectVideo ?? inspectVideo;
+    this.trimVideo = options.trimVideo ?? trimVideo;
     this.exportGif = options.exportGif ?? exportGif;
     this.originalBlob = null;
     this.exportRange = null;
+    this.gifRange = null;
+    this.exportJob = null;
 
     this.state = initialState();
     this.operations = Promise.resolve();
@@ -118,6 +125,7 @@ export class TabAudioRecorder {
       level,
       result: this.state.result ? { ...this.state.result } : null,
       gifResult: this.state.gifResult ? { ...this.state.gifResult } : null,
+      rangeGifResult: this.state.rangeGifResult ? { ...this.state.rangeGifResult } : null,
       selection: this.state.selection ? { ...this.state.selection } : null,
       exportResult: this.state.exportResult ? { ...this.state.exportResult } : null,
       download: { ...this.state.download },
@@ -127,6 +135,12 @@ export class TabAudioRecorder {
   handle(message = {}) {
     // Status polling must remain responsive while capture or finalization waits.
     if (message.type === 'STATUS') {
+      return Promise.resolve({ ok: true, state: this.getState() });
+    }
+    // Cancellation must reach a long-running encoder immediately, even though
+    // the export command itself still occupies the serialized operation queue.
+    if (message.type === 'CANCEL_EXPORT') {
+      this.cancelExport();
       return Promise.resolve({ ok: true, state: this.getState() });
     }
     // A page resize must interrupt pending capture setup, rather than waiting
@@ -180,14 +194,15 @@ export class TabAudioRecorder {
             await this.prepareExport(message);
             break;
           case 'PREPARE_GIF':
-            await this.prepareGif();
+            await this.prepareGif(message);
             break;
           default:
             throw new Error('지원하지 않는 녹음 요청입니다.');
         }
         return { ok: true, state: this.getState() };
       } catch (error) {
-        return { ok: false, error: errorMessage(error), state: this.getState() };
+        return { ok: false, ...(error?.cancelled === true ? { cancelled: true } : {}),
+          error: errorMessage(error), state: this.getState() };
       }
     });
     this.operations = operation.then(() => undefined, () => undefined);
@@ -223,6 +238,7 @@ export class TabAudioRecorder {
       throw new Error('화면을 선택할 탭 정보를 가져오지 못했습니다.');
     }
     this.disposeMedia();
+    this.clearResults();
     this.recordedMs = 0;
     this.activeSince = null;
     this.state = {
@@ -257,6 +273,7 @@ export class TabAudioRecorder {
       throw new Error('탭 오디오 권한을 가져오지 못했습니다. 다시 시작해 주세요.');
     }
     this.disposeMedia();
+    this.clearResults();
     this.state = { ...initialState(), status: 'starting', mode,
       videoSessionToken: isVideo ? selectionToken : null,
       tab: tab ? { id: tab.id, title: String(tab.title || '제목 없는 탭') } : null };
@@ -445,22 +462,26 @@ export class TabAudioRecorder {
       if (!blob.size) throw new Error('녹음된 데이터가 없습니다. 페이지에서 소리를 재생한 뒤 다시 녹음해 주세요.');
       let durationSeconds = null;
       let trimError = null;
-      if (this.state.mode === 'video') {
-        durationSeconds = this.elapsedMs() / 1000;
-        trimError = '화면 녹화는 전체 영상만 저장할 수 있어요.';
-      } else try {
-        const metadata = await this.inspectMp4(blob);
+      let videoDimensions = this.videoDimensions;
+      try {
+        const metadata = this.state.mode === 'video'
+          ? await this.inspectVideo(blob) : await this.inspectMp4(blob);
         if (!Number.isFinite(metadata.durationSeconds) || metadata.durationSeconds <= 0) throw new Error('Invalid duration');
+        if (this.state.mode === 'video') {
+          if (!Number.isFinite(metadata.width) || metadata.width <= 0 ||
+              !Number.isFinite(metadata.height) || metadata.height <= 0) throw new Error('Invalid video size');
+          videoDimensions = { width: metadata.width, height: metadata.height };
+        }
         durationSeconds = metadata.durationSeconds;
       } catch {
-        trimError = '이 파일의 구간 정보를 읽지 못했어요. 전체 녹음은 그대로 저장할 수 있어요.';
+        trimError = '이 파일의 구간 정보를 읽지 못했어요. 원본 전체는 그대로 저장할 수 있어요.';
       }
       const filename = recordingFilename(this.state.tab?.title, this.wallNow());
       const url = this.url.createObjectURL(blob);
       this.originalBlob = blob;
       this.state.result = { url, filename, mimeType, bytes: blob.size, durationSeconds, trimError,
-        kind: this.state.mode, ...(this.state.mode === 'video' ? this.videoDimensions : {}) };
-      this.state.selection = this.state.mode !== 'video' && durationSeconds ? { startSeconds: 0, endSeconds: durationSeconds } : null;
+        kind: this.state.mode, ...(this.state.mode === 'video' ? videoDimensions : {}) };
+      this.state.selection = durationSeconds ? { startSeconds: 0, endSeconds: durationSeconds } : null;
       this.state.bytes = blob.size;
       this.state.status = 'ready';
       this.chunks = [];
@@ -476,7 +497,6 @@ export class TabAudioRecorder {
     if (this.state.status !== 'ready' || !this.state.result || !this.originalBlob) {
       throw new Error('녹음을 끝낸 뒤 구간을 선택해 주세요.');
     }
-    if (this.state.mode === 'video') throw new Error('화면 녹화는 전체 영상만 저장할 수 있어요.');
     if (this.state.download.status === 'pending') throw new Error('파일 저장이 끝난 뒤 구간을 변경해 주세요.');
     const duration = this.state.result.durationSeconds;
     if (!Number.isFinite(duration) || duration <= 0) throw new Error('구간 정보를 읽지 못했어요. 전체 저장을 사용해 주세요.');
@@ -492,20 +512,86 @@ export class TabAudioRecorder {
     this.emit();
   }
 
+  beginExport(status) {
+    const job = { controller: new AbortController() };
+    this.exportJob = job;
+    this.state.status = status;
+    this.state.exportProgress = 0;
+    if (this.state.notice === EXPORT_CANCELLED_NOTICE) this.state.notice = null;
+    this.emit();
+    return job;
+  }
+
+  exportCancelledError() {
+    return Object.assign(new Error(EXPORT_CANCELLED_NOTICE), { name: 'AbortError', cancelled: true });
+  }
+
+  assertExportActive(job) {
+    if (this.exportJob !== job || job.controller.signal.aborted) throw this.exportCancelledError();
+  }
+
+  async runExport(job, operation) {
+    const { signal } = job.controller;
+    try {
+      this.assertExportActive(job);
+      const result = await operation({ signal, onProgress: (value) => {
+        if (this.exportJob !== job || signal.aborted) return;
+        this.state.exportProgress = Math.max(0, Math.min(1, Number(value) || 0));
+        this.emit();
+      } });
+      this.assertExportActive(job);
+      return result;
+    } catch (error) {
+      if (signal.aborted) throw this.exportCancelledError();
+      throw error;
+    }
+  }
+
+  finishExport(job, succeeded) {
+    if (this.exportJob !== job) return;
+    this.exportJob = null;
+    this.state.status = 'ready';
+    this.state.exportProgress = succeeded ? 1 : 0;
+    this.emit();
+  }
+
+  cancelExport() {
+    const job = this.exportJob;
+    if (!job) return;
+    job.controller.abort();
+    // The encoder owns temporary media resources and finishes its cleanup before
+    // finishExport returns the recorder to ready and permits another operation.
+    this.state.notice = EXPORT_CANCELLED_NOTICE;
+    this.state.error = null;
+    this.emit();
+  }
+
+  cachedRange(cache, selection) {
+    return cache?.blob === this.originalBlob && cache.startSeconds === selection.startSeconds &&
+      cache.endSeconds === selection.endSeconds;
+  }
+
   async prepareExport(message) {
     const selection = this.validateSelection(message);
     this.state.selection = selection;
-    if (this.state.exportResult && this.exportRange?.startSeconds === selection.startSeconds &&
-        this.exportRange?.endSeconds === selection.endSeconds) {
+    if (this.state.exportResult && this.cachedRange(this.exportRange, selection)) {
+      if (this.state.notice === EXPORT_CANCELLED_NOTICE) this.state.notice = null;
       this.emit();
       return;
     }
-    this.state.status = 'trimming';
-    this.emit();
+    const job = this.beginExport('trimming');
+    let succeeded = false;
     try {
-      const clip = await this.trimMp4(this.originalBlob, selection.startSeconds, selection.endSeconds);
+      const isVideo = this.state.result.kind === 'video';
+      const clip = await this.runExport(job, (settings) => isVideo
+        ? this.trimVideo(this.originalBlob, selection.startSeconds, selection.endSeconds, settings)
+        : this.trimMp4(this.originalBlob, selection.startSeconds, selection.endSeconds));
       if (!clip.blob?.size || !Number.isFinite(clip.durationSeconds) || clip.durationSeconds <= 0) {
         throw new Error('선택한 구간의 파일을 만들지 못했어요. 다른 구간으로 다시 시도해 주세요.');
+      }
+      if (isVideo && (!/^video\/mp4(?:;|$)/i.test(clip.blob.type) ||
+          !Number.isFinite(clip.width) || clip.width <= 0 || !Number.isFinite(clip.height) || clip.height <= 0)) {
+        throw new Error('선택한 구간의 MP4 영상을 만들지 못했어요. 원본 전체는 저장할 수 있어요.');
       }
       const url = this.url.createObjectURL(clip.blob);
       const suffix = `${selection.startSeconds.toFixed(2)}-${selection.endSeconds.toFixed(2)}s`;
@@ -514,39 +600,53 @@ export class TabAudioRecorder {
         url, filename: this.state.result.filename.replace(/\.mp4$/i, `-clip-${suffix}.mp4`),
         mimeType: clip.blob.type || this.state.result.mimeType, bytes: clip.blob.size,
         durationSeconds: clip.durationSeconds, startSeconds: clip.startSeconds, endSeconds: clip.endSeconds,
+        kind: this.state.result.kind, ...(isVideo ? { width: clip.width, height: clip.height } : {}),
       };
-      this.exportRange = { ...selection };
+      this.exportRange = { ...selection, blob: this.originalBlob };
       if (previousUrl) this.url.revokeObjectURL(previousUrl);
+      succeeded = true;
     } finally {
       // A trim failure leaves the original and the previous export available.
-      this.state.status = 'ready';
-      this.emit();
+      this.finishExport(job, succeeded);
     }
   }
 
-  async prepareGif() {
+  async prepareGif(message = {}) {
     if (this.state.status !== 'ready' || this.state.result?.kind !== 'video' || !this.originalBlob) {
       throw new Error('화면 녹화를 마친 뒤 GIF로 저장할 수 있어요.');
     }
     if (this.state.download.status === 'pending') throw new Error('진행 중인 저장을 먼저 마쳐 주세요.');
-    if (this.state.gifResult) return;
-    this.state.status = 'exporting';
-    this.state.exportProgress = 0;
-    this.emit();
-    try {
-      const output = await this.exportGif(this.originalBlob, { onProgress: (value) => {
-        this.state.exportProgress = Math.max(0, Math.min(1, Number(value) || 0));
-        this.emit();
-      } });
-      if (!output.blob?.size || output.blob.type !== 'image/gif') throw new Error('GIF 파일을 만들지 못했어요. MP4 원본은 저장할 수 있어요.');
-      this.state.gifResult = {
-        url: this.url.createObjectURL(output.blob), filename: this.state.result.filename.replace(/\.mp4$/i, '.gif'),
-        mimeType: 'image/gif', bytes: output.blob.size, width: output.width, height: output.height,
-        frameCount: output.frameCount, durationSeconds: output.durationSeconds,
-      };
-    } finally {
-      this.state.status = 'ready';
+    const selection = message.startSeconds !== undefined || message.endSeconds !== undefined
+      ? this.validateSelection(message) : null;
+    if (selection) this.state.selection = selection;
+    const resultKey = selection ? 'rangeGifResult' : 'gifResult';
+    if (this.state[resultKey] && (!selection || this.cachedRange(this.gifRange, selection))) {
+      if (this.state.notice === EXPORT_CANCELLED_NOTICE) this.state.notice = null;
       this.emit();
+      return;
+    }
+    const job = this.beginExport('exporting');
+    let succeeded = false;
+    try {
+      // Convert the selected range directly from the original MP4. Converting a
+      // previously trimmed MP4 would repeat encoding and shift the time bounds.
+      const output = await this.runExport(job, (settings) => this.exportGif(this.originalBlob, {
+        ...settings, ...(selection || {}),
+      }));
+      if (!output.blob?.size || output.blob.type !== 'image/gif') throw new Error('GIF 파일을 만들지 못했어요. MP4 원본은 저장할 수 있어요.');
+      const suffix = selection ? `-clip-${selection.startSeconds.toFixed(2)}-${selection.endSeconds.toFixed(2)}s.gif` : '.gif';
+      const previousUrl = this.state[resultKey]?.url;
+      this.state[resultKey] = {
+        url: this.url.createObjectURL(output.blob), filename: this.state.result.filename.replace(/\.mp4$/i, suffix),
+        mimeType: 'image/gif', bytes: output.blob.size, width: output.width, height: output.height,
+        frameCount: output.frameCount, durationSeconds: output.durationSeconds, kind: 'video',
+        ...(selection ? { startSeconds: selection.startSeconds, endSeconds: selection.endSeconds } : {}),
+      };
+      if (selection) this.gifRange = { ...selection, blob: this.originalBlob };
+      if (previousUrl) this.url.revokeObjectURL(previousUrl);
+      succeeded = true;
+    } finally {
+      this.finishExport(job, succeeded);
     }
   }
 
@@ -579,11 +679,7 @@ export class TabAudioRecorder {
     if (this.state.download.status === 'pending') {
       throw new Error('파일 저장이 끝난 뒤 녹음을 지울 수 있습니다.');
     }
-    if (this.state.result?.url) this.url.revokeObjectURL(this.state.result.url);
-    if (this.state.exportResult?.url) this.url.revokeObjectURL(this.state.exportResult.url);
-    if (this.state.gifResult?.url) this.url.revokeObjectURL(this.state.gifResult.url);
-    this.originalBlob = null;
-    this.exportRange = null;
+    this.clearResults();
     this.disposeMedia();
     this.chunks = [];
     this.recordedMs = 0;
@@ -595,6 +691,7 @@ export class TabAudioRecorder {
   fail(error) {
     this.freezeElapsed();
     this.disposeMedia();
+    this.clearResults();
     this.chunks = [];
     this.state.status = 'error';
     this.state.error = errorMessage(error);
@@ -602,6 +699,20 @@ export class TabAudioRecorder {
     this.resolveStop?.();
     this.resolveStop = null;
     this.emit();
+  }
+
+  clearResults() {
+    this.exportJob?.controller.abort();
+    this.exportJob = null;
+    const urls = new Set(['result', 'exportResult', 'gifResult', 'rangeGifResult']
+      .map((key) => this.state[key]?.url).filter(Boolean));
+    for (const url of urls) this.url.revokeObjectURL(url);
+    for (const key of ['result', 'exportResult', 'gifResult', 'rangeGifResult']) this.state[key] = null;
+    this.state.selection = null;
+    this.state.exportProgress = 0;
+    this.originalBlob = null;
+    this.exportRange = null;
+    this.gifRange = null;
   }
 
   disposeMedia() {
