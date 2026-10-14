@@ -29,6 +29,7 @@ function element(tagName, attributes = {}) {
 // context makes message timing and extension invalidation deterministic.
 function page({ runtimeMessages = false } = {}) {
   const listeners = new Set();
+  const windowListeners = new Map([['keydown', listeners]]);
   const messageListeners = new Set();
   const sent = [];
   const selections = [];
@@ -37,7 +38,7 @@ function page({ runtimeMessages = false } = {}) {
   const timers = new Map();
   let nextTimer = 0;
   const env = {
-    listeners, messageListeners, sent, selections, messageReplies, selectorCancels: 0,
+    listeners, windowListeners, messageListeners, sent, selections, messageReplies, selectorCancels: 0,
     async respond() { return { ok: true }; },
     async selectRegion() { return null; },
     cancelRegion() {},
@@ -70,11 +71,11 @@ function page({ runtimeMessages = false } = {}) {
       innerWidth: 1000,
       innerHeight: 800,
       addEventListener(type, listener, capture) {
-        assert.equal(type, 'keydown');
-        assert.equal(capture, true);
-        listeners.add(listener);
+        if (type === 'keydown') assert.equal(capture, true);
+        if (!windowListeners.has(type)) windowListeners.set(type, new Set());
+        windowListeners.get(type).add(listener);
       },
-      removeEventListener(type, listener) { listeners.delete(listener); },
+      removeEventListener(type, listener) { windowListeners.get(type)?.delete(listener); },
       setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id; },
       clearTimeout(id) { timers.delete(id); },
     },
@@ -102,6 +103,9 @@ function page({ runtimeMessages = false } = {}) {
     context.window.innerWidth = width;
     context.window.innerHeight = height;
   };
+  env.windowEvent = (type) => Promise.all([...(windowListeners.get(type) || [])].map((listener) => (
+    listener({ type })
+  )));
   env.install();
   return env;
 }
@@ -217,7 +221,9 @@ const videoSelection = {
   imageDataUrl: 'data:image/png;base64,dGVzdA==',
   selectionToken: 'selection-test-token',
 };
-const videoRegion = { x: 0.1, y: 0.2, width: 0.5, height: 0.4 };
+const videoRegion = {
+  x: 0.1, y: 0.2, width: 0.5, height: 0.4, viewportWidth: 1000, viewportHeight: 800,
+};
 
 test('4 cancels a pending 3 as soon as its selection token arrives, without opening the selector',
   { timeout: 2000 }, async () => {
@@ -465,5 +471,247 @@ for (const key of ['1', '2', '3']) {
     await env.press('4').completion;
     assert.match(env.toast(), /화면 녹화를 마쳤어요/);
     assert.deepEqual(env.sent.at(-1), { target: 'background', type: 'PAGE_SHORTCUT', key: '4' });
+  });
+}
+
+function videoState(status, selectionToken = videoSelection.selectionToken) {
+  return { mode: 'video', status, videoSessionToken: selectionToken };
+}
+
+function watcherCount(env, type) {
+  return env.windowListeners.get(type)?.size || 0;
+}
+
+function settleCallbacks() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+test('a real viewport resize reports its session token once while same-size resize events are ignored',
+  { timeout: 2000 }, async () => {
+    const env = page();
+    const changedReply = deferred();
+    env.respond = (message) => {
+      if (message.key === '3') return videoSelection;
+      if (message.type === 'VIDEO_VIEWPORT_CHANGED') return changedReply.promise;
+      return { ok: true, state: videoState('recording') };
+    };
+    env.selectRegion = async () => videoRegion;
+    await env.press('3').completion;
+    assert.equal(watcherCount(env, 'resize'), 1);
+    assert.equal(watcherCount(env, 'pagehide'), 1);
+    const retainedResize = [...env.windowListeners.get('resize')][0];
+
+    await env.windowEvent('resize');
+    assert.equal(env.sent.some((message) => message.type === 'VIDEO_VIEWPORT_CHANGED'), false);
+
+    env.resize(1100, 800);
+    const resizing = env.windowEvent('resize');
+    await env.windowEvent('resize');
+    await retainedResize({ type: 'resize' });
+    assert.deepEqual(env.sent.filter((message) => message.type === 'VIDEO_VIEWPORT_CHANGED'), [{
+      target: 'background', type: 'VIDEO_VIEWPORT_CHANGED', selectionToken: videoSelection.selectionToken,
+    }]);
+
+    changedReply.resolve({ ok: true, state: videoState('ready', null) });
+    await resizing;
+    await settleCallbacks();
+    assert.equal(watcherCount(env, 'resize'), 0);
+    assert.equal(watcherCount(env, 'pagehide'), 0);
+  });
+
+test('resize protection is installed before START replies and queues a stop after that start succeeds',
+  { timeout: 2000 }, async () => {
+    const env = page();
+    const startEntered = deferred();
+    const started = deferred();
+    env.respond = (message) => {
+      if (message.key === '3') return videoSelection;
+      if (message.type === 'VIDEO_REGION_SELECTED') {
+        startEntered.resolve();
+        return started.promise;
+      }
+      if (message.type === 'VIDEO_VIEWPORT_CHANGED') return { ok: true, state: videoState('starting') };
+      return { ok: true, state: videoState('ready', null) };
+    };
+    env.selectRegion = async () => videoRegion;
+    const start = env.press('3');
+    await startEntered.promise;
+    assert.equal(watcherCount(env, 'resize'), 1);
+    env.resize(1000, 700);
+    await env.windowEvent('resize');
+    await env.windowEvent('resize');
+    assert.equal(env.sent.filter((message) => message.type === 'VIDEO_VIEWPORT_CHANGED').length, 1);
+    assert.deepEqual(env.sent.at(-1), {
+      target: 'background', type: 'VIDEO_VIEWPORT_CHANGED', selectionToken: videoSelection.selectionToken,
+    });
+    assert.equal(env.sent.some((message) => message.key === '4'), false);
+
+    started.resolve({ ok: true, state: videoState('recording') });
+    await start.completion;
+    assert.deepEqual(env.sent.at(-1), { target: 'background', type: 'PAGE_SHORTCUT', key: '4' });
+    assert.equal(watcherCount(env, 'resize'), 0);
+    assert.equal(watcherCount(env, 'pagehide'), 0);
+  });
+
+test('old viewport callbacks and a delayed old stop reply cannot remove a newer session watcher',
+  { timeout: 2000 }, async () => {
+    const env = page();
+    const oldToken = videoSelection.selectionToken;
+    const newToken = 'selection-next-token';
+    const oldChangedReply = deferred();
+    let currentToken = oldToken;
+    let currentRegion = videoRegion;
+    env.respond = (message) => {
+      if (message.key === '3') return { ...videoSelection, selectionToken: currentToken };
+      if (message.type === 'VIDEO_VIEWPORT_CHANGED' && message.selectionToken === oldToken) {
+        return oldChangedReply.promise;
+      }
+      if (message.key === '4' || message.type === 'VIDEO_VIEWPORT_CHANGED') {
+        return { ok: true, state: videoState('ready', null) };
+      }
+      return { ok: true, state: videoState('recording', currentToken) };
+    };
+    env.selectRegion = async () => currentRegion;
+    await env.press('3').completion;
+    const oldResize = [...(env.windowListeners.get('resize') || [])][0];
+    const oldPagehide = [...(env.windowListeners.get('pagehide') || [])][0];
+    assert.equal(typeof oldResize, 'function');
+    env.resize(1100, 800);
+    const oldResizeCompletion = env.windowEvent('resize');
+    await env.press('4').completion;
+    currentToken = newToken;
+    currentRegion = { ...videoRegion, viewportWidth: 1100 };
+    await env.press('3').completion;
+    assert.equal(watcherCount(env, 'resize'), 1);
+    assert.equal(watcherCount(env, 'pagehide'), 1);
+    const newResize = [...env.windowListeners.get('resize')][0];
+
+    const sentBeforeStaleCallbacks = env.sent.length;
+    await oldResize({ type: 'resize' });
+    await oldPagehide({ type: 'pagehide' });
+    assert.equal(env.sent.length, sentBeforeStaleCallbacks);
+    oldChangedReply.resolve({ ok: true, state: videoState('ready', null) });
+    await oldResizeCompletion;
+    await settleCallbacks();
+    assert.equal(watcherCount(env, 'resize'), 1);
+    assert.equal(watcherCount(env, 'pagehide'), 1);
+    assert.ok(env.windowListeners.get('resize').has(newResize));
+
+    env.resize(1200, 800);
+    await env.windowEvent('resize');
+    await settleCallbacks();
+    assert.deepEqual(env.sent.filter((message) => message.type === 'VIDEO_VIEWPORT_CHANGED').map((message) => (
+      message.selectionToken
+    )), [oldToken, newToken]);
+  });
+
+test('failed video startup removes viewport watchers and makes retained callbacks inert', async () => {
+  const env = page();
+  let failedResize;
+  let failedPagehide;
+  env.respond = (message) => {
+    if (message.key === '3') return videoSelection;
+    if (message.type === 'VIDEO_REGION_SELECTED') {
+      [failedResize] = env.windowListeners.get('resize') || [];
+      [failedPagehide] = env.windowListeners.get('pagehide') || [];
+      return { ok: false, error: '화면 녹화를 시작하지 못했어요.', state: videoState('error', null) };
+    }
+    return { ok: true, state: videoState('idle', null) };
+  };
+  env.selectRegion = async () => videoRegion;
+  await env.press('3').completion;
+  assert.equal(typeof failedResize, 'function');
+  assert.equal(typeof failedPagehide, 'function');
+  assert.equal(watcherCount(env, 'resize'), 0);
+  assert.equal(watcherCount(env, 'pagehide'), 0);
+  const sentAfterFailure = env.sent.length;
+  env.resize(800, 600);
+  await failedResize({ type: 'resize' });
+  await failedPagehide({ type: 'pagehide' });
+  assert.equal(env.sent.length, sentAfterFailure);
+});
+
+for (const cleanup of ['stop', 'pagehide', 'disconnect']) {
+  test(`${cleanup} releases active video viewport watchers`, async () => {
+    const env = page({ runtimeMessages: true });
+    env.respond = (message) => {
+      if (message.key === '3') return videoSelection;
+      if (message.key === '4') return { ok: true, state: videoState('ready', null) };
+      return { ok: true, state: videoState('recording') };
+    };
+    env.selectRegion = async () => videoRegion;
+    await env.press('3').completion;
+    assert.equal(watcherCount(env, 'resize'), 1);
+    assert.equal(watcherCount(env, 'pagehide'), 1);
+    if (cleanup === 'stop') await env.press('4').completion;
+    if (cleanup === 'pagehide') {
+      const retainedPagehide = [...env.windowListeners.get('pagehide')][0];
+      await env.windowEvent('pagehide');
+      await env.windowEvent('pagehide');
+      await retainedPagehide({ type: 'pagehide' });
+      assert.deepEqual(env.sent.filter((message) => message.type === 'VIDEO_VIEWPORT_CHANGED'), [{
+        target: 'background', type: 'VIDEO_VIEWPORT_CHANGED', selectionToken: videoSelection.selectionToken,
+      }], 'pagehide reports the session exactly once even when its viewport size has not changed');
+    }
+    if (cleanup === 'disconnect') {
+      env.respond = async () => { throw new Error('Extension context invalidated.'); };
+      await env.press('1').completion;
+      assert.equal(env.listeners.size, 0);
+      assert.equal(env.messageListeners.size, 0);
+    }
+    assert.equal(watcherCount(env, 'resize'), 0);
+    assert.equal(watcherCount(env, 'pagehide'), 0);
+  });
+}
+
+for (const scenario of [
+  ...['stopping', 'ready', 'error'].map((status) => ({
+    name: `already ${status} in the same video session`, state: videoState(status), benign: true,
+  })),
+  {
+    name: 'ready in a different video session',
+    state: videoState('ready', 'another-selection-token'), foreignSession: true,
+  },
+  {
+    name: 'ready in audio mode',
+    state: { ...videoState('ready'), mode: 'audio' },
+  },
+]) {
+  test(`queued resize stop handles a failed 4 response ${scenario.name}`, { timeout: 2000 }, async () => {
+    const env = page();
+    const startEntered = deferred();
+    const started = deferred();
+    env.respond = (message) => {
+      if (message.key === '3') return videoSelection;
+      if (message.type === 'VIDEO_REGION_SELECTED') {
+        startEntered.resolve();
+        return started.promise;
+      }
+      if (message.type === 'VIDEO_VIEWPORT_CHANGED') return { ok: true, state: videoState('starting') };
+      if (message.key === '4') return { ok: false, error: 'no recording', state: scenario.state };
+      return { ok: true };
+    };
+    env.selectRegion = async () => videoRegion;
+    const start = env.press('3');
+    await startEntered.promise;
+    env.resize(1000, 700);
+    await env.windowEvent('resize');
+    started.resolve({ ok: true, state: videoState('recording') });
+    await start.completion;
+    assert.deepEqual(env.sent.at(-1), { target: 'background', type: 'PAGE_SHORTCUT', key: '4' });
+    assert.equal(env.sent.filter((message) => message.type === 'VIDEO_VIEWPORT_CHANGED').length, 1);
+
+    if (scenario.benign) {
+      assert.doesNotMatch(env.toast(), /no recording/);
+      if (scenario.state.status === 'stopping') assert.equal(env.toast(), '');
+    } else if (scenario.foreignSession) {
+      // The foreign reply cannot confirm this session stopped, so preserve its
+      // watcher and keep error/success page UI out of a potentially live video.
+      assert.equal(watcherCount(env, 'resize'), 1);
+      assert.equal(watcherCount(env, 'pagehide'), 1);
+      assert.equal(env.toast(), '');
+    } else {
+      assert.equal(env.toast(), 'no recording');
+    }
   });
 }

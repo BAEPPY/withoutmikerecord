@@ -57,6 +57,8 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
     async captureVisibleTab() { return screenshot; },
     async sendTabMessage() { return { ok: true }; },
     async prepareGif() { return structuredClone(recordedGif); },
+    async startRecording() {},
+    async viewportChanged() {},
     async getTab(tabId) {
       const tab = env.tabsById.get(tabId) || (env.activeTab?.id === tabId ? env.activeTab : null);
       if (!tab) throw new Error(`No tab with id: ${tabId}`);
@@ -86,7 +88,12 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
         switch (message.type) {
           case 'STATUS': break;
           case 'START':
+            Object.assign(state, { status: 'starting', mode: message.mode || 'audio', tab: message.tab, result: null });
+            await env.startRecording(message);
             Object.assign(state, { status: 'recording', mode: message.mode || 'audio', tab: message.tab, result: null });
+            break;
+          case 'VIDEO_VIEWPORT_CHANGED':
+            await env.viewportChanged(message);
             break;
           case 'SELECT_VIDEO':
             Object.assign(state, {
@@ -1066,4 +1073,139 @@ test('STATUS remains readable during GIF conversion and the later Save As dialog
   env.items.set(93, { id: 93, state: 'complete' });
   picker.resolve(93);
   assert.equal((await saving).state.download.status, 'complete');
+});
+
+test('viewport change signals reach offscreen while video startup is awaiting capture', { timeout: 3000 }, async () => {
+  for (const stage of ['stream-id', 'offscreen-start']) {
+    const env = browser();
+    const selected = await env.controller.handle({ type: 'BEGIN_VIDEO', targetTabId: 17 });
+    assert.equal(selected.ok, true);
+    const entered = deferred();
+    const release = deferred();
+    if (stage === 'stream-id') {
+      env.capture = async () => { entered.resolve(); await release.promise; return 'video-stream'; };
+    } else {
+      env.startRecording = async () => { entered.resolve(); await release.promise; };
+    }
+    const starting = env.controller.handle({
+      type: 'START_VIDEO', targetTabId: 17, selectionToken: selected.selectionToken, region: selectedRegion,
+    });
+    await entered.promise;
+    let finished = false;
+    starting.then(() => { finished = true; });
+    try {
+      const changed = await env.controller.handle({
+        type: 'VIDEO_VIEWPORT_CHANGED', targetTabId: 17, selectionToken: selected.selectionToken,
+      });
+      assert.equal(changed.ok, true);
+      assert.equal(finished, false, `${stage}: viewport notification must bypass the pending START command`);
+      assert.deepEqual(messages(env, 'VIDEO_VIEWPORT_CHANGED').map(({ data }) => data), [{
+        target: 'offscreen', type: 'VIDEO_VIEWPORT_CHANGED', tabId: 17, selectionToken: selected.selectionToken,
+      }]);
+      assert.equal(changed.state.status, stage === 'stream-id' ? 'selecting' : 'starting');
+    } finally {
+      release.resolve();
+      await starting;
+    }
+  }
+});
+
+test('stale viewport signals retain source and session scope without controller-level stop or cancellation', async () => {
+  for (const mode of ['audio', 'video']) {
+    const env = browser({ status: 'recording', mode });
+    env.state.selectionToken = 'new-selection';
+    const before = structuredClone(env.state);
+    const reply = await env.controller.handle({
+      type: 'VIDEO_VIEWPORT_CHANGED', targetTabId: 88, selectionToken: 'old-selection',
+    });
+    assert.equal(reply.ok, true);
+    assert.deepEqual(reply.state, before, 'the recorder decides whether the scoped signal belongs to its current session');
+    assert.deepEqual(messages(env, 'VIDEO_VIEWPORT_CHANGED')[0].data, {
+      target: 'offscreen', type: 'VIDEO_VIEWPORT_CHANGED', tabId: 88, selectionToken: 'old-selection',
+    });
+    assert.equal(messages(env, 'STOP').length, 0);
+    assert.equal(messages(env, 'CANCEL_VIDEO').length, 0);
+    assert.equal(events(env, 'capture').length, 0);
+  }
+});
+
+test('viewport change signals reject malformed source or session fields before sending to offscreen', async () => {
+  const env = browser({ status: 'recording', mode: 'video' });
+  for (const args of [
+    { selectionToken: 'selection-a' },
+    { targetTabId: null, selectionToken: 'selection-a' },
+    { targetTabId: '17', selectionToken: 'selection-a' },
+    { targetTabId: 17.5, selectionToken: 'selection-a' },
+    { targetTabId: NaN, selectionToken: 'selection-a' },
+    { targetTabId: 17 },
+    { targetTabId: 17, selectionToken: null },
+    { targetTabId: 17, selectionToken: 1 },
+    { targetTabId: 17, selectionToken: {} },
+  ]) {
+    const reply = await env.controller.handle({ type: 'VIDEO_VIEWPORT_CHANGED', ...args });
+    assert.equal(reply.ok, false, JSON.stringify(args));
+    assert.equal(reply.state.status, 'recording');
+    assert.equal(reply.state.mode, 'video');
+  }
+  assert.equal(messages(env, 'VIDEO_VIEWPORT_CHANGED').length, 0);
+  assert.equal(messages(env, 'STOP').length, 0);
+  assert.equal(messages(env, 'CANCEL_VIDEO').length, 0);
+});
+
+test('source navigation forwards the active video session nonce during startup, recording, and pause', async () => {
+  for (const status of ['starting', 'recording', 'paused']) {
+    const env = browser({ status, mode: 'video' });
+    env.state.videoSessionToken = `video-session-${status}`;
+    env.state.selectionToken = 'unrelated-selection-token';
+    await env.controller.onTabUpdated(88, { status: 'loading' });
+    await env.controller.onTabUpdated(17, { status: 'complete' });
+    assert.equal(messages(env, 'VIDEO_VIEWPORT_CHANGED').length, 0);
+    await env.controller.onTabUpdated(17, { status: 'loading' });
+    assert.deepEqual(messages(env, 'VIDEO_VIEWPORT_CHANGED').map(({ data }) => data), [{
+      target: 'offscreen', type: 'VIDEO_VIEWPORT_CHANGED', tabId: 17, selectionToken: `video-session-${status}`,
+    }]);
+    assert.equal(messages(env, 'STOP').length, 0, 'navigation must use the session-scoped signal');
+    assert.equal(messages(env, 'CANCEL_VIDEO').length, 0);
+  }
+  const audio = browser({ status: 'recording', mode: 'audio' });
+  await audio.controller.onTabUpdated(17, { status: 'loading' });
+  assert.equal(messages(audio, 'VIDEO_VIEWPORT_CHANGED').length, 0);
+  assert.equal(messages(audio, 'STOP').length, 0);
+});
+
+test('delayed source navigation retains its old nonce and cannot end a newer video session', async () => {
+  const env = browser({ status: 'recording', mode: 'video' });
+  env.state.videoSessionToken = 'old-video-session';
+  const entered = deferred();
+  const release = deferred();
+  const send = env.api.runtime.sendMessage;
+  let delayStatus = true;
+  env.api.runtime.sendMessage = async (message) => {
+    const reply = await send(message);
+    if (message.type === 'STATUS' && delayStatus) {
+      delayStatus = false;
+      entered.resolve();
+      await release.promise;
+    }
+    return reply;
+  };
+  env.viewportChanged = async (message) => {
+    if (message.selectionToken === env.state.videoSessionToken && message.tabId === env.state.tab.id) {
+      env.state.status = 'ready';
+    }
+  };
+  const navigation = env.controller.onTabUpdated(17, { status: 'loading' });
+  await entered.promise;
+  // The offscreen recorder has advanced to a new session while its old STATUS
+  // snapshot is still in flight to the worker.
+  env.state.videoSessionToken = 'new-video-session';
+  release.resolve();
+  await navigation;
+  assert.deepEqual(messages(env, 'VIDEO_VIEWPORT_CHANGED').map(({ data }) => data), [{
+    target: 'offscreen', type: 'VIDEO_VIEWPORT_CHANGED', tabId: 17, selectionToken: 'old-video-session',
+  }]);
+  assert.equal(env.state.status, 'recording');
+  assert.equal(env.state.videoSessionToken, 'new-video-session');
+  assert.equal(messages(env, 'STOP').length, 0);
+  assert.equal(messages(env, 'CANCEL_VIDEO').length, 0);
 });

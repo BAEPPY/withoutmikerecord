@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { TabAudioRecorder } from '../extension/recorder.js';
-import { validateVideoRegion, videoCropDimensions, createVideoCropper } from '../extension/video-crop.js';
+import { validateVideoRegion, videoCaptureSize, videoCropDimensions, createVideoCropper } from '../extension/video-crop.js';
 
 const region = { x: 0.25, y: 0.25, width: 0.5, height: 0.5, viewportWidth: 1280, viewportHeight: 720 };
 const tab = { id: 41, title: '영상 탭', url: 'https://example.com/video' };
@@ -59,7 +59,12 @@ function harness(options = {}) {
     async close() {}
   }
   const engine = new TabAudioRecorder({
-    mediaDevices: { getUserMedia: async (constraints) => { captures.push(constraints); return stream; } },
+    mediaDevices: { getUserMedia: async (constraints) => {
+      captures.push(constraints);
+      options.onCapture?.();
+      if (options.capturePromise) await options.capturePromise;
+      return stream;
+    } },
     MediaRecorder: Recorder, MediaStream: Stream, AudioContext: Context,
     createVideoCropper: async (input, selection, settings) => {
       assert.equal(input, stream);
@@ -117,7 +122,8 @@ test('records cropped video plus captured tab audio into native MP4 and releases
   assert.equal(started.state.selectionUrl, null);
   assert.deepEqual(h.captures, [{
     audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: 'tab-stream' } },
-    video: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: 'tab-stream' } },
+    video: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: 'tab-stream',
+      minWidth: 1280, maxWidth: 1280, minHeight: 720, maxHeight: 720, maxFrameRate: 30 } },
   }]);
   assert.deepEqual(h.recorders[0].stream.getTracks(), [h.cropped, h.audio]);
   assert.match(h.recorders[0].mimeType, /^video\/mp4/);
@@ -184,6 +190,74 @@ test('source video ending or geometry change stops recording with a saveable res
   }
 });
 
+
+test('viewport changes stop only the matching active video session and preserve the recorded file', async () => {
+  for (const paused of [false, true]) {
+    const h = harness();
+    await h.select();
+    await h.start();
+    h.advance(1500);
+    if (paused) await h.engine.handle({ type: 'PAUSE' });
+    assert.equal(h.engine.getState().videoSessionToken, 'fresh-token');
+    for (const wrong of [{ tabId: 42, selectionToken: 'fresh-token' }, { tabId: tab.id, selectionToken: 'old-token' }, { tabId: tab.id }]) {
+      const reply = await h.engine.handle({ type: 'VIDEO_VIEWPORT_CHANGED', ...wrong });
+      assert.equal(reply.ok, true);
+      assert.equal(h.engine.getState().status, paused ? 'paused' : 'recording');
+    }
+    await h.engine.handle({ type: 'VIDEO_VIEWPORT_CHANGED', tabId: tab.id, selectionToken: 'fresh-token' });
+    await h.engine.stopPromise;
+    const state = h.engine.getState();
+    assert.equal(state.status, 'ready');
+    assert.equal(state.result.kind, 'video');
+    assert.ok(state.result.url);
+    assert.match(state.notice, /페이지의 화면 크기/);
+    assert.equal(h.audio.stopped, true);
+    assert.equal(h.video.stopped, true);
+    assert.equal(h.cropped.stopped, true);
+  }
+});
+
+test('viewport changes interrupt pending capture setup before an encoder can start', async () => {
+  let releaseCapture;
+  let enteredCapture;
+  const capturePromise = new Promise((resolve) => { releaseCapture = resolve; });
+  const entered = new Promise((resolve) => { enteredCapture = resolve; });
+  const h = harness({ capturePromise, onCapture: enteredCapture });
+  await h.select();
+  const starting = h.start();
+  await entered;
+  assert.equal(h.engine.getState().status, 'starting');
+  await h.engine.handle({ type: 'VIDEO_VIEWPORT_CHANGED', tabId: tab.id, selectionToken: 'old-token' });
+  assert.equal(h.engine.startingVideoError, null);
+  const changed = await h.engine.handle({ type: 'VIDEO_VIEWPORT_CHANGED', tabId: tab.id, selectionToken: 'fresh-token' });
+  assert.equal(changed.ok, true, 'resize notification must return while START is waiting');
+  assert.equal(changed.state.status, 'starting');
+  assert.equal(h.recorders.length, 0);
+  releaseCapture();
+  const result = await starting;
+  assert.equal(result.ok, false);
+  assert.equal(result.state.status, 'error');
+  assert.match(result.error, /페이지의 화면 크기/);
+  assert.equal(h.recorders.length, 0, 'resized content never reaches a running recorder');
+  assert.equal(h.crops.length, 0);
+  assert.equal(h.audio.stopped, true);
+  assert.equal(h.video.stopped, true);
+});
+
+test('viewport changes cancel a matching selection and ignore stale selection messages', async () => {
+  const h = harness();
+  await h.select();
+  await h.engine.handle({ type: 'VIDEO_VIEWPORT_CHANGED', tabId: tab.id, selectionToken: 'old-token' });
+  assert.equal(h.engine.getState().status, 'selecting');
+  await h.engine.handle({ type: 'VIDEO_VIEWPORT_CHANGED', tabId: 42, selectionToken: 'fresh-token' });
+  assert.equal(h.engine.getState().status, 'selecting');
+  const cancelled = await h.engine.handle({ type: 'VIDEO_VIEWPORT_CHANGED', tabId: tab.id, selectionToken: 'fresh-token' });
+  assert.equal(cancelled.state.status, 'idle');
+  assert.equal(cancelled.state.selectionToken, null);
+  assert.equal((await h.start()).ok, false);
+  assert.equal(h.captures.length, 0);
+});
+
 test('crop uses normalized source coordinates, even output dimensions, and a 1080p bound', () => {
   const crop = videoCropDimensions(region, 3840, 2160);
   assert.deepEqual(crop, { x: 960, y: 540, cropWidth: 1920, cropHeight: 1080, width: 1920, height: 1080 });
@@ -193,8 +267,51 @@ test('crop uses normalized source coordinates, even output dimensions, and a 108
   const odd = videoCropDimensions({ ...region, width: 0.51, height: 0.51 }, 1280, 720);
   assert.equal(odd.width % 2, 0);
   assert.equal(odd.height % 2, 0);
-  assert.throws(() => videoCropDimensions(region, 800, 800), /크기/);
+  assert.doesNotThrow(() => videoCropDimensions(region, 800, 800), 'letterboxed frames are valid capture input');
   assert.throws(() => validateVideoRegion({ ...region, viewportWidth: NaN }));
+});
+
+
+test('capture constraints follow the CSS viewport aspect with even sizes bounded by 1080p', () => {
+  assert.deepEqual(videoCaptureSize(region), { width: 1280, height: 720 });
+  assert.deepEqual(videoCaptureSize({ ...region, viewportWidth: 3840, viewportHeight: 2160 }), { width: 1920, height: 1080 });
+  assert.deepEqual(videoCaptureSize({ ...region, viewportWidth: 1000, viewportHeight: 1000 }), { width: 1000, height: 1000 });
+  assert.deepEqual(videoCaptureSize({ ...region, viewportWidth: 900, viewportHeight: 1600 }), { width: 606, height: 1080 });
+  assert.deepEqual(videoCaptureSize({ ...region, viewportWidth: 1281, viewportHeight: 721 }), { width: 1280, height: 720 });
+  assert.throws(() => videoCaptureSize({ ...region, viewportHeight: NaN }));
+});
+
+test('crop coordinates exclude pillarboxes and letterboxes around a captured viewport', () => {
+  const square = { ...region, viewportWidth: 1000, viewportHeight: 1000 };
+  assert.deepEqual(videoCropDimensions(square, 1280, 720), {
+    x: 460, y: 180, cropWidth: 360, cropHeight: 360, width: 360, height: 360,
+  });
+  const wide = { ...region, viewportWidth: 1920, viewportHeight: 900 };
+  assert.deepEqual(videoCropDimensions(wide, 1280, 720), {
+    x: 320, y: 210, cropWidth: 640, cropHeight: 300, width: 640, height: 300,
+  });
+  const full = { ...square, x: 0, y: 0, width: 1, height: 1 };
+  assert.deepEqual(videoCropDimensions(full, 1280, 720), {
+    x: 280, y: 0, cropWidth: 720, cropHeight: 720, width: 720, height: 720,
+  });
+  const bounded = videoCropDimensions(full, 3840, 2160);
+  assert.deepEqual(bounded, { x: 840, y: 0, cropWidth: 2160, cropHeight: 2160, width: 1080, height: 1080 });
+});
+
+test('content bounds follow Chromium even-pixel letterboxing and tolerate odd video frame sizes', () => {
+  const full = { ...region, x: 0, y: 0, width: 1, height: 1, viewportWidth: 640, viewportHeight: 480 };
+  const pillarbox = videoCropDimensions(full, 1000, 500);
+  assert.deepEqual([pillarbox.x, pillarbox.y, pillarbox.cropWidth, pillarbox.cropHeight], [166, 0, 666, 500]);
+  const letterbox = videoCropDimensions(full, 500, 1000);
+  assert.deepEqual([letterbox.x, letterbox.y, letterbox.cropWidth, letterbox.cropHeight], [0, 312, 500, 374]);
+  const wide = videoCropDimensions({ ...full, viewportWidth: 1920, viewportHeight: 1080 }, 1000, 500);
+  assert.deepEqual([wide.x, wide.y, wide.cropWidth, wide.cropHeight], [54, 0, 890, 500]);
+  const odd = videoCropDimensions(full, 1001, 501);
+  assert.deepEqual([odd.x, odd.y, odd.cropWidth, odd.cropHeight], [166, 0, 668, 501]);
+  assert.equal(odd.width % 2, 0);
+  assert.equal(odd.height % 2, 0);
+  assert.ok(odd.x + odd.cropWidth <= 1001);
+  assert.ok(odd.y + odd.cropHeight <= 501);
 });
 
 function cropHarness(options = {}) {
@@ -233,20 +350,24 @@ function cropHarness(options = {}) {
   };
 }
 
-test('live cropper draws only selected pixels and stops drawing when source geometry changes', async () => {
+test('live cropper remaps changed encoder resolution and keeps the output dimensions fixed', async () => {
   const h = cropHarness();
-  let changed = 0;
-  const crop = await createVideoCropper({}, region, { ...h.options, onGeometryChanged: () => { changed++; } });
+  const crop = await createVideoCropper({}, region, h.options);
   assert.deepEqual(h.draws[0].slice(1), [320, 180, 640, 360, 0, 0, 640, 360]);
   assert.equal(crop.width, 640);
   assert.equal(crop.height, 360);
   h.frame();
   assert.equal(h.draws.length, 2);
-  h.video.videoWidth = 1440;
+  h.video.videoWidth = 1920;
+  h.video.videoHeight = 1080;
   h.frame();
-  assert.equal(changed, 1);
-  assert.equal(h.draws.length, 2, 'a resized frame must never enter the cropped output');
-  assert.equal(h.frames.size, 0);
+  assert.deepEqual(h.draws.at(-1).slice(1), [480, 270, 960, 540, 0, 0, 640, 360]);
+  h.video.videoHeight = 1200;
+  h.frame();
+  assert.deepEqual(h.draws.at(-1).slice(1), [480, 330, 960, 540, 0, 0, 640, 360]);
+  assert.equal(h.frames.size, 1, 'encoder resolution changes do not cancel frame callbacks');
+  assert.equal(h.canvas.width, 640);
+  assert.equal(h.canvas.height, 360);
   crop.dispose();
   assert.equal(h.outputTrack.stopped, true);
   assert.equal(h.video.srcObject, null);
@@ -273,8 +394,7 @@ test('live cropper disposal cancels its next frame and cleans up a stalled video
 
 test('timer fallback records frames without compositor callbacks and avoids duplicate draws', async () => {
   const h = cropHarness();
-  let changed = 0;
-  const crop = await createVideoCropper({}, region, { ...h.options, onGeometryChanged: () => { changed++; } });
+  const crop = await createVideoCropper({}, region, h.options);
   assert.equal(h.draws.length, 1);
   assert.equal(h.intervals.size, 1, 'fallback runs even when frame callbacks are supported');
   h.tick();
@@ -285,10 +405,16 @@ test('timer fallback records frames without compositor callbacks and avoids dupl
   h.frame();
   h.tick(0);
   assert.equal(h.draws.length, 4, 'timer does not redraw a just-rendered callback frame');
-  h.video.videoHeight = 800;
-  h.tick(0);
-  assert.equal(changed, 1, 'size changes are caught even inside the draw throttle window');
-  assert.equal(h.draws.length, 4);
+  h.video.videoHeight = 0;
+  h.tick();
+  assert.equal(h.draws.length, 4, 'temporarily unavailable frame dimensions are skipped');
+  h.video.videoHeight = 720;
+  h.video.readyState = 0;
+  h.frame();
+  assert.equal(h.draws.length, 4, 'frames that are not ready are skipped');
+  h.video.readyState = 2;
+  h.tick();
+  assert.equal(h.draws.length, 5, 'drawing resumes once a valid frame returns');
   crop.dispose();
   assert.equal(h.intervals.size, 0);
   assert.equal(h.frames.size, 0);

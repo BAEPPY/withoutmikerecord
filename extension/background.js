@@ -12,6 +12,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       command = { type: 'START_VIDEO', region: message.region, selectionToken: message.selectionToken };
     } else if (message.type === 'CANCEL_VIDEO_SELECTION' && typeof message.selectionToken === 'string') {
       command = { type: 'CANCEL_VIDEO', selectionToken: message.selectionToken };
+    } else if (message.type === 'VIDEO_VIEWPORT_CHANGED' && typeof message.selectionToken === 'string') {
+      command = { type: 'VIDEO_VIEWPORT_CHANGED', selectionToken: message.selectionToken };
     } else return;
     controller.handle({ ...command, targetTabId: sender.tab.id }).then(respond);
     return true;

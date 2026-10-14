@@ -1,7 +1,7 @@
 export const EMPTY_STATE = {
   status: 'idle', tab: null, elapsedMs: 0, bytes: 0, level: 0,
   error: null, notice: null, result: null, selection: null, exportResult: null,
-  mode: 'audio', selectionToken: null, selectionUrl: null, gifResult: null, exportProgress: 0,
+  mode: 'audio', selectionToken: null, selectionUrl: null, videoSessionToken: null, gifResult: null, exportProgress: 0,
   download: { id: null, status: 'idle', error: null },
 };
 
@@ -95,6 +95,15 @@ export function createController(api) {
   }
 
   async function run(message) {
+    if (message.type === 'VIDEO_VIEWPORT_CHANGED') {
+      if (!Number.isInteger(message.targetTabId) || typeof message.selectionToken !== 'string') {
+        throw new Error('화면 변경 요청이 올바르지 않아요.');
+      }
+      if (!await hasDocument()) return { ok: true, state: structuredClone(EMPTY_STATE) };
+      const reply = await send('VIDEO_VIEWPORT_CHANGED', { tabId: message.targetTabId, selectionToken: message.selectionToken });
+      await badge(reply.state);
+      return reply;
+    }
     let current = await reconcileDownload(await state());
     if (message.type === 'STATUS') return { ok: true, state: current };
     if (message.type === 'ARM_SHORTCUTS' || message.type === 'OPEN_VIDEO_SELECTOR') {
@@ -255,7 +264,7 @@ export function createController(api) {
     badge,
     // Reads remain responsive while a native Save As dialog is open.
     handle(message) {
-      if (message.type === 'STATUS') return safeRun(message);
+      if (message.type === 'STATUS' || message.type === 'VIDEO_VIEWPORT_CHANGED') return safeRun(message);
       const result = commands.then(() => safeRun(message));
       commands = result.catch(() => {});
       return result;
@@ -278,6 +287,11 @@ export function createController(api) {
       const current = await state();
       if (current.tab?.id === tabId && current.status === 'selecting') {
         await this.handle({ type: 'CANCEL_VIDEO', targetTabId: tabId, selectionToken: current.selectionToken });
+      } else if (current.tab?.id === tabId && current.mode === 'video' &&
+          ['starting', 'recording', 'paused'].includes(current.status)) {
+        // A replaced document no longer owns the viewport watcher. End only
+        // its session, even if a newer recording starts before this is handled.
+        await this.handle({ type: 'VIDEO_VIEWPORT_CHANGED', targetTabId: tabId, selectionToken: current.videoSessionToken });
       }
     },
   };

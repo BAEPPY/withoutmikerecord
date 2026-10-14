@@ -1,5 +1,5 @@
 import { inspectMp4, trimMp4 } from './mp4-trim.js';
-import { createVideoCropper, validateVideoRegion } from './video-crop.js';
+import { createVideoCropper, validateVideoRegion, videoCaptureSize } from './video-crop.js';
 import { exportGif } from './gif-export.js';
 
 export const MAX_RECORDING_BYTES = 128 * 1024 * 1024;
@@ -14,6 +14,7 @@ function initialState() {
     mode: 'audio',
     selectionToken: null,
     selectionUrl: null,
+    videoSessionToken: null,
     gifResult: null,
     exportProgress: 0,
     tab: null,
@@ -126,6 +127,19 @@ export class TabAudioRecorder {
   handle(message = {}) {
     // Status polling must remain responsive while capture or finalization waits.
     if (message.type === 'STATUS') {
+      return Promise.resolve({ ok: true, state: this.getState() });
+    }
+    // A page resize must interrupt pending capture setup, rather than waiting
+    // behind START in the command queue and recording a different viewport.
+    if (message.type === 'VIDEO_VIEWPORT_CHANGED') {
+      const token = this.state.status === 'selecting' ? this.state.selectionToken : this.state.videoSessionToken;
+      if (this.state.mode === 'video' && this.state.tab?.id === message.tabId &&
+          typeof message.selectionToken === 'string' && token === message.selectionToken) {
+        const notice = '페이지의 화면 크기가 바뀌어 녹화를 마쳤어요. 새 영역을 선택해 다시 녹화해 주세요.';
+        if (this.state.status === 'selecting') this.cancelVideo({ selectionToken: token });
+        else if (this.state.status === 'starting') this.startingVideoError = new Error(notice);
+        else this.stopAfterNotice(notice);
+      }
       return Promise.resolve({ ok: true, state: this.getState() });
     }
     if (['trimming', 'exporting'].includes(this.state.status)) {
@@ -243,7 +257,9 @@ export class TabAudioRecorder {
       throw new Error('탭 오디오 권한을 가져오지 못했습니다. 다시 시작해 주세요.');
     }
     this.disposeMedia();
-    this.state = { ...initialState(), status: 'starting', mode, tab: tab ? { id: tab.id, title: String(tab.title || '제목 없는 탭') } : null };
+    this.state = { ...initialState(), status: 'starting', mode,
+      videoSessionToken: isVideo ? selectionToken : null,
+      tab: tab ? { id: tab.id, title: String(tab.title || '제목 없는 탭') } : null };
     this.chunks = [];
     this.recordedMs = 0;
     this.activeSince = null;
@@ -269,6 +285,7 @@ export class TabAudioRecorder {
           : '이 브라우저는 MP4 오디오 녹음을 지원하지 않습니다. Chrome 또는 Edge를 최신 버전으로 업데이트해 주세요.');
       }
       this.recordingMimeType = mimeType;
+      const captureSize = isVideo ? videoCaptureSize(region) : null;
       // These mandatory constraints request ONLY the tab stream obtained by
       // chrome.tabCapture. There is deliberately no microphone fallback.
       this.stream = await this.mediaDevices.getUserMedia({
@@ -278,8 +295,13 @@ export class TabAudioRecorder {
             chromeMediaSourceId: streamId,
           },
         },
-        video: isVideo ? { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } } : false,
+        video: isVideo ? { mandatory: {
+          chromeMediaSource: 'tab', chromeMediaSourceId: streamId,
+          minWidth: captureSize.width, maxWidth: captureSize.width,
+          minHeight: captureSize.height, maxHeight: captureSize.height, maxFrameRate: 30,
+        } } : false,
       });
+      if (this.startingVideoError) throw this.startingVideoError;
       if (!this.stream.getAudioTracks().length) {
         throw new Error('탭에서 오디오 스트림을 가져오지 못했습니다.');
       }

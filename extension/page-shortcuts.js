@@ -9,6 +9,7 @@
   let cancelVideoRequested = false;
   let scheduledVideoStart = null;
   let videoRecording = false;
+  let videoViewportWatch = null;
   let toastHost = null;
   let toastMessage = null;
   let toastTimer = null;
@@ -99,6 +100,7 @@
     window.removeEventListener('keydown', onKeydown, true);
     try { globalThis.chrome?.runtime?.onMessage?.removeListener?.(onBackgroundMessage); }
     catch { /* An extension update can invalidate this API before cleanup. */ }
+    removeVideoViewportWatch();
     cancelVideoSelection();
     if (globalThis[installationKey] === installation) delete globalThis[installationKey];
   }
@@ -106,16 +108,67 @@
   function cancelVideoSelection() {
     if (scheduledVideoStart !== null) window.clearTimeout(scheduledVideoStart);
     scheduledVideoStart = null;
-    if (pendingKey === '3') cancelVideoRequested = true;
+    if (pendingKey === '3') {
+      cancelVideoRequested = true;
+      if (videoViewportWatch?.starting) removeVideoViewportWatch();
+    }
     globalThis.__withoutMikeCancelRegion?.();
   }
 
+  function removeVideoViewportWatch(expected = videoViewportWatch) {
+    if (!expected || videoViewportWatch !== expected) return;
+    window.removeEventListener('resize', expected.onResize, true);
+    window.removeEventListener('pagehide', expected.onPageHide, true);
+    videoViewportWatch = null;
+  }
+
+  function watchVideoViewport(selectionToken, region) {
+    removeVideoViewportWatch();
+    const watch = {
+      selectionToken, width: region.viewportWidth, height: region.viewportHeight,
+      signalled: false, starting: true, onResize: null, onPageHide: null,
+    };
+    const signalGeometryChange = () => {
+      if (videoViewportWatch !== watch || watch.signalled) return;
+      watch.signalled = true;
+      if (pendingKey === '3') cancelVideoRequested = true;
+      // Tab capture may keep a fixed output resolution while the source page
+      // changes size. Only the source viewport can detect that layout change.
+      void send({
+        target: 'background', type: 'VIDEO_VIEWPORT_CHANGED', selectionToken,
+      }).catch((error) => {
+        if (!runtimeAvailable() || /extension context invalidated/i.test(error?.message || '')) disconnect();
+      });
+    };
+    watch.onResize = () => {
+      if (window.innerWidth !== watch.width || window.innerHeight !== watch.height) signalGeometryChange();
+    };
+    watch.onPageHide = () => {
+      if (videoViewportWatch !== watch) return;
+      // Navigating away destroys this guard even when the capture frame keeps
+      // the same dimensions, so stop the scoped recording before detaching.
+      signalGeometryChange();
+      removeVideoViewportWatch(watch);
+    };
+    videoViewportWatch = watch;
+    window.addEventListener('resize', watch.onResize, true);
+    window.addEventListener('pagehide', watch.onPageHide, true);
+    return watch;
+  }
+
   async function send(message) {
+    const watchAtRequest = videoViewportWatch;
     const reply = await chrome.runtime.sendMessage(message);
     if (reply?.state) {
+      // A delayed resize/stop reply from an earlier recording must not remove
+      // the new recording's watcher or make its page notifications visible.
+      if (watchAtRequest !== videoViewportWatch && (watchAtRequest || videoViewportWatch)) return reply;
+      const replyToken = reply.state.videoSessionToken || reply.state.selectionToken;
+      if (videoViewportWatch && replyToken && replyToken !== videoViewportWatch.selectionToken) return reply;
       videoRecording = reply.state.mode === 'video'
         && ['starting', 'recording', 'paused', 'stopping'].includes(reply.state.status);
       if (videoRecording) removeToast();
+      else removeVideoViewportWatch(watchAtRequest);
     }
     return reply;
   }
@@ -148,6 +201,7 @@
     if (!reply?.ok) throw new Error(reply?.error || '영역 선택을 시작하지 못했어요. 다시 시도해 주세요.');
     const selectionToken = reply.selectionToken;
     let submitted = false;
+    let selectionWatch = null;
     const cancel = () => send({
       target: 'background', type: 'CANCEL_VIDEO_SELECTION', selectionToken,
     });
@@ -168,20 +222,37 @@
       }
       // The selector removes its dialog and waits two animation frames before
       // resolving. A success toast here would itself appear in the new video.
+      selectionWatch = watchVideoViewport(selectionToken, region);
       const started = await send({
         target: 'background', type: 'VIDEO_REGION_SELECTED', selectionToken, region,
       });
       if (!started?.ok) throw new Error(started?.error || '화면 녹화를 시작하지 못했어요. 다시 시도해 주세요.');
       submitted = true;
+      selectionWatch.starting = false;
       if (!started.state) videoRecording = true;
       if (cancelVideoRequested) {
         const stopped = await send({ target: 'background', type: 'PAGE_SHORTCUT', key: '4' });
-        if (!stopped?.ok) throw new Error(stopped?.error || '녹화를 중지하지 못했어요. 4를 다시 눌러 주세요.');
+        if (!stopped?.ok) {
+          const alreadyStopping = stopped?.state?.mode === 'video'
+            && stopped.state.videoSessionToken === selectionToken
+            && ['stopping', 'ready', 'error'].includes(stopped.state.status);
+          if (!alreadyStopping) throw new Error(stopped?.error || '녹화를 중지하지 못했어요. 4를 다시 눌러 주세요.');
+          // The direct viewport signal can beat this queued stop. Its matching
+          // session has already ended (or is ending), so no error toast belongs
+          // on the page, particularly while the final video frames drain.
+          removeVideoViewportWatch(selectionWatch);
+          videoRecording = stopped.state.status === 'stopping';
+          return;
+        }
+        removeVideoViewportWatch(selectionWatch);
         videoRecording = false;
         showToast('화면 녹화를 마쳤어요. 확장 아이콘을 눌러 파일을 저장해 주세요.');
       }
     } catch (error) {
-      if (!submitted) await cancel().catch(() => {});
+      if (!submitted) {
+        removeVideoViewportWatch(selectionWatch);
+        await cancel().catch(() => {});
+      }
       throw error;
     }
   }
@@ -230,7 +301,10 @@
         target: 'background', type: 'PAGE_SHORTCUT', key,
       });
       if (!reply?.ok) throw new Error(reply?.error || reconnectHint);
-      if (key === '1' || key === '4') videoRecording = false;
+      if (key === '1' || key === '4') {
+        videoRecording = false;
+        removeVideoViewportWatch();
+      }
       if (pendingKey === '1' && stopAfterStart) {
         stopAfterStart = false;
         pendingKey = '2';

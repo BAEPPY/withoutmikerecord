@@ -17,21 +17,47 @@ export function validateVideoRegion(region) {
   return { x, y, width, height, viewportWidth, viewportHeight };
 }
 
+/** Ask the browser for a frame whose aspect follows the selected viewport. */
+export function videoCaptureSize(region) {
+  validateVideoRegion(region);
+  const scale = Math.min(1, MAX_WIDTH / region.viewportWidth, MAX_HEIGHT / region.viewportHeight);
+  return {
+    width: Math.max(2, Math.floor(region.viewportWidth * scale / 2) * 2),
+    height: Math.max(2, Math.floor(region.viewportHeight * scale / 2) * 2),
+  };
+}
+
+function contentRectangle(region, frameWidth, frameHeight) {
+  const scale = Math.min(frameWidth / region.viewportWidth, frameHeight / region.viewportHeight);
+  let width = Math.round(region.viewportWidth * scale);
+  let height = Math.round(region.viewportHeight * scale);
+  let x = Math.floor((frameWidth - width) / 2);
+  let y = Math.floor((frameHeight - height) / 2);
+  // Chromium centers the viewport inside the encoded frame. Its I420 capture
+  // path aligns the resulting origin and size to even pixels (video_util.cc,
+  // ComputeLetterboxRegionForI420); odd RGB frame sizes use ordinary centering.
+  if (frameWidth % 2 === 0 && frameHeight % 2 === 0) {
+    width = Math.floor((width + x % 2) / 2) * 2;
+    height = Math.floor((height + y % 2) / 2) * 2;
+    x = Math.floor(x / 2) * 2;
+    y = Math.floor(y / 2) * 2;
+  }
+  if (width < 1 || height < 1) throw new Error('선택한 화면 영역이 너무 작아요. 더 큰 영역을 선택해 주세요.');
+  return { x, y, width, height };
+}
+
 export function videoCropDimensions(region, sourceWidth, sourceHeight) {
   validateVideoRegion(region);
   if (!Number.isFinite(sourceWidth) || !Number.isFinite(sourceHeight) || sourceWidth < 2 || sourceHeight < 2) {
     throw new Error('탭의 화면 크기를 읽지 못했습니다.');
   }
-  const expectedAspect = region.viewportWidth / region.viewportHeight;
-  if (Math.abs((sourceWidth / sourceHeight) / expectedAspect - 1) > 0.02) {
-    throw new Error('영역을 선택한 뒤 화면 크기가 바뀌었어요. 다시 선택해 주세요.');
-  }
-  const cropWidth = Math.min(sourceWidth - region.x * sourceWidth, region.width * sourceWidth);
-  const cropHeight = Math.min(sourceHeight - region.y * sourceHeight, region.height * sourceHeight);
+  const content = contentRectangle(region, sourceWidth, sourceHeight);
+  const cropWidth = Math.min(content.width * (1 - region.x), region.width * content.width);
+  const cropHeight = Math.min(content.height * (1 - region.y), region.height * content.height);
   const scale = Math.min(1, MAX_WIDTH / cropWidth, MAX_HEIGHT / cropHeight);
   return {
-    x: region.x * sourceWidth,
-    y: region.y * sourceHeight,
+    x: content.x + region.x * content.width,
+    y: content.y + region.y * content.height,
     cropWidth,
     cropHeight,
     width: Math.max(2, Math.floor(cropWidth * scale / 2) * 2),
@@ -47,7 +73,6 @@ export async function createVideoCropper(stream, requestedRegion, options = {}) 
   const clearTimeout = options.clearTimeout ?? globalThis.clearTimeout.bind(globalThis);
   const setInterval = options.setInterval ?? globalThis.setInterval.bind(globalThis);
   const clearInterval = options.clearInterval ?? globalThis.clearInterval.bind(globalThis);
-  const onGeometryChanged = options.onGeometryChanged ?? (() => {});
   const now = options.now ?? (() => performance.now());
   if (!document?.createElement) throw new Error('이 브라우저에서 화면 녹화를 시작할 수 없습니다.');
   const video = document.createElement('video');
@@ -59,7 +84,6 @@ export async function createVideoCropper(stream, requestedRegion, options = {}) 
   let frameId = null;
   let timer = null;
   let disposed = false;
-  let invalid = false;
   let removeReadyListeners = () => {};
   const dispose = () => {
     if (disposed) return;
@@ -101,28 +125,32 @@ export async function createVideoCropper(stream, requestedRegion, options = {}) 
       Promise.resolve(video.play()).then(ready, (error) => finish(error));
       ready();
     });
-    const sourceWidth = video.videoWidth;
-    const sourceHeight = video.videoHeight;
-    const dimensions = videoCropDimensions(region, sourceWidth, sourceHeight);
-    canvas.width = dimensions.width;
-    canvas.height = dimensions.height;
+    let sourceWidth = video.videoWidth;
+    let sourceHeight = video.videoHeight;
+    let dimensions = videoCropDimensions(region, sourceWidth, sourceHeight);
+    const outputWidth = dimensions.width;
+    const outputHeight = dimensions.height;
+    canvas.width = outputWidth;
+    canvas.height = outputHeight;
     const context = canvas.getContext('2d', { alpha: false });
     if (!context || !canvas.captureStream) throw new Error('이 브라우저는 선택 영역의 화면 녹화를 지원하지 않습니다.');
     let lastDraw = -Infinity;
     const frameInterval = 1000 / FRAME_RATE;
     const draw = () => {
-      if (disposed || invalid) return;
+      if (disposed || video.readyState < 2 || video.videoWidth < 2 || video.videoHeight < 2) return;
       if (video.videoWidth !== sourceWidth || video.videoHeight !== sourceHeight) {
-        invalid = true;
-        onGeometryChanged();
-        return;
+        // Encoders can change resolution during startup or while adapting to
+        // load. That changes letterboxing, not the selected CSS viewport.
+        sourceWidth = video.videoWidth;
+        sourceHeight = video.videoHeight;
+        dimensions = videoCropDimensions(region, sourceWidth, sourceHeight);
       }
       const timestamp = now();
       // A frame callback and the fallback timer may arrive together. Render at
-      // most once per frame interval while keeping geometry checks immediate.
-      if (video.readyState >= 2 && timestamp - lastDraw >= frameInterval * 0.9) {
+      // most once per frame interval while remapping new frame sizes immediately.
+      if (timestamp - lastDraw >= frameInterval * 0.9) {
         context.drawImage(video, dimensions.x, dimensions.y, dimensions.cropWidth, dimensions.cropHeight,
-          0, 0, dimensions.width, dimensions.height);
+          0, 0, outputWidth, outputHeight);
         lastDraw = timestamp;
       }
     };
@@ -132,7 +160,7 @@ export async function createVideoCropper(stream, requestedRegion, options = {}) 
     if (video.requestVideoFrameCallback) {
       const nextFrame = () => {
         draw();
-        if (!disposed && !invalid) frameId = video.requestVideoFrameCallback(nextFrame);
+        if (!disposed) frameId = video.requestVideoFrameCallback(nextFrame);
       };
       frameId = video.requestVideoFrameCallback(nextFrame);
     }
@@ -140,7 +168,7 @@ export async function createVideoCropper(stream, requestedRegion, options = {}) 
     // This timer continues drawing the live video there; recent frame callbacks
     // make its draw call a cheap no-op instead of copying the same frame twice.
     timer = setInterval(draw, frameInterval);
-    return { stream: output, width: dimensions.width, height: dimensions.height, dispose };
+    return { stream: output, width: outputWidth, height: outputHeight, dispose };
   } catch (error) {
     dispose();
     throw error;

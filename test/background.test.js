@@ -220,7 +220,7 @@ test('video selector messages bind to the sender tab and forward only their allo
 
 test('video selection callbacks reject child frames, other extensions, and missing tokens', async () => {
   const h = await harness();
-  for (const type of ['VIDEO_REGION_SELECTED', 'CANCEL_VIDEO_SELECTION']) {
+  for (const type of ['VIDEO_REGION_SELECTED', 'CANCEL_VIDEO_SELECTION', 'VIDEO_VIEWPORT_CHANGED']) {
     for (const sender of [
       { ...h.page, frameId: 1 },
       { ...h.page, id: 'another-extension' },
@@ -233,4 +233,19 @@ test('video selection callbacks reject child frames, other extensions, and missi
     }
   }
   assert.deepEqual(h.calls, []);
+});
+
+test('viewport change notifications use the authenticated source tab and only forward their session token', async () => {
+  const h = await harness();
+  const response = await h.dispatch({
+    target: 'background', type: 'VIDEO_VIEWPORT_CHANGED', selectionToken: 'selection-a',
+    targetTabId: 88, tabId: 88, tab: { id: 88 }, mode: 'audio', streamId: 'forged-stream',
+    region: { x: 0, y: 0, width: 1, height: 1 },
+  }, h.page);
+  assert.equal(response.keepAlive, true);
+  assert.equal(response.replies.length, 1);
+  assert.equal(response.replies[0].ok, true);
+  assert.deepEqual(h.calls, [{
+    type: 'VIDEO_VIEWPORT_CHANGED', targetTabId: 17, selectionToken: 'selection-a',
+  }]);
 });
