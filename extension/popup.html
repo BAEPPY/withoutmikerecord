@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>탭 소리 녹음</title>
+    <title>소리 · 화면 녹화</title>
     <link rel="stylesheet" href="popup.css" />
     <script src="popup.js" defer></script>
   </head>
@@ -17,7 +17,7 @@
         </div>
         <div>
           <p class="eyebrow">WITHOUT MIKERECORD</p>
-          <h1 id="app-title">탭 소리 녹음</h1>
+          <h1 id="app-title">소리 · 화면 녹화</h1>
         </div>
         <span class="local-badge">LOCAL</span>
       </header>
@@ -30,7 +30,7 @@
             <span class="status-dot" aria-hidden="true"></span>
             <span id="status-label" role="status" aria-live="polite">상태 확인 중</span>
           </p>
-          <span class="format-tag">MP4 / AUDIO</span>
+          <span class="format-tag" id="format-tag">MP4 / AUDIO</span>
         </div>
         <p class="timer" id="timer" aria-label="녹음 시간 0분 0.00초">00:00.00</p>
         <p class="timer-caption" id="timer-caption">녹음할 탭에서 시작해 주세요</p>
@@ -62,17 +62,21 @@
           <span class="record-icon" aria-hidden="true"></span>
           <span id="start-label">녹음 시작</span>
         </button>
+        <button class="button secondary" id="start-video-button" type="button" aria-keyshortcuts="3" title="영역 영상 녹화 (키보드 3)" disabled>영역 영상 녹화 · 3</button>
         <div class="button-row" id="recording-controls" hidden>
           <button class="button secondary" id="pause-button" type="button">일시 정지</button>
           <button class="button stop" id="stop-button" type="button" aria-keyshortcuts="2" title="녹음 끝내기 (키보드 2)">
-            <span class="stop-icon" aria-hidden="true"></span>녹음 끝내기
+            <span class="stop-icon" aria-hidden="true"></span><span id="stop-label">녹음 끝내기</span>
           </button>
         </div>
         <div class="ready-controls" id="ready-controls" hidden>
           <section class="trim-editor" aria-labelledby="trim-title">
             <h2 id="trim-title">듣고, 원하는 구간만 저장하기</h2>
             <audio id="audio-preview" controls preload="metadata" aria-label="녹음 미리 듣기"></audio>
+            <video id="video-preview" controls preload="metadata" playsinline aria-label="녹화 영상 미리 보기" hidden></video>
             <p class="preview-position" id="preview-position" aria-label="미리 듣기 현재 위치와 전체 길이">00:00.00 / 00:00.00</p>
+            <p class="trim-note video-note" id="video-note" hidden>MP4는 소리 포함 · GIF는 소리 없이 저장해요. 영상 구간 자르기는 지원하지 않아요.</p>
+            <div id="audio-trim-controls">
             <p class="trim-note" id="trim-unavailable" hidden>이 녹음의 길이를 확인할 수 없어 구간을 자를 수 없어요. 전체 파일은 저장할 수 있어요.</p>
             <div class="trim-fields">
               <div>
@@ -92,7 +96,15 @@
             </div>
             <p id="trim-error" class="trim-error" role="alert" hidden></p>
             <p class="trim-note trim-precision">시간은 0.01초 단위로 표시해요. 저장 구간의 시작·끝은 약 0.1초 차이가 날 수 있어요.</p>
+            </div>
           </section>
+          <div class="save-format-field" id="save-format-field" hidden>
+            <label for="save-format">영상 저장 형식</label>
+            <select id="save-format">
+              <option value="mp4">MP4 · 소리 포함</option>
+              <option value="gif">GIF · 소리 없음</option>
+            </select>
+          </div>
           <button class="button primary" id="save-range-button" type="button">선택 구간 저장 · .mp4</button>
           <div class="save-row">
             <button class="button secondary" id="save-button" type="button">전체 저장 · .mp4</button>
@@ -100,9 +112,9 @@
           </div>
         </div>
         <p class="control-hint" id="control-hint">먼저 페이지에서 소리를 재생해 주세요.</p>
-        <p class="shortcut-hint">이 창에서 <kbd>1</kbd> 녹음 시작 · <kbd>2</kbd> 녹음 끝내기</p>
+        <p class="shortcut-hint">이 창에서 <kbd>1</kbd> 소리 시작 · <kbd>2</kbd> 소리 종료<br /><kbd>3</kbd> 영역 선택 후 영상 시작 · <kbd>4</kbd> 영상 종료</p>
         <p class="shortcut-status" id="shortcut-status" role="status" aria-live="polite" data-status="pending">페이지 단축키 연결 중…</p>
-        <p class="shortcut-hint" id="shortcut-fallback"><kbd>Alt+Shift+1</kbd> 시작 · <kbd>Alt+Shift+2</kbd> 종료<br />아이콘을 열지 않고 사용할 수 있어요.</p>
+        <p class="shortcut-hint" id="shortcut-fallback"><kbd>Alt+Shift+1</kbd> 소리 시작 · <kbd>Alt+Shift+2</kbd> 종료<br /><kbd>Alt+Shift+3</kbd> 영역 선택 · <kbd>Alt+Shift+4</kbd> 종료<br />아이콘을 열지 않고 사용할 수 있어요.</p>
       </div>
 
       <footer class="footer">

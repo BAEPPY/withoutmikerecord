@@ -1,6 +1,7 @@
 export const EMPTY_STATE = {
   status: 'idle', tab: null, elapsedMs: 0, bytes: 0, level: 0,
   error: null, notice: null, result: null, selection: null, exportResult: null,
+  mode: 'audio', selectionToken: null, selectionUrl: null, gifResult: null, exportProgress: 0,
   download: { id: null, status: 'idle', error: null },
 };
 
@@ -44,11 +45,13 @@ export function createController(api) {
   }
 
   async function badge(current) {
-    const labels = { starting: '…', recording: 'REC', paused: 'Ⅱ', stopping: '…', trimming: '…', ready: '↓', error: '!' };
+    const labels = { selecting: '영역', starting: '…', recording: 'REC', paused: 'Ⅱ', stopping: '…', trimming: '…', exporting: 'GIF', ready: '↓', error: '!' };
     await Promise.all([
       api.action.setBadgeText({ text: labels[current.status] || '' }),
       api.action.setBadgeBackgroundColor({ color: current.status === 'recording' ? '#da4761' : '#247e76' }),
-      api.action.setTitle({ title: current.status === 'recording' ? '탭 소리 녹음 중 — 클릭하여 중지' : '탭 소리 녹음' }),
+      api.action.setTitle({ title: current.status === 'recording'
+        ? current.mode === 'video' ? '화면과 소리 녹화 중 — 4로 종료' : '탭 소리 녹음 중 — 2로 종료'
+        : '탭 소리 · 화면 녹화' }),
     ]);
   }
 
@@ -94,18 +97,84 @@ export function createController(api) {
   async function run(message) {
     let current = await reconcileDownload(await state());
     if (message.type === 'STATUS') return { ok: true, state: current };
-    if (message.type === 'ARM_SHORTCUTS') {
-      const tab = await activeWebTab();
+    if (message.type === 'ARM_SHORTCUTS' || message.type === 'OPEN_VIDEO_SELECTOR') {
+      if (message.type === 'OPEN_VIDEO_SELECTOR' && !['idle', 'error'].includes(current.status)) {
+        throw new Error('진행 중인 녹음을 마치고 새 녹음을 준비해 주세요.');
+      }
+      const tab = await activeWebTab(message.targetTabId);
       try {
-        await api.scripting.executeScript({ target: { tabId: tab.id }, files: ['page-shortcuts.js'] });
+        await api.scripting.executeScript({ target: { tabId: tab.id }, files: ['region-selector.js', 'page-shortcuts.js'] });
       } catch {
         throw new Error('단축키 연결 권한을 확인하지 못했어요. 이 탭에서 확장 프로그램을 다시 눌러 주세요.');
       }
+      if (message.type === 'OPEN_VIDEO_SELECTOR') {
+        const response = await api.tabs.sendMessage(tab.id, { type: 'SHOW_VIDEO_SELECTOR' }, { frameId: 0 });
+        if (!response?.ok) throw new Error('영역 선택 화면을 열지 못했어요. 페이지를 새로고침하고 다시 연결해 주세요.');
+      }
       return { ok: true, state: current };
+    }
+    if (message.type === 'BEGIN_VIDEO') {
+      if (!['idle', 'error'].includes(current.status)) throw new Error('진행 중인 녹음을 마치고 새 녹음을 준비해 주세요.');
+      const tab = await activeWebTab(message.targetTabId);
+      let imageDataUrl;
+      try { imageDataUrl = await api.tabs.captureVisibleTab(tab.windowId, { format: 'png' }); }
+      catch { throw new Error('화면을 가져오지 못했어요. 녹화할 페이지에서 확장 아이콘을 다시 눌러 주세요.'); }
+      const latest = await activeWebTab(tab.id);
+      if (latest.url !== tab.url) throw new Error('페이지가 바뀌었어요. 3을 눌러 영역을 다시 선택해 주세요.');
+      const selectionToken = crypto.randomUUID();
+      await ensureDocument();
+      const reply = await send('SELECT_VIDEO', { tab: { id: tab.id, title: tab.title, url: tab.url }, selectionToken });
+      await badge(reply.state);
+      return reply.ok ? { ...reply, imageDataUrl, selectionToken } : reply;
+    }
+    if (message.type === 'CANCEL_VIDEO' || (message.type === 'STOP_VIDEO' && current.status === 'selecting')) {
+      if (current.status !== 'selecting' ||
+          (message.targetTabId !== undefined && current.tab?.id !== message.targetTabId) ||
+          (message.selectionToken !== undefined && current.selectionToken !== message.selectionToken)) {
+        throw new Error('진행 중인 영역 선택이 아니에요.');
+      }
+      const reply = await send('CANCEL_VIDEO', { selectionToken: current.selectionToken });
+      await api.tabs.sendMessage(current.tab.id, { type: 'CANCEL_VIDEO_SELECTOR' }, { frameId: 0 }).catch(() => {});
+      await badge(reply.state);
+      return reply;
+    }
+    if (message.type === 'START_VIDEO') {
+      if (current.status !== 'selecting' || current.tab?.id !== message.targetTabId ||
+          typeof message.selectionToken !== 'string' || current.selectionToken !== message.selectionToken) {
+        throw new Error('영역 선택이 만료됐어요. 3을 눌러 다시 선택해 주세요.');
+      }
+      try {
+        const tab = await activeWebTab(message.targetTabId);
+        if (tab.url !== current.selectionUrl) throw new Error('페이지가 바뀌었어요. 영역을 다시 선택해 주세요.');
+        const r = message.region;
+        if (!r || !['x', 'y', 'width', 'height', 'viewportWidth', 'viewportHeight'].every((key) => Number.isFinite(r[key])) ||
+            r.x < 0 || r.y < 0 || r.width <= 0 || r.height <= 0 || r.x + r.width > 1.000001 || r.y + r.height > 1.000001 ||
+            r.viewportWidth <= 0 || r.viewportHeight <= 0 || r.viewportWidth > 32768 || r.viewportHeight > 32768 ||
+            r.width * r.viewportWidth < 16 || r.height * r.viewportHeight < 16) {
+          throw new Error('가로·세로 16픽셀 이상의 영역을 선택해 주세요.');
+        }
+        const streamId = await api.tabCapture.getMediaStreamId({ targetTabId: tab.id });
+        const reply = await send('START', { mode: 'video', streamId, tab: { id: tab.id, title: tab.title },
+          region: r, selectionToken: message.selectionToken });
+        await badge(reply.state);
+        return reply;
+      } catch (error) {
+        await send('CANCEL_VIDEO', { selectionToken: message.selectionToken }).catch(() => {});
+        await badge(await state());
+        throw error;
+      }
+    }
+    if (message.type === 'STOP_VIDEO') {
+      if (current.mode !== 'video' || current.tab?.id !== message.targetTabId || !['recording', 'paused'].includes(current.status)) {
+        throw new Error('이 탭에서 진행 중인 화면 녹화가 없어요.');
+      }
+      const reply = await send('STOP');
+      await badge(reply.state);
+      return reply;
     }
     if (message.type === 'PAGE_STOP') {
       if (!Number.isInteger(message.targetTabId) || current.tab?.id !== message.targetTabId ||
-          !['recording', 'paused'].includes(current.status)) {
+          current.mode === 'video' || !['recording', 'paused'].includes(current.status)) {
         throw new Error('이 탭에서 진행 중인 녹음이 없어요. 녹음한 탭에서 2를 눌러 주세요.');
       }
       const reply = await send('STOP');
@@ -129,9 +198,17 @@ export function createController(api) {
       await badge(reply.state);
       return reply;
     }
-    if (message.type === 'SAVE' || message.type === 'SAVE_RANGE') {
+    if (['SAVE', 'SAVE_RANGE', 'SAVE_VIDEO'].includes(message.type)) {
       if (current.status !== 'ready' || !current.result) throw new Error('녹음을 먼저 마쳐 주세요.');
       if (current.download.status === 'pending') throw new Error('파일 저장이 진행 중이에요.');
+      if (message.type === 'SAVE_VIDEO') {
+        if (current.result.kind !== 'video' || !['mp4', 'gif'].includes(message.format)) throw new Error('영상 저장 형식을 선택해 주세요.');
+        if (message.format === 'gif') {
+          const prepared = await send('PREPARE_GIF');
+          if (!prepared.ok) return prepared;
+          current = prepared.state;
+        }
+      }
       if (message.type === 'SAVE_RANGE') {
         const prepared = await send('PREPARE_EXPORT', {
           startSeconds: message.startSeconds, endSeconds: message.endSeconds,
@@ -139,7 +216,8 @@ export function createController(api) {
         if (!prepared.ok) return prepared;
         current = prepared.state;
       }
-      const output = message.type === 'SAVE_RANGE' ? current.exportResult : current.result;
+      const output = message.type === 'SAVE_RANGE' ? current.exportResult
+        : message.type === 'SAVE_VIDEO' && message.format === 'gif' ? current.gifResult : current.result;
       if (!output?.url) throw new Error('저장할 파일을 준비하지 못했어요. 다시 시도해 주세요.');
       saveInFlight = true;
       try {
@@ -188,8 +266,18 @@ export function createController(api) {
     },
     async onTabRemoved(tabId) {
       const current = await state();
+      if (current.tab?.id === tabId && current.status === 'selecting') {
+        await this.handle({ type: 'CANCEL_VIDEO', targetTabId: tabId, selectionToken: current.selectionToken });
+      }
       if (current.tab?.id === tabId && ['recording', 'paused', 'starting'].includes(current.status)) {
         await this.handle({ type: 'STOP', expectedTabId: tabId });
+      }
+    },
+    async onTabUpdated(tabId, change) {
+      if (change.status !== 'loading') return;
+      const current = await state();
+      if (current.tab?.id === tabId && current.status === 'selecting') {
+        await this.handle({ type: 'CANCEL_VIDEO', targetTabId: tabId, selectionToken: current.selectionToken });
       }
     },
   };

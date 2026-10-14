@@ -16,6 +16,7 @@ async function harness() {
   const calls = [];
   const badges = [];
   const removedTabs = [];
+  const updatedTabs = [];
   const downloads = [];
   const listeners = {};
   const chrome = {
@@ -25,7 +26,10 @@ async function harness() {
       onMessage: { addListener: (listener) => { listeners.message = listener; } },
     },
     downloads: { onChanged: { addListener: (listener) => { listeners.download = listener; } } },
-    tabs: { onRemoved: { addListener: (listener) => { listeners.tabRemoved = listener; } } },
+    tabs: {
+      onRemoved: { addListener: (listener) => { listeners.tabRemoved = listener; } },
+      onUpdated: { addListener: (listener) => { listeners.tabUpdated = listener; } },
+    },
     commands: { onCommand: { addListener: (listener) => { listeners.command = listener; } } },
   };
   const controller = {
@@ -36,6 +40,7 @@ async function harness() {
     async badge(state) { badges.push(structuredClone(state)); },
     async onDownloadChanged(delta) { downloads.push(structuredClone(delta)); },
     async onTabRemoved(tabId) { removedTabs.push(tabId); },
+    async onTabUpdated(tabId, change) { updatedTabs.push({ tabId, change: structuredClone(change) }); },
   };
   vm.runInNewContext(backgroundSource.replace(controllerImport, ''), {
     chrome, console, createController: () => controller,
@@ -44,7 +49,7 @@ async function harness() {
   calls.length = 0;
   badges.length = 0;
   return {
-    chrome, calls, badges, removedTabs, downloads, listeners,
+    chrome, calls, badges, removedTabs, updatedTabs, downloads, listeners,
     popup: { id: chrome.runtime.id, url: chrome.runtime.getURL('popup.html') },
     page: { id: chrome.runtime.id, tab: { id: 17 }, frameId: 0, url: 'https://example.test/player' },
     async dispatch(message, sender) {
@@ -58,7 +63,7 @@ async function harness() {
 
 test('top-level page keys use the sender tab, ignoring a forged capture target in the payload', async () => {
   const h = await harness();
-  for (const [key, type] of [['1', 'START'], ['2', 'PAGE_STOP']]) {
+  for (const [key, type] of [['1', 'START'], ['2', 'PAGE_STOP'], ['3', 'BEGIN_VIDEO'], ['4', 'STOP_VIDEO']]) {
     const response = await h.dispatch({
       target: 'background', type: 'PAGE_SHORTCUT', key,
       targetTabId: 88, expectedTabId: 88, streamId: 'untrusted-stream',
@@ -75,6 +80,7 @@ test('content scripts cannot invoke popup-only commands or forge offscreen state
   for (const type of [
     'START', 'STOP', 'PAUSE', 'RESUME', 'SAVE', 'SAVE_RANGE', 'DISCARD',
     'SET_SELECTION', 'ARM_SHORTCUTS', 'STATUS', 'STATE_CHANGED',
+    'BEGIN_VIDEO', 'START_VIDEO', 'CANCEL_VIDEO', 'STOP_VIDEO', 'OPEN_VIDEO_SELECTOR', 'SAVE_VIDEO',
   ]) {
     await h.dispatch({
       target: 'background', type, targetTabId: 17,
@@ -96,7 +102,7 @@ test('page shortcuts reject other extensions, child frames, missing tabs, and un
   ]) {
     await h.dispatch(valid, sender);
   }
-  await h.dispatch({ ...valid, key: '3' }, h.page);
+  await h.dispatch({ ...valid, key: '5' }, h.page);
   await h.dispatch({ ...valid, key: null }, h.page);
   await h.dispatch({ ...valid, target: 'offscreen' }, h.page);
   assert.deepEqual(h.calls, []);
@@ -109,6 +115,9 @@ test('the extension popup still routes regular recording and trim commands', asy
     { target: 'background', type: 'START' },
     { target: 'background', type: 'STOP' },
     { target: 'background', type: 'ARM_SHORTCUTS' },
+    { target: 'background', type: 'OPEN_VIDEO_SELECTOR' },
+    { target: 'background', type: 'CANCEL_VIDEO' },
+    { target: 'background', type: 'SAVE_VIDEO', format: 'gif' },
     { target: 'background', type: 'SET_SELECTION', startSeconds: 1.25, endSeconds: 5.75 },
     { target: 'background', type: 'SAVE_RANGE', startSeconds: 1.25, endSeconds: 5.75 },
   ]) {
@@ -159,27 +168,69 @@ test('browser keyboard commands use the provided source tab without falling back
   assert.equal(typeof h.listeners.command, 'function');
   h.listeners.command('start-recording', { id: 88 });
   h.listeners.command('stop-recording', { id: 17 });
+  h.listeners.command('start-video', { id: 88 });
+  h.listeners.command('stop-video', { id: 17 });
   await settle();
   assert.deepEqual(h.calls, [
     { type: 'START', targetTabId: 88 },
     { type: 'PAGE_STOP', targetTabId: 17 },
+    { type: 'OPEN_VIDEO_SELECTOR', targetTabId: 88 },
+    { type: 'STOP_VIDEO', targetTabId: 17 },
   ]);
   h.calls.length = 0;
   for (const tab of [undefined, null, {}, { id: '17' }, { id: NaN }, { id: 17.5 }]) {
     h.listeners.command('start-recording', tab);
     h.listeners.command('stop-recording', tab);
+    h.listeners.command('start-video', tab);
+    h.listeners.command('stop-video', tab);
   }
   h.listeners.command('unknown-command', { id: 17 });
   await settle();
   assert.deepEqual(h.calls, []);
 });
 
-test('download and tab-close notifications retain their controller routing', async () => {
+test('download, tab-close, and navigation notifications retain their controller routing', async () => {
   const h = await harness();
   const delta = { id: 91, state: { current: 'complete' } };
   h.listeners.download(delta);
   h.listeners.tabRemoved(17);
+  h.listeners.tabUpdated(17, { status: 'loading' });
   await settle();
   assert.deepEqual(h.downloads, [delta]);
   assert.deepEqual(h.removedTabs, [17]);
+  assert.deepEqual(h.updatedTabs, [{ tabId: 17, change: { status: 'loading' } }]);
+});
+
+test('video selector messages bind to the sender tab and forward only their allowed fields', async () => {
+  const h = await harness();
+  const region = { x: 0.1, y: 0.1, width: 0.5, height: 0.5, viewportWidth: 1000, viewportHeight: 800 };
+  const selected = await h.dispatch({
+    target: 'background', type: 'VIDEO_REGION_SELECTED', region, selectionToken: 'selection-a',
+    targetTabId: 88, streamId: 'forged-stream', mode: 'audio', format: 'gif',
+  }, h.page);
+  assert.equal(selected.keepAlive, true);
+  assert.deepEqual(h.calls.at(-1), { type: 'START_VIDEO', targetTabId: 17, region, selectionToken: 'selection-a' });
+  const cancelled = await h.dispatch({
+    target: 'background', type: 'CANCEL_VIDEO_SELECTION', selectionToken: 'selection-a',
+    targetTabId: 88, region, expectedTabId: 88,
+  }, h.page);
+  assert.equal(cancelled.keepAlive, true);
+  assert.deepEqual(h.calls.at(-1), { type: 'CANCEL_VIDEO', targetTabId: 17, selectionToken: 'selection-a' });
+});
+
+test('video selection callbacks reject child frames, other extensions, and missing tokens', async () => {
+  const h = await harness();
+  for (const type of ['VIDEO_REGION_SELECTED', 'CANCEL_VIDEO_SELECTION']) {
+    for (const sender of [
+      { ...h.page, frameId: 1 },
+      { ...h.page, id: 'another-extension' },
+      { ...h.page, tab: { id: '17' } },
+    ]) {
+      await h.dispatch({ target: 'background', type, selectionToken: 'selection-a' }, sender);
+    }
+    for (const selectionToken of [undefined, null, 17, {}]) {
+      await h.dispatch({ target: 'background', type, selectionToken }, h.page);
+    }
+  }
+  assert.deepEqual(h.calls, []);
 });

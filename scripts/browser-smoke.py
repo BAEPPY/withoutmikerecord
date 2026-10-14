@@ -63,8 +63,8 @@ async def main():
               if(id !== 1) throw Error('Missing source tab'); return sourceTab;
             }},
             scripting: {executeScript:async(options)=>{
-              if(options.target.tabId !== 1 || options.files[0] !== 'page-shortcuts.js') throw Error('Wrong injection target');
-              new Function(await (await fetch('./page-shortcuts.js')).text())();
+              if(options.target.tabId !== 1) throw Error('Wrong injection target');
+              for (const file of options.files) new Function(await (await fetch('./'+file)).text())();
             }},
             tabCapture: {getMediaStreamId:async()=> 'synthetic-tab-test'},
             action: {setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{},setTitle:async()=>{}},

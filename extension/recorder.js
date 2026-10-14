@@ -1,4 +1,6 @@
 import { inspectMp4, trimMp4 } from './mp4-trim.js';
+import { createVideoCropper, validateVideoRegion } from './video-crop.js';
+import { exportGif } from './gif-export.js';
 
 export const MAX_RECORDING_BYTES = 128 * 1024 * 1024;
 export const MAX_RECORDING_MS = 2 * 60 * 60 * 1000;
@@ -9,6 +11,11 @@ const DOWNLOAD_STATUSES = new Set(['idle', 'pending', 'complete', 'interrupted']
 function initialState() {
   return {
     status: 'idle',
+    mode: 'audio',
+    selectionToken: null,
+    selectionUrl: null,
+    gifResult: null,
+    exportProgress: 0,
     tab: null,
     elapsedMs: 0,
     bytes: 0,
@@ -52,6 +59,8 @@ export class TabAudioRecorder {
     this.mediaDevices = options.mediaDevices ?? globalThis.navigator?.mediaDevices;
     this.MediaRecorder = options.MediaRecorder ?? globalThis.MediaRecorder;
     this.AudioContext = options.AudioContext ?? globalThis.AudioContext;
+    this.MediaStream = options.MediaStream ?? globalThis.MediaStream;
+    this.createVideoCropper = options.createVideoCropper ?? createVideoCropper;
     this.url = options.url ?? globalThis.URL;
     this.Blob = options.Blob ?? globalThis.Blob;
     this.now = options.now ?? (() => performance.now());
@@ -63,12 +72,16 @@ export class TabAudioRecorder {
     this.onStateChange = options.onStateChange ?? (() => {});
     this.inspectMp4 = options.inspectMp4 ?? inspectMp4;
     this.trimMp4 = options.trimMp4 ?? trimMp4;
+    this.exportGif = options.exportGif ?? exportGif;
     this.originalBlob = null;
     this.exportRange = null;
 
     this.state = initialState();
     this.operations = Promise.resolve();
     this.stream = null;
+    this.cropper = null;
+    this.videoDimensions = null;
+    this.startingVideoError = null;
     this.context = null;
     this.source = null;
     this.analyser = null;
@@ -103,6 +116,7 @@ export class TabAudioRecorder {
       elapsedMs: this.elapsedMs(),
       level,
       result: this.state.result ? { ...this.state.result } : null,
+      gifResult: this.state.gifResult ? { ...this.state.gifResult } : null,
       selection: this.state.selection ? { ...this.state.selection } : null,
       exportResult: this.state.exportResult ? { ...this.state.exportResult } : null,
       download: { ...this.state.download },
@@ -114,12 +128,18 @@ export class TabAudioRecorder {
     if (message.type === 'STATUS') {
       return Promise.resolve({ ok: true, state: this.getState() });
     }
-    if (this.state.status === 'trimming') {
-      return Promise.resolve({ ok: false, error: '선택 구간을 만드는 중이에요. 잠시 기다려 주세요.', state: this.getState() });
+    if (['trimming', 'exporting'].includes(this.state.status)) {
+      return Promise.resolve({ ok: false, error: '저장할 파일을 만드는 중이에요. 잠시 기다려 주세요.', state: this.getState() });
     }
     const operation = this.operations.then(async () => {
       try {
         switch (message.type) {
+          case 'SELECT_VIDEO':
+            this.selectVideo(message);
+            break;
+          case 'CANCEL_VIDEO':
+            this.cancelVideo(message);
+            break;
           case 'START':
             await this.start(message);
             break;
@@ -144,6 +164,9 @@ export class TabAudioRecorder {
             break;
           case 'PREPARE_EXPORT':
             await this.prepareExport(message);
+            break;
+          case 'PREPARE_GIF':
+            await this.prepareGif();
             break;
           default:
             throw new Error('지원하지 않는 녹음 요청입니다.');
@@ -178,31 +201,72 @@ export class TabAudioRecorder {
     }
   }
 
-  async start({ streamId, tab }) {
+  selectVideo({ tab, selectionToken }) {
     if (!['idle', 'error'].includes(this.state.status)) {
+      throw new Error('현재 녹음을 끝내고 저장하거나 지운 뒤 화면 영역을 선택해 주세요.');
+    }
+    if (!Number.isInteger(tab?.id) || typeof selectionToken !== 'string' || !selectionToken) {
+      throw new Error('화면을 선택할 탭 정보를 가져오지 못했습니다.');
+    }
+    this.disposeMedia();
+    this.recordedMs = 0;
+    this.activeSince = null;
+    this.state = {
+      ...initialState(), status: 'selecting', mode: 'video', selectionToken, selectionUrl: tab.url || null,
+      tab: { id: tab.id, title: String(tab.title || '제목 없는 탭') },
+    };
+    this.emit();
+  }
+
+  cancelVideo({ selectionToken } = {}) {
+    if (this.state.status !== 'selecting') return;
+    if (selectionToken !== undefined && selectionToken !== this.state.selectionToken) {
+      throw new Error('이전 화면 선택 요청은 취소할 수 없습니다.');
+    }
+    this.state = initialState();
+    this.emit();
+  }
+
+  async start({ streamId, tab, mode = 'audio', region, selectionToken }) {
+    if (mode !== 'audio' && mode !== 'video') throw new Error('지원하지 않는 녹화 모드입니다.');
+    const isVideo = mode === 'video';
+    if (isVideo) {
+      if (this.state.status !== 'selecting' || !selectionToken || selectionToken !== this.state.selectionToken
+        || tab?.id !== this.state.tab?.id) {
+        throw new Error('화면 영역을 새로 선택한 뒤 녹화를 시작해 주세요.');
+      }
+      validateVideoRegion(region);
+    } else if (!['idle', 'error'].includes(this.state.status)) {
       throw new Error('현재 녹음을 끝내고 저장하거나 지운 뒤 새 녹음을 시작해 주세요.');
     }
     if (typeof streamId !== 'string' || !streamId) {
       throw new Error('탭 오디오 권한을 가져오지 못했습니다. 다시 시작해 주세요.');
     }
     this.disposeMedia();
-    this.state = { ...initialState(), status: 'starting', tab: tab ? { id: tab.id, title: String(tab.title || '제목 없는 탭') } : null };
+    this.state = { ...initialState(), status: 'starting', mode, tab: tab ? { id: tab.id, title: String(tab.title || '제목 없는 탭') } : null };
     this.chunks = [];
     this.recordedMs = 0;
     this.activeSince = null;
     this.finalizing = false;
     this.stopPromise = null;
     this.resolveStop = null;
+    this.videoDimensions = null;
+    this.startingVideoError = null;
     this.emit();
 
     try {
       if (!this.mediaDevices?.getUserMedia || !this.MediaRecorder || !this.AudioContext) {
         throw new Error('이 브라우저는 탭 오디오 녹음을 지원하지 않습니다. 최신 Chrome 또는 Edge를 사용해 주세요.');
       }
-      const mimeType = ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4;codecs=opus', 'audio/mp4']
-        .find((type) => this.MediaRecorder.isTypeSupported?.(type));
+      const supportedTypes = isVideo
+        ? ['video/mp4;codecs=avc1.420028,mp4a.40.2', 'video/mp4;codecs=avc1,mp4a.40.2',
+          'video/mp4;codecs=vp9,opus', 'video/mp4;codecs=avc1,opus', 'video/mp4']
+        : ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4;codecs=opus', 'audio/mp4'];
+      const mimeType = supportedTypes.find((type) => this.MediaRecorder.isTypeSupported?.(type));
       if (!mimeType) {
-        throw new Error('이 브라우저는 MP4 오디오 녹음을 지원하지 않습니다. Chrome 또는 Edge를 최신 버전으로 업데이트해 주세요.');
+        throw new Error(isVideo
+          ? '이 브라우저는 MP4 화면 녹화를 지원하지 않습니다. Chrome 또는 Edge를 최신 버전으로 업데이트해 주세요.'
+          : '이 브라우저는 MP4 오디오 녹음을 지원하지 않습니다. Chrome 또는 Edge를 최신 버전으로 업데이트해 주세요.');
       }
       this.recordingMimeType = mimeType;
       // These mandatory constraints request ONLY the tab stream obtained by
@@ -214,10 +278,28 @@ export class TabAudioRecorder {
             chromeMediaSourceId: streamId,
           },
         },
-        video: false,
+        video: isVideo ? { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } } : false,
       });
       if (!this.stream.getAudioTracks().length) {
         throw new Error('탭에서 오디오 스트림을 가져오지 못했습니다.');
+      }
+
+      let recordingStream = this.stream;
+      if (isVideo) {
+        if (!this.stream.getVideoTracks?.().length) throw new Error('탭에서 영상 스트림을 가져오지 못했습니다.');
+        if (!this.MediaStream) throw new Error('이 브라우저에서 화면 녹화를 시작할 수 없습니다.');
+        this.cropper = await this.createVideoCropper(this.stream, region, {
+          onGeometryChanged: () => {
+            const notice = '탭의 화면 크기가 바뀌어 녹화를 마쳤어요. 새 영역을 선택해 다시 녹화해 주세요.';
+            if (this.state.status === 'starting') this.startingVideoError = new Error(notice);
+            else this.stopAfterNotice(notice);
+          },
+        });
+        if (this.startingVideoError) throw this.startingVideoError;
+        this.videoDimensions = { width: this.cropper.width, height: this.cropper.height };
+        recordingStream = new this.MediaStream([
+          ...this.cropper.stream.getVideoTracks(), ...this.stream.getAudioTracks(),
+        ]);
       }
 
       // Tab capture otherwise silences playback. This single connection restores
@@ -231,10 +313,11 @@ export class TabAudioRecorder {
       this.analyser.connect(this.context.destination);
       if (this.context.state === 'suspended') await this.context.resume();
 
-      const options = { audioBitsPerSecond: 128000, mimeType };
-      const recorder = new this.MediaRecorder(this.stream, options);
+      if (this.startingVideoError) throw this.startingVideoError;
+      const options = { audioBitsPerSecond: 128000, mimeType, ...(isVideo ? { videoBitsPerSecond: 5000000 } : {}) };
+      const recorder = new this.MediaRecorder(recordingStream, options);
       this.mediaRecorder = recorder;
-      if (recorder.mimeType && !/^audio\/mp4(?:;|$)/i.test(recorder.mimeType)) {
+      if (recorder.mimeType && !(isVideo ? /^video\/mp4(?:;|$)/i : /^audio\/mp4(?:;|$)/i).test(recorder.mimeType)) {
         throw new Error('브라우저가 MP4 대신 다른 녹음 형식을 반환했습니다. 최신 Chrome 또는 Edge에서 다시 시도해 주세요.');
       }
       this.stopPromise = new Promise((resolve) => { this.resolveStop = resolve; });
@@ -254,10 +337,10 @@ export class TabAudioRecorder {
         this.state.error = errorMessage(event.error || new Error('녹음 중 오류가 발생했습니다.'));
         this.stopAfterNotice('녹음 중 오류가 발생해 중지했습니다. 생성된 파일이 있으면 저장해 주세요.');
       };
-      for (const track of this.stream.getAudioTracks()) {
+      for (const track of isVideo ? this.stream.getTracks() : this.stream.getAudioTracks()) {
         const onEnded = () => {
           if (this.mediaRecorder === recorder) {
-            this.stopAfterNotice('탭의 오디오 연결이 종료되어 녹음을 마쳤습니다.');
+            this.stopAfterNotice(isVideo ? '탭의 화면 또는 오디오 연결이 종료되어 녹화를 마쳤습니다.' : '탭의 오디오 연결이 종료되어 녹음을 마쳤습니다.');
           }
         };
         track.addEventListener('ended', onEnded);
@@ -340,7 +423,10 @@ export class TabAudioRecorder {
       if (!blob.size) throw new Error('녹음된 데이터가 없습니다. 페이지에서 소리를 재생한 뒤 다시 녹음해 주세요.');
       let durationSeconds = null;
       let trimError = null;
-      try {
+      if (this.state.mode === 'video') {
+        durationSeconds = this.elapsedMs() / 1000;
+        trimError = '화면 녹화는 전체 영상만 저장할 수 있어요.';
+      } else try {
         const metadata = await this.inspectMp4(blob);
         if (!Number.isFinite(metadata.durationSeconds) || metadata.durationSeconds <= 0) throw new Error('Invalid duration');
         durationSeconds = metadata.durationSeconds;
@@ -350,8 +436,9 @@ export class TabAudioRecorder {
       const filename = recordingFilename(this.state.tab?.title, this.wallNow());
       const url = this.url.createObjectURL(blob);
       this.originalBlob = blob;
-      this.state.result = { url, filename, mimeType, bytes: blob.size, durationSeconds, trimError };
-      this.state.selection = durationSeconds ? { startSeconds: 0, endSeconds: durationSeconds } : null;
+      this.state.result = { url, filename, mimeType, bytes: blob.size, durationSeconds, trimError,
+        kind: this.state.mode, ...(this.state.mode === 'video' ? this.videoDimensions : {}) };
+      this.state.selection = this.state.mode !== 'video' && durationSeconds ? { startSeconds: 0, endSeconds: durationSeconds } : null;
       this.state.bytes = blob.size;
       this.state.status = 'ready';
       this.chunks = [];
@@ -367,6 +454,7 @@ export class TabAudioRecorder {
     if (this.state.status !== 'ready' || !this.state.result || !this.originalBlob) {
       throw new Error('녹음을 끝낸 뒤 구간을 선택해 주세요.');
     }
+    if (this.state.mode === 'video') throw new Error('화면 녹화는 전체 영상만 저장할 수 있어요.');
     if (this.state.download.status === 'pending') throw new Error('파일 저장이 끝난 뒤 구간을 변경해 주세요.');
     const duration = this.state.result.durationSeconds;
     if (!Number.isFinite(duration) || duration <= 0) throw new Error('구간 정보를 읽지 못했어요. 전체 저장을 사용해 주세요.');
@@ -414,6 +502,32 @@ export class TabAudioRecorder {
     }
   }
 
+  async prepareGif() {
+    if (this.state.status !== 'ready' || this.state.result?.kind !== 'video' || !this.originalBlob) {
+      throw new Error('화면 녹화를 마친 뒤 GIF로 저장할 수 있어요.');
+    }
+    if (this.state.download.status === 'pending') throw new Error('진행 중인 저장을 먼저 마쳐 주세요.');
+    if (this.state.gifResult) return;
+    this.state.status = 'exporting';
+    this.state.exportProgress = 0;
+    this.emit();
+    try {
+      const output = await this.exportGif(this.originalBlob, { onProgress: (value) => {
+        this.state.exportProgress = Math.max(0, Math.min(1, Number(value) || 0));
+        this.emit();
+      } });
+      if (!output.blob?.size || output.blob.type !== 'image/gif') throw new Error('GIF 파일을 만들지 못했어요. MP4 원본은 저장할 수 있어요.');
+      this.state.gifResult = {
+        url: this.url.createObjectURL(output.blob), filename: this.state.result.filename.replace(/\.mp4$/i, '.gif'),
+        mimeType: 'image/gif', bytes: output.blob.size, width: output.width, height: output.height,
+        frameCount: output.frameCount, durationSeconds: output.durationSeconds,
+      };
+    } finally {
+      this.state.status = 'ready';
+      this.emit();
+    }
+  }
+
   updateDownload(download) {
     if (this.state.status !== 'ready' || !this.state.result) {
       throw new Error('저장할 녹음 파일이 없습니다.');
@@ -433,6 +547,10 @@ export class TabAudioRecorder {
   }
 
   discard() {
+    if (this.state.status === 'selecting') {
+      this.cancelVideo();
+      return;
+    }
     if (!['ready', 'error'].includes(this.state.status)) {
       throw new Error('진행 중인 녹음을 먼저 중지해 주세요.');
     }
@@ -441,6 +559,7 @@ export class TabAudioRecorder {
     }
     if (this.state.result?.url) this.url.revokeObjectURL(this.state.result.url);
     if (this.state.exportResult?.url) this.url.revokeObjectURL(this.state.exportResult.url);
+    if (this.state.gifResult?.url) this.url.revokeObjectURL(this.state.gifResult.url);
     this.originalBlob = null;
     this.exportRange = null;
     this.disposeMedia();
@@ -479,6 +598,8 @@ export class TabAudioRecorder {
       } catch { /* An already failed recorder still needs stream cleanup. */ }
       this.mediaRecorder = null;
     }
+    try { this.cropper?.dispose(); } catch { /* Other media still needs cleanup. */ }
+    this.cropper = null;
     try { this.source?.disconnect(); } catch { /* Already disconnected. */ }
     try { this.analyser?.disconnect(); } catch { /* Already disconnected. */ }
     this.source = null;

@@ -27,26 +27,48 @@ function element(tagName, attributes = {}) {
 
 // Browser integration verifies actual trusted keyboard events. This isolated
 // context makes message timing and extension invalidation deterministic.
-function page() {
+function page({ runtimeMessages = false } = {}) {
   const listeners = new Set();
+  const messageListeners = new Set();
   const sent = [];
+  const selections = [];
+  const messageReplies = [];
   const body = element('body');
   const timers = new Map();
   let nextTimer = 0;
   const env = {
-    listeners, sent,
+    listeners, messageListeners, sent, selections, messageReplies, selectorCancels: 0,
     async respond() { return { ok: true }; },
-    toast() { return body.children.at(-1)?.shadow?.children.at(-1)?.textContent || ''; },
+    async selectRegion() { return null; },
+    cancelRegion() {},
+    toast() {
+      return body.children.filter((child) => child.isConnected).at(-1)?.shadow?.children.at(-1)?.textContent || '';
+    },
   };
+  const runtime = {
+    id: 'test-extension',
+    async sendMessage(message) { sent.push(structuredClone(message)); return env.respond(message); },
+  };
+  if (runtimeMessages) {
+    runtime.onMessage = {
+      addListener(listener) { messageListeners.add(listener); },
+      removeListener(listener) { messageListeners.delete(listener); },
+    };
+  }
   const context = vm.createContext({
     document: { body, documentElement: body, createElement: element },
-    chrome: {
-      runtime: {
-        id: 'test-extension',
-        async sendMessage(message) { sent.push(structuredClone(message)); return env.respond(message); },
-      },
+    chrome: { runtime },
+    async __withoutMikeSelectRegion(options) {
+      selections.push(structuredClone(options));
+      return env.selectRegion(options);
+    },
+    __withoutMikeCancelRegion() {
+      env.selectorCancels += 1;
+      env.cancelRegion();
     },
     window: {
+      innerWidth: 1000,
+      innerHeight: 800,
       addEventListener(type, listener, capture) {
         assert.equal(type, 'keydown');
         assert.equal(capture, true);
@@ -61,13 +83,24 @@ function page() {
   env.press = (key, overrides = {}) => {
     const event = {
       key, isTrusted: true, defaultPrevented: false, repeat: false, isComposing: false,
-      keyCode: key === '1' ? 49 : 50,
+      keyCode: key.charCodeAt(0),
       composedPath: () => [element('video')],
       preventDefault() { this.prevented = true; },
       stopImmediatePropagation() { this.stopped = true; },
       ...overrides,
     };
     return { event, completion: Promise.all([...listeners].map((listener) => listener(event))) };
+  };
+  env.message = (message) => Promise.all([...messageListeners].map((listener) => (
+    listener(message, { id: 'test-extension' }, (reply) => { messageReplies.push(structuredClone(reply)); })
+  )));
+  env.runTimers = () => Promise.all([...timers].map(([id, callback]) => {
+    timers.delete(id);
+    return callback();
+  }));
+  env.resize = (width, height) => {
+    context.window.innerWidth = width;
+    context.window.innerHeight = height;
   };
   env.install();
   return env;
@@ -177,3 +210,260 @@ test('an invalidated extension context releases page keys and clears installatio
   await env.press('1').completion;
   assert.equal(env.sent.length, 2);
 });
+
+const videoSelection = {
+  ok: true,
+  state: { status: 'selecting', mode: 'video' },
+  imageDataUrl: 'data:image/png;base64,dGVzdA==',
+  selectionToken: 'selection-test-token',
+};
+const videoRegion = { x: 0.1, y: 0.2, width: 0.5, height: 0.4 };
+
+test('4 cancels a pending 3 as soon as its selection token arrives, without opening the selector',
+  { timeout: 2000 }, async () => {
+    const env = page();
+    const beginReply = deferred();
+    env.respond = (message) => message.type === 'PAGE_SHORTCUT'
+      ? beginReply.promise : { ok: true };
+
+    const start = env.press('3');
+    const stop = env.press('4');
+    await stop.completion;
+    await env.press('4').completion;
+    await env.press('3').completion;
+    assert.ok(stop.event.prevented && stop.event.stopped);
+    assert.deepEqual(env.sent, [
+      { target: 'background', type: 'PAGE_SHORTCUT', key: '3' },
+    ]);
+
+    beginReply.resolve(videoSelection);
+    await start.completion;
+    assert.deepEqual(env.selections, []);
+    assert.deepEqual(env.sent, [
+      { target: 'background', type: 'PAGE_SHORTCUT', key: '3' },
+      { target: 'background', type: 'CANCEL_VIDEO_SELECTION', selectionToken: videoSelection.selectionToken },
+    ]);
+  });
+
+test('3 routes the accepted normalized region and selection token without showing a captured start toast',
+  { timeout: 2000 }, async () => {
+    const env = page();
+    env.respond = (message) => message.type === 'PAGE_SHORTCUT'
+      ? videoSelection : { ok: true, state: { status: 'recording', mode: 'video' } };
+    env.selectRegion = async () => videoRegion;
+
+    const { event, completion } = env.press('3');
+    await completion;
+    assert.ok(event.prevented && event.stopped);
+    assert.deepEqual(env.selections, [{
+      imageDataUrl: videoSelection.imageDataUrl,
+      selectionToken: videoSelection.selectionToken,
+    }]);
+    assert.deepEqual(env.sent, [
+      { target: 'background', type: 'PAGE_SHORTCUT', key: '3' },
+      {
+        target: 'background', type: 'VIDEO_REGION_SELECTED',
+        selectionToken: videoSelection.selectionToken, region: videoRegion,
+      },
+    ]);
+    assert.equal(env.toast(), '');
+  });
+
+test('4 dismisses an open region selector and sends cancellation through the pending 3 flow',
+  { timeout: 2000 }, async () => {
+    const env = page();
+    const selectorEntered = deferred();
+    const selected = deferred();
+    env.respond = (message) => message.type === 'PAGE_SHORTCUT'
+      ? videoSelection : { ok: true };
+    env.selectRegion = () => { selectorEntered.resolve(); return selected.promise; };
+    env.cancelRegion = () => selected.resolve(null);
+
+    const start = env.press('3');
+    await selectorEntered.promise;
+    await env.press('4').completion;
+    await start.completion;
+    assert.equal(env.selectorCancels, 1);
+    assert.deepEqual(env.sent, [
+      { target: 'background', type: 'PAGE_SHORTCUT', key: '3' },
+      { target: 'background', type: 'CANCEL_VIDEO_SELECTION', selectionToken: videoSelection.selectionToken },
+    ]);
+  });
+
+test('dismissing region selection sends cancellation and releases shortcuts for the next selection',
+  { timeout: 2000 }, async () => {
+    const env = page();
+    env.respond = (message) => message.type === 'PAGE_SHORTCUT'
+      ? videoSelection : { ok: true };
+    await env.press('3').completion;
+    assert.deepEqual(env.sent.at(-1), {
+      target: 'background', type: 'CANCEL_VIDEO_SELECTION', selectionToken: videoSelection.selectionToken,
+    });
+
+    env.selectRegion = async () => videoRegion;
+    await env.press('3').completion;
+    assert.equal(env.selections.length, 2);
+    assert.equal(env.sent.at(-1).type, 'VIDEO_REGION_SELECTED');
+  });
+
+test('4 stops an established video recording with the normal page shortcut message', async () => {
+  const env = page();
+  env.respond = (message) => message.key === '3'
+    ? videoSelection : { ok: true, state: { status: message.key === '4' ? 'ready' : 'recording', mode: 'video' } };
+  env.selectRegion = async () => videoRegion;
+  await env.press('3').completion;
+  await env.press('4').completion;
+  assert.deepEqual(env.sent.at(-1), { target: 'background', type: 'PAGE_SHORTCUT', key: '4' });
+  assert.equal(env.selectorCancels, 0);
+});
+
+test('SHOW_VIDEO_SELECTOR uses the same token and region flow as pressing 3',
+  { timeout: 2000 }, async () => {
+    const env = page({ runtimeMessages: true });
+    const regionSent = deferred();
+    env.respond = (message) => {
+      if (message.type === 'PAGE_SHORTCUT') return videoSelection;
+      if (message.type === 'VIDEO_REGION_SELECTED') regionSent.resolve();
+      return { ok: true, state: { status: 'recording', mode: 'video' } };
+    };
+    env.selectRegion = async () => videoRegion;
+    env.install();
+    assert.equal(env.messageListeners.size, 1);
+
+    await env.message({ type: 'SHOW_VIDEO_SELECTOR' });
+    assert.deepEqual(env.messageReplies, [{ ok: true }]);
+    assert.deepEqual(env.sent, [], 'acknowledge the command before requesting BEGIN');
+    await env.runTimers();
+    await regionSent.promise;
+    assert.deepEqual(env.sent, [
+      { target: 'background', type: 'PAGE_SHORTCUT', key: '3' },
+      {
+        target: 'background', type: 'VIDEO_REGION_SELECTED',
+        selectionToken: videoSelection.selectionToken, region: videoRegion,
+      },
+    ]);
+    assert.equal(env.toast(), '');
+  });
+
+test('CANCEL_VIDEO_SELECTOR acknowledges immediately and dismisses active selection',
+  { timeout: 2000 }, async () => {
+    const env = page({ runtimeMessages: true });
+    const selectorEntered = deferred();
+    const selected = deferred();
+    env.respond = (message) => message.type === 'PAGE_SHORTCUT'
+      ? videoSelection : { ok: true };
+    env.selectRegion = () => { selectorEntered.resolve(); return selected.promise; };
+    env.cancelRegion = () => selected.resolve(null);
+
+    const start = env.press('3');
+    await selectorEntered.promise;
+    await env.message({ type: 'CANCEL_VIDEO_SELECTOR' });
+    assert.deepEqual(env.messageReplies, [{ ok: true }]);
+    await start.completion;
+    assert.equal(env.selectorCancels, 1);
+    assert.equal(env.sent.at(-1).type, 'CANCEL_VIDEO_SELECTION');
+    assert.equal(env.sent.at(-1).selectionToken, videoSelection.selectionToken);
+    assert.equal(env.sent.some((message) => message.type === 'VIDEO_REGION_SELECTED'), false);
+  });
+
+test('resizing while BEGIN is pending cancels the stale screenshot selection',
+  { timeout: 2000 }, async () => {
+    const env = page();
+    const beginReply = deferred();
+    env.respond = (message) => message.type === 'PAGE_SHORTCUT'
+      ? beginReply.promise : { ok: true };
+    const start = env.press('3');
+    env.resize(800, 600);
+    beginReply.resolve(videoSelection);
+    await start.completion;
+    assert.deepEqual(env.selections, []);
+    assert.deepEqual(env.sent.at(-1), {
+      target: 'background', type: 'CANCEL_VIDEO_SELECTION', selectionToken: videoSelection.selectionToken,
+    });
+  });
+
+test('3 removes a previous audio toast before requesting the video screenshot', async () => {
+  const env = page();
+  await env.press('1').completion;
+  assert.match(env.toast(), /녹음을 시작했어요/);
+  env.respond = (message) => {
+    if (message.key === '3') {
+      assert.equal(env.toast(), '', 'the screenshot must not include an old recorder toast');
+      return videoSelection;
+    }
+    return { ok: true };
+  };
+  env.selectRegion = async () => videoRegion;
+  await env.press('3').completion;
+  assert.equal(env.sent.at(-1).type, 'VIDEO_REGION_SELECTED');
+  assert.equal(env.toast(), '');
+});
+
+test('4 during accepted-region startup stops as soon as recording starts',
+  { timeout: 2000 }, async () => {
+    const env = page();
+    const regionSent = deferred();
+    const started = deferred();
+    env.respond = (message) => {
+      if (message.key === '3') return videoSelection;
+      if (message.type === 'VIDEO_REGION_SELECTED') {
+        regionSent.resolve();
+        return started.promise;
+      }
+      return { ok: true };
+    };
+    env.selectRegion = async () => videoRegion;
+    const start = env.press('3');
+    await regionSent.promise;
+    await env.press('4').completion;
+    await env.press('4').completion;
+    assert.equal(env.sent.length, 2);
+    started.resolve({ ok: true, state: { status: 'recording', mode: 'video' } });
+    await start.completion;
+    assert.deepEqual(env.sent.at(-1), { target: 'background', type: 'PAGE_SHORTCUT', key: '4' });
+    assert.equal(env.sent.length, 3);
+  });
+
+test('background cancellation before the scheduled selector launch prevents BEGIN', async () => {
+  const env = page({ runtimeMessages: true });
+  env.respond = async () => videoSelection;
+  await env.message({ type: 'SHOW_VIDEO_SELECTOR' });
+  await env.message({ type: 'CANCEL_VIDEO_SELECTOR' });
+  assert.deepEqual(env.messageReplies, [{ ok: true }, { ok: true }]);
+  await env.runTimers();
+  assert.deepEqual(env.sent, []);
+  assert.deepEqual(env.selections, []);
+});
+
+test('4 before the scheduled selector launch prevents a later BEGIN', async () => {
+  const env = page({ runtimeMessages: true });
+  env.respond = (message) => message.key === '3' ? videoSelection : { ok: true };
+  await env.message({ type: 'SHOW_VIDEO_SELECTOR' });
+  await env.press('4').completion;
+  await env.runTimers();
+  assert.equal(env.sent.some((message) => message.key === '3'), false);
+  assert.deepEqual(env.selections, []);
+});
+
+for (const key of ['1', '2', '3']) {
+  test(`failed ${key} during video recording keeps errors out of captured frames until 4 stops recording`, async () => {
+    const env = page();
+    // The video can have started via a browser command or popup; even the
+    // first response observed here must suppress page UI while it is live.
+    env.respond = (message) => message.key === '4'
+      ? { ok: true, state: { mode: 'video', status: 'ready' } }
+      : {
+        ok: false,
+        error: '화면 녹화가 진행 중입니다.',
+        state: { mode: 'video', status: 'recording' },
+      };
+
+    await env.press(key).completion;
+    assert.equal(env.toast(), '', 'an error toast would become part of the video');
+    assert.deepEqual(env.sent, [{ target: 'background', type: 'PAGE_SHORTCUT', key }]);
+
+    await env.press('4').completion;
+    assert.match(env.toast(), /화면 녹화를 마쳤어요/);
+    assert.deepEqual(env.sent.at(-1), { target: 'background', type: 'PAGE_SHORTCUT', key: '4' });
+  });
+}
