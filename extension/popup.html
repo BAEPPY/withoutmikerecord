@@ -76,7 +76,7 @@
             <audio id="audio-preview" controls preload="metadata" aria-label="녹음 미리 듣기"></audio>
             <video id="video-preview" controls preload="metadata" playsinline aria-label="녹화 영상 미리 보기" hidden></video>
             <p class="preview-position" id="preview-position" aria-label="미리 듣기 현재 위치와 전체 길이">00:00.00 / 00:00.00</p>
-            <p class="trim-note video-note" id="video-note" hidden>MP4는 소리 포함 · GIF는 소리 없이 저장해요. 구간 저장은 선택한 구간 길이만큼 시간이 걸릴 수 있어요.</p>
+            <p class="trim-note video-note" id="video-note" hidden>MP4에 저장할 영상과 소리를 선택할 수 있어요. 미리보기는 원본 영상과 소리예요.</p>
             <div id="audio-trim-controls">
             <p class="trim-note" id="trim-unavailable" hidden>이 녹음의 길이를 확인할 수 없어 구간을 자를 수 없어요. 전체 파일은 저장할 수 있어요.</p>
             <div class="trim-fields">
@@ -103,8 +103,16 @@
           <div class="save-format-field" id="save-format-field" hidden>
             <label for="save-format">영상 저장 형식</label>
             <select id="save-format">
-              <option value="mp4">MP4 · 소리 포함</option>
+              <option value="mp4">MP4</option>
               <option value="gif">GIF · 소리 없음</option>
+            </select>
+          </div>
+          <div class="save-format-field" id="save-content-field" hidden>
+            <label for="save-content">MP4에 담을 내용</label>
+            <select id="save-content">
+              <option value="both">영상+소리 함께</option>
+              <option value="video">영상만 · 무음</option>
+              <option value="audio">소리만</option>
             </select>
           </div>
           <div class="range-save-row" id="range-save-row">

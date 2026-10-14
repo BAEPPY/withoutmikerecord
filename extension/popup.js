@@ -25,6 +25,8 @@ const ui = {
   save: byId("save-button"),
   saveFormat: byId("save-format"),
   saveFormatField: byId("save-format-field"),
+  saveContent: byId("save-content"),
+  saveContentField: byId("save-content-field"),
   saveRange: byId("save-range-button"),
   rangeSaveRow: byId("range-save-row"),
   saveRow: byId("save-row"),
@@ -186,6 +188,25 @@ function rangePreviewLabel() {
   return videoResult() ? "선택 구간 보기" : "선택 구간 듣기";
 }
 
+function saveContent() {
+  return ["both", "video", "audio"].includes(ui.saveContent.value) ? ui.saveContent.value : "both";
+}
+
+function videoSaveOptions() {
+  return ui.saveFormat.value === "gif" ? { format: "gif" } : { format: "mp4", content: saveContent() };
+}
+
+function savedOutputLabel() {
+  if (!videoResult()) return ".mp4";
+  if (ui.saveFormat.value === "gif") return ".gif";
+  return `${{ both: "영상+소리", video: "무음 영상", audio: "소리만" }[saveContent()]} .mp4`;
+}
+
+function videoProcessingLabel() {
+  if (ui.saveFormat.value === "gif") return "영상 구간 만드는 중";
+  return { both: "영상 구간 만드는 중", video: "무음 영상 만드는 중", audio: "소리만 만드는 중" }[saveContent()];
+}
+
 function readSelection() {
   const duration = durationSeconds();
   if (!trimAvailable()) return { error: "" };
@@ -257,6 +278,10 @@ function renderEditor() {
   ui.audioTrimControls.hidden = false;
   ui.saveRange.hidden = false;
   ui.saveFormatField.hidden = !video;
+  ui.saveContentField.hidden = !video || ui.saveFormat.value === "gif";
+  const description = ui.saveFormat.value === "gif" ? "GIF는 소리 없이 저장해요."
+    : `MP4는 ${{ both: "영상과 소리를 함께", video: "소리 없이 영상만", audio: "영상 없이 소리만" }[saveContent()]} 저장해요.`;
+  setText(ui.videoNote, `${description} 미리보기는 원본 영상과 소리예요. 변환은 선택 구간 길이만큼 시간이 걸릴 수 있어요.`);
   setText(ui.trimTitle, video ? "보고, 원하는 구간만 저장하기" : "듣고, 원하는 구간만 저장하기");
   if (previewEnd === null) setText(ui.previewRange, rangePreviewLabel());
   ui.previewPosition.setAttribute("aria-label", video ? "영상 현재 위치와 전체 길이" : "미리 듣기 현재 위치와 전체 길이");
@@ -316,12 +341,16 @@ function renderEditor() {
   setText(ui.copyStatus, copyStatus);
   ui.copyStatus.hidden = !showCopy || !copyStatus;
   ui.copyStatus.dataset.mode = copyMode;
-  setText(ui.saveRange, state.status === "trimming" ? video ? `선택 구간 만드는 중 ${exportPercent()}%` : "선택 구간 만드는 중…"
-    : state.status === "exporting" && activeCommand === "SAVE_VIDEO_RANGE" ? `선택 GIF 만드는 중 ${exportPercent()}%` : `선택 구간 저장 · .${format}`);
+  setText(ui.saveRange, state.status === "trimming" && (!video || activeCommand !== "SAVE_VIDEO") ? video ? `${videoProcessingLabel()} ${exportPercent()}%` : "선택 구간 만드는 중…"
+    : state.status === "exporting" && activeCommand === "SAVE_VIDEO_RANGE" ? `선택 GIF 만드는 중 ${exportPercent()}%` : `선택 구간 저장 · ${savedOutputLabel()}`);
   renderPreviewPosition();
 }
 
 function render() {
+  if (exporting()) {
+    if (["mp4", "gif"].includes(state.exportFormat)) ui.saveFormat.value = state.exportFormat;
+    if (ui.saveFormat.value !== "gif" && ["both", "video", "audio"].includes(state.exportContent)) ui.saveContent.value = state.exportContent;
+  }
   const status = state.status;
   const recording = status === "recording";
   const paused = status === "paused";
@@ -342,7 +371,7 @@ function render() {
   ui.timer.setAttribute("aria-label", `${video ? "녹화" : "녹음"} 시간 ${time}`);
   ui.statusPill.dataset.status = status;
   const progress = exportPercent();
-  const statusLabel = video ? { starting: "녹화 준비 중", recording: "영상 녹화 중", ready: "녹화 완료", error: "녹화 확인 필요", trimming: `영상 구간 만드는 중 ${progress}%`, exporting: `GIF 만드는 중 ${progress}%` }[status] : null;
+  const statusLabel = video ? { starting: "녹화 준비 중", recording: "영상 녹화 중", ready: "녹화 완료", error: "녹화 확인 필요", trimming: `${videoProcessingLabel()} ${progress}%`, exporting: `GIF 만드는 중 ${progress}%` }[status] : null;
   setText(ui.statusLabel, statusLabel || statusLabels[status] || "상태 확인 중");
   setText(ui.formatTag, video ? "MP4 / VIDEO + AUDIO" : "MP4 / AUDIO");
   setText(ui.timerCaption, selecting ? "페이지에서 녹화할 사각형 영역을 드래그해 주세요" : recording ? `팝업을 닫아도 계속 ${video ? "녹화" : "녹음"}돼요` : paused ? "잠시 쉬는 중 · 정지한 시간은 제외돼요" : ready ? `${video ? "녹화" : "녹음"} 파일을 기기에 저장하세요` : status === "stopping" ? "MP4 파일을 정리하고 있어요" : "녹음할 탭에서 시작해 주세요");
@@ -370,7 +399,7 @@ function render() {
   ui.readyControls.hidden = !ready;
   ui.save.disabled = busy || pending || status !== "ready" || !state.result;
   ui.saveFormat.disabled = busy || pending || status !== "ready";
-  if (exporting() && ["mp4", "gif"].includes(state.exportFormat)) ui.saveFormat.value = state.exportFormat;
+  ui.saveContent.disabled = busy || pending || status !== "ready";
   ui.cancelExport.hidden = !exporting();
   ui.cancelExport.disabled = cancellingExport;
   setText(ui.cancelExport, cancellingExport ? "처리 중지 중…" : "처리 중지 · 원본 유지");
@@ -378,8 +407,8 @@ function render() {
   setText(ui.discard, videoResult() ? "새 녹화" : "새 녹음");
   ui.save.classList.toggle("primary", !trimAvailable());
   ui.save.classList.toggle("secondary", trimAvailable());
-  const format = videoResult() && ui.saveFormat.value === "gif" ? "gif" : "mp4";
-  setText(ui.save, status === "exporting" && activeCommand === "SAVE_VIDEO" ? `전체 GIF 만드는 중 ${progress}%` : `전체 저장 · .${format}`);
+  setText(ui.save, status === "exporting" && activeCommand === "SAVE_VIDEO" ? `전체 GIF 만드는 중 ${progress}%`
+    : status === "trimming" && activeCommand === "SAVE_VIDEO" ? `${videoProcessingLabel()} ${progress}%` : `전체 저장 · ${savedOutputLabel()}`);
   setText(ui.hint, queuedStop ? "종료 요청을 기억했어요. 진행 중인 준비가 끝나면 바로 종료해요." : selecting ? "이 창을 닫고 페이지에서 영역을 선택하면 녹화가 시작돼요." : ready ? pending ? "저장이 끝날 때까지 파일을 보관해요." : complete ? "저장 완료 · 새 녹음을 시작할 수 있어요." : "브라우저를 닫기 전에 파일을 저장해 주세요." : recording || paused ? video ? "선택 영역 영상과 현재 탭 소리를 함께 녹화해요." : "현재 탭만 녹음해요 · 최대 2시간 또는 128 MB" : starting ? "잠시만 기다려 주세요. 준비 중에도 종료할 수 있어요." : transitional ? "잠시만 기다려 주세요." : "소리만 녹음하거나, 영역을 선택해 영상으로 저장하세요.");
 
   const error = commandError || connectionError || state.error || (interrupted ? download.error || "다운로드가 중단됐어요. 저장을 다시 시도해 주세요." : "");
@@ -575,11 +604,12 @@ document.addEventListener("keydown", (event) => {
 ui.save.addEventListener("click", () => {
   if (state.status === "ready" && state.result && state.download?.status !== "pending") {
     stopRangePreview();
-    if (videoResult()) void command("SAVE_VIDEO", { format: ui.saveFormat.value });
+    if (videoResult()) void command("SAVE_VIDEO", videoSaveOptions());
     else void command("SAVE");
   }
 });
 ui.saveFormat.addEventListener("change", render);
+ui.saveContent.addEventListener("change", render);
 ui.shortcutSettings.addEventListener("click", async () => {
   const scheme = /\bEdg\//.test(navigator.userAgent) ? "edge" : "chrome";
   const url = `${scheme}://extensions/shortcuts`;
@@ -597,7 +627,7 @@ ui.saveRange.addEventListener("click", () => {
   if (busy || state.status !== "ready" || state.download?.status === "pending" || !trimAvailable() || selection.error || selectedExportError(selection)) return;
   stopRangePreview();
   const range = { startSeconds: selection.startSeconds, endSeconds: selection.endSeconds };
-  if (videoResult()) void command("SAVE_VIDEO_RANGE", { ...range, format: ui.saveFormat.value });
+  if (videoResult()) void command("SAVE_VIDEO_RANGE", { ...range, ...videoSaveOptions() });
   else void command("SAVE_RANGE", range);
 });
 async function copyGif(scope) {

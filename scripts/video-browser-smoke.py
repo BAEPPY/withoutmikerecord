@@ -196,6 +196,8 @@ async def main():
         await popup.wait_for_selector('#video-preview:visible')
         assert await popup.locator('#audio-trim-controls').is_visible()
         assert await popup.locator('#save-range-button').is_visible()
+        assert await popup.locator('#save-content').is_visible()
+        assert await popup.input_value('#save-content') == 'both'
         assert state['selection']['startSeconds'] == 0
         assert state['result']['trimError'] is None
         await popup.fill('#trim-start','0.35')
@@ -286,6 +288,53 @@ async def main():
         assert '취소' in cancelled['notice']
         assert await owner.evaluate('downloaded.length') == 4
         assert await popup.locator('#error-message').is_hidden()
+        # The same source and interval must produce actual single-track files,
+        # not a muted player or a misleading filename. Switching the content
+        # choice must also invalidate the previous export's cache key.
+        await popup.fill('#trim-start','0.35')
+        await popup.fill('#trim-end','1.25')
+        await popup.locator('#trim-end').blur()
+        track_checks = {}
+        download_count = 4
+        for scope, button in [('whole','save-button'),('range','save-range-button')]:
+            for content, expected_tracks in [('video',['video']),('audio',['audio']),('both',['audio','video'])]:
+                await popup.select_option('#save-content',content)
+                await popup.click('#'+button)
+                download_count += 1
+                await owner.wait_for_function('(count)=>downloaded.length === count',arg=download_count,timeout=60000)
+                await popup.wait_for_function("!document.querySelector('#save-range-button').disabled")
+                exported = await owner.evaluate('recorder.getState()')
+                assert exported['result']['url'] == state['result']['url']
+                export_path = OUTPUT / f'test-{scope}-{content}{CASE_SUFFIX}.mp4'
+                await save_blob('downloaded.at(-1).url',export_path)
+                exported_probe = probe(export_path)
+                actual_tracks = sorted(stream['codec_type'] for stream in exported_probe['streams'])
+                assert actual_tracks == expected_tracks, (scope,content,exported_probe)
+                expected_duration = 0.9 if scope == 'range' else float(video_probe['format']['duration'])
+                assert abs(float(exported_probe['format']['duration'])-expected_duration) < 0.2, exported_probe
+                if content != 'audio':
+                    assert_cropped_pixels(export_path,*EXPECTED_CROP)
+                if content != 'video':
+                    export_pcm = array.array('f',subprocess.check_output([
+                        'ffmpeg','-v','error','-i',str(export_path),'-vn','-ac','1','-ar','48000','-f','f32le','-']))
+                    export_crossings = sum(export_pcm[i-1] < 0 <= export_pcm[i] for i in range(1,len(export_pcm)))
+                    export_frequency = export_crossings*48000/len(export_pcm)
+                    assert 420 <= export_frequency <= 460 and max(abs(value) for value in export_pcm) > 0.05
+                if scope == 'whole' and content == 'both':
+                    assert await owner.evaluate('downloaded.at(-1).url === recorder.getState().result.url')
+                track_checks[f'{scope}-{content}'] = actual_tracks
+        # An audio-only MP4 choice has no effect on subsequent silent GIF output.
+        await popup.select_option('#save-content','audio')
+        await popup.select_option('#save-format','gif')
+        assert await popup.locator('#save-content').is_hidden()
+        await popup.click('#save-button')
+        download_count += 1
+        await owner.wait_for_function('(count)=>downloaded.length === count',arg=download_count)
+        await popup.wait_for_function("!document.querySelector('#save-button').disabled")
+        assert await owner.evaluate('downloaded.at(-1).url === recorder.getState().gifResult.url')
+        await popup.select_option('#save-format','mp4')
+        assert await popup.input_value('#save-content') == 'audio'
+        await popup.locator('#ready-controls').screenshot(path=str(OUTPUT / f'video-content-options{CASE_SUFFIX}.png'))
         await popup.close()
         await owner.bring_to_front()
         await owner.evaluate("controller.handle({type:'DISCARD'})")
@@ -306,7 +355,8 @@ async def main():
           'gifFrames':gif_probe['streams'][0]['nb_frames'],'gifDuration':gif_probe['format']['duration'],
           'checkedPixels':{'videoFrames':video_frames,'gifFrames':gif_frames,'clipFrames':clip_frames,'rangeGifFrames':range_gif_frames,'allCorners':True},
           'clipDuration':clip_probe['format']['duration'],'rangeGifDuration':range_gif_probe['format']['duration'],
-          'verified':'3 frozen selector, Escape cancel, letterboxed drag crop, 4 stop, audio/video MP4, every cropped pixel, silent GIF, hundredths video editor/preview, selected MP4/GIF, whole/range animated GIF clipboard bytes, native trim cancellation, original/cache preservation, viewport resize stops recording',
+          'trackSelections':track_checks,
+          'verified':'3 frozen selector, Escape cancel, letterboxed drag crop, 4 stop, audio/video MP4, every cropped pixel, silent GIF, hundredths video editor/preview, selected MP4/GIF, whole/range animated GIF clipboard bytes, native trim cancellation, whole/range video-only/audio-only/combined MP4 tracks, original/cache preservation, viewport resize stops recording',
           'scope':'real keyboard, selector, native media/canvas/worker/UI; synthetic tabCapture and download APIs'},ensure_ascii=False))
         await browser.close()
 

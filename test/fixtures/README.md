@@ -11,3 +11,16 @@ Small audio-only MP4 fixtures for deterministic local remux tests:
 Both fixtures contain generated tones only. Node tests need no FFmpeg install.
 During implementation, trimmed outputs were also decoded completely with FFmpeg
 and inspected with ffprobe to verify the remux against an independent parser.
+
+Synthetic video/audio fixtures for lossless track extraction:
+
+- `av-fragmented.mp4`: 64×48 H.264 test pattern with B-frames and a 660 Hz AAC
+  tone, generated with:
+  `ffmpeg -f lavfi -i 'testsrc2=size=64x48:rate=12:duration=2' -f lavfi -i 'sine=frequency=660:sample_rate=48000:duration=2' -c:v libx264 -preset fast -g 12 -bf 2 -c:a aac -b:a 32k -movflags +frag_keyframe+empty_moov av-fragmented.mp4`
+- `av-edited.mp4`: the same encoded packets in a regular MP4 containing edit
+  lists, generated with:
+  `ffmpeg -i av-fragmented.mp4 -c copy -movflags +faststart av-edited.mp4`
+
+These generated fixtures contain no external footage or recordings. Tests verify
+that extraction preserves every encoded packet, codec initialization, B-frame
+composition offset, edit list and available track while removing the other one.

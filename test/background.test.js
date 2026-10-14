@@ -91,7 +91,7 @@ test('content scripts cannot invoke popup-only commands or forge offscreen state
     'START', 'BROWSER_START', 'STOP', 'STOP_PENDING', 'PAUSE', 'RESUME', 'SAVE', 'SAVE_RANGE', 'DISCARD',
     'SET_SELECTION', 'ARM_SHORTCUTS', 'STATUS', 'STATE_CHANGED',
     'BEGIN_VIDEO', 'START_VIDEO', 'CANCEL_VIDEO', 'STOP_VIDEO', 'OPEN_VIDEO_SELECTOR', 'SAVE_VIDEO',
-    'SAVE_VIDEO_RANGE', 'PREPARE_GIF_COPY', 'CANCEL_EXPORT',
+    'SAVE_VIDEO_RANGE', 'PREPARE_VIDEO_EXPORT', 'PREPARE_GIF_COPY', 'CANCEL_EXPORT',
   ]) {
     await h.dispatch({
       target: 'background', type, targetTabId: 17,
