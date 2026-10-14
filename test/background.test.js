@@ -78,7 +78,7 @@ test('top-level page keys use the sender tab, ignoring a forged capture target i
 test('content scripts cannot invoke popup-only commands or forge offscreen state updates', async () => {
   const h = await harness();
   for (const type of [
-    'START', 'STOP', 'PAUSE', 'RESUME', 'SAVE', 'SAVE_RANGE', 'DISCARD',
+    'START', 'BROWSER_START', 'STOP', 'STOP_PENDING', 'PAUSE', 'RESUME', 'SAVE', 'SAVE_RANGE', 'DISCARD',
     'SET_SELECTION', 'ARM_SHORTCUTS', 'STATUS', 'STATE_CHANGED',
     'BEGIN_VIDEO', 'START_VIDEO', 'CANCEL_VIDEO', 'STOP_VIDEO', 'OPEN_VIDEO_SELECTOR', 'SAVE_VIDEO',
   ]) {
@@ -172,7 +172,7 @@ test('browser keyboard commands use the provided source tab without falling back
   h.listeners.command('stop-video', { id: 17 });
   await settle();
   assert.deepEqual(h.calls, [
-    { type: 'START', targetTabId: 88 },
+    { type: 'BROWSER_START', targetTabId: 88 },
     { type: 'PAGE_STOP', targetTabId: 17 },
     { type: 'OPEN_VIDEO_SELECTOR', targetTabId: 88 },
     { type: 'STOP_VIDEO', targetTabId: 17 },

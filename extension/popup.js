@@ -43,6 +43,12 @@ const ui = {
   discard: byId("discard-button"),
   hint: byId("control-hint"),
   shortcutStatus: byId("shortcut-status"),
+  shortcutAudioStart: byId("shortcut-audio-start"),
+  shortcutAudioStop: byId("shortcut-audio-stop"),
+  shortcutVideoStart: byId("shortcut-video-start"),
+  shortcutVideoStop: byId("shortcut-video-stop"),
+  shortcutAssignmentNote: byId("shortcut-assignment-note"),
+  shortcutSettings: byId("shortcut-settings"),
 };
 
 const statusLabels = {
@@ -61,6 +67,9 @@ const statusLabels = {
 
 let state = { status: "loading", elapsedMs: 0, bytes: 0, level: 0 };
 let busy = false;
+let activeCommand = null;
+let activeOperationId = null;
+let queuedStop = null;
 let commandError = "";
 let connectionError = "";
 let commandVersion = 0;
@@ -113,6 +122,36 @@ function videoResult() {
 
 function videoMode() {
   return state.status === "selecting" || state.mode === "video" || videoResult();
+}
+
+function pendingCaptureMode() {
+  if (activeCommand === "START") return "audio";
+  if (activeCommand === "OPEN_VIDEO_SELECTOR") return "video";
+  if (activeCommand === "PAUSE" || activeCommand === "RESUME") return videoMode() ? "video" : "audio";
+  return null;
+}
+
+function canStop(mode) {
+  if (busy) return pendingCaptureMode() === mode;
+  return mode === (videoMode() ? "video" : "audio")
+    && ["starting", "recording", "paused", "selecting"].includes(state.status);
+}
+
+function stopCapture(mode) {
+  if (!canStop(mode)) return false;
+  if (busy) {
+    // Send immediately: the background binds this stop to the pending operation,
+    // so closing the popup before its reply cannot discard the stop intent.
+    queuedStop ||= {
+      promise: request("STOP_PENDING", { operationId: activeOperationId, mode }).catch((error) => ({
+        ok: false, error: error.message || "종료 요청을 보내지 못했어요. 다시 종료해 주세요.",
+      })),
+    };
+    render();
+  } else {
+    void command(state.status === "selecting" ? "CANCEL_VIDEO" : "STOP");
+  }
+  return true;
 }
 
 function activePreview() {
@@ -238,7 +277,9 @@ function render() {
   const recording = status === "recording";
   const paused = status === "paused";
   const selecting = status === "selecting";
-  const video = videoMode();
+  const starting = status === "starting" || activeCommand === "START" || activeCommand === "OPEN_VIDEO_SELECTOR";
+  const mode = pendingCaptureMode() || (videoMode() ? "video" : "audio");
+  const video = mode === "video";
   const ready = status === "ready" || status === "trimming" || status === "exporting";
   const transitional = status === "starting" || status === "stopping" || status === "trimming" || status === "exporting";
   const download = state.download || {};
@@ -263,18 +304,18 @@ function render() {
   setText(ui.source, title);
   ui.source.title = title;
 
-  ui.start.hidden = ready || recording || paused || selecting || status === "stopping";
+  ui.start.hidden = ready || recording || paused || selecting || starting || status === "stopping";
   ui.start.disabled = busy || !(status === "idle" || status === "error");
   ui.startVideo.hidden = ui.start.hidden;
   ui.startVideo.disabled = ui.start.disabled;
   setText(ui.startLabel, status === "starting" ? "녹음 준비 중…" : "녹음 시작");
-  ui.recordingControls.hidden = !(recording || paused || selecting || status === "stopping");
-  ui.recordingControls.classList.toggle("recording-selecting", selecting);
-  ui.pause.hidden = selecting;
+  ui.recordingControls.hidden = !(recording || paused || selecting || starting || status === "stopping");
+  ui.recordingControls.classList.toggle("recording-selecting", selecting || starting);
+  ui.pause.hidden = selecting || starting;
   ui.pause.disabled = busy || transitional;
   setText(ui.pause, paused ? "녹음 재개" : "일시 정지");
-  ui.stop.disabled = busy || transitional;
-  setText(ui.stopLabel, selecting ? "영역 선택 취소" : video ? "영상 끝내기" : "녹음 끝내기");
+  ui.stop.disabled = Boolean(queuedStop) || !canStop(mode);
+  setText(ui.stopLabel, queuedStop ? "종료 요청 대기 중…" : selecting || activeCommand === "OPEN_VIDEO_SELECTOR" ? "영역 선택 취소" : video ? "영상 끝내기" : "녹음 끝내기");
   ui.stop.setAttribute("aria-keyshortcuts", video ? "4" : "2");
   ui.stop.title = selecting ? "영역 선택 취소 (키보드 4)" : video ? "영상 끝내기 (키보드 4)" : "녹음 끝내기 (키보드 2)";
   ui.readyControls.hidden = !ready;
@@ -285,7 +326,7 @@ function render() {
   ui.save.classList.toggle("primary", videoResult());
   ui.save.classList.toggle("secondary", !videoResult());
   setText(ui.save, status === "exporting" ? `GIF 만드는 중 ${exportPercent}%` : videoResult() ? ui.saveFormat.value === "gif" ? "GIF 저장 · 소리 없음" : "영상 저장 · .mp4" : "전체 저장 · .mp4");
-  setText(ui.hint, selecting ? "이 창을 닫고 페이지에서 영역을 선택하면 녹화가 시작돼요." : ready ? pending ? "저장이 끝날 때까지 파일을 보관해요." : complete ? "저장 완료 · 새 녹음을 시작할 수 있어요." : "브라우저를 닫기 전에 파일을 저장해 주세요." : recording || paused ? video ? "선택 영역 영상과 현재 탭 소리를 함께 녹화해요." : "현재 탭만 녹음해요 · 최대 2시간 또는 128 MB" : transitional ? "잠시만 기다려 주세요." : "소리만 녹음하거나, 영역을 선택해 영상으로 저장하세요.");
+  setText(ui.hint, queuedStop ? "종료 요청을 기억했어요. 진행 중인 준비가 끝나면 바로 종료해요." : selecting ? "이 창을 닫고 페이지에서 영역을 선택하면 녹화가 시작돼요." : ready ? pending ? "저장이 끝날 때까지 파일을 보관해요." : complete ? "저장 완료 · 새 녹음을 시작할 수 있어요." : "브라우저를 닫기 전에 파일을 저장해 주세요." : recording || paused ? video ? "선택 영역 영상과 현재 탭 소리를 함께 녹화해요." : "현재 탭만 녹음해요 · 최대 2시간 또는 128 MB" : starting ? "잠시만 기다려 주세요. 준비 중에도 종료할 수 있어요." : transitional ? "잠시만 기다려 주세요." : "소리만 녹음하거나, 영역을 선택해 영상으로 저장하세요.");
 
   const error = commandError || connectionError || state.error || (interrupted ? download.error || "다운로드가 중단됐어요. 저장을 다시 시도해 주세요." : "");
   setText(ui.error, error);
@@ -318,25 +359,66 @@ async function armShortcuts() {
   ui.shortcutStatus.title = shortcutDetail;
   setText(ui.shortcutStatus, shortcutConnection === "connected"
     ? "이 탭에 연결됨 · 창을 닫아도 1/2 소리 · 3/4 영상"
-    : "페이지 단축키 연결 불가 · 아래 Alt+Shift 단축키를 사용해 주세요.");
+    : "페이지 숫자키 연결 불가 · 아래 등록 상태와 단축키 설정을 확인해 주세요.");
+}
+
+async function loadShortcutAssignments() {
+  const assignments = [
+    ["start-recording", ui.shortcutAudioStart], ["stop-recording", ui.shortcutAudioStop],
+    ["start-video", ui.shortcutVideoStart], ["stop-video", ui.shortcutVideoStop],
+  ];
+  try {
+    const commands = await chrome.commands.getAll();
+    if (!Array.isArray(commands)) throw new Error("단축키 목록을 가져오지 못했어요.");
+    let missing = false;
+    for (const [name, element] of assignments) {
+      const shortcut = commands.find((item) => item.name === name)?.shortcut?.trim() || "";
+      setText(element, shortcut || "미지정");
+      element.dataset.assigned = String(Boolean(shortcut));
+      if (!shortcut) missing = true;
+    }
+    setText(ui.shortcutAssignmentNote, missing
+      ? "미지정 키는 설정에서 등록하세요. 다른 단축키와 겹치면 키를 바꿔 주세요."
+      : "실제 등록된 키예요. 동작하지 않으면 설정에서 다른 키로 바꿔 주세요.");
+  } catch {
+    for (const [, element] of assignments) {
+      setText(element, "확인 불가");
+      element.dataset.assigned = "false";
+    }
+    setText(ui.shortcutAssignmentNote, "단축키 등록 상태를 가져오지 못했어요. 설정에서 확인해 주세요.");
+  }
 }
 
 async function command(type, payload = {}) {
   if (busy) return;
+  const operationId = ["START", "OPEN_VIDEO_SELECTOR", "PAUSE", "RESUME"].includes(type) ? crypto.randomUUID() : null;
   busy = true;
+  activeCommand = type;
+  activeOperationId = operationId;
   commandVersion += 1;
   commandError = "";
   connectionError = "";
   render();
   let successful = false;
   try {
-    const response = await request(type, payload);
+    const response = await request(type, operationId ? { ...payload, operationId } : payload);
     if (response.state) state = response.state;
     if (!response.ok) commandError = response.error || "요청을 처리하지 못했어요. 다시 시도해 주세요.";
     successful = response.ok;
   } catch (error) {
     commandError = error.message || "요청을 처리하지 못했어요. 팝업을 다시 열어 주세요.";
   } finally {
+    if (queuedStop) {
+      const response = await queuedStop.promise;
+      // Apply the follow-up last even if its reply arrived before the start reply.
+      if (response.state) state = response.state;
+      if (!response.ok && !commandError) commandError = response.error || "종료 요청을 처리하지 못했어요. 다시 종료해 주세요.";
+      // Keep the popup open after a requested video cancellation.
+      successful = false;
+    }
+    queuedStop = null;
+    activeCommand = null;
+    activeOperationId = null;
     busy = false;
     commandVersion += 1;
     render();
@@ -402,23 +484,23 @@ ui.pause.addEventListener("click", () => {
   }
 });
 ui.stop.addEventListener("click", () => {
-  if (state.status === "selecting") {
-    void command("CANCEL_VIDEO");
-    return;
-  }
-  if (state.status === "recording" || state.status === "paused") void command("STOP");
+  stopCapture(pendingCaptureMode() || (videoMode() ? "video" : "audio"));
 });
 document.addEventListener("keydown", (event) => {
   // Shortcuts belong to this popup; preserve typing and native media controls.
-  if (busy || event.defaultPrevented || event.repeat || event.isComposing || event.keyCode === 229
+  if (event.defaultPrevented || event.repeat || event.isComposing || event.keyCode === 229
     || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
   const target = event.target;
   if (target instanceof Element && (target.isContentEditable
     || target.closest('input, textarea, select, audio, video, [role="textbox"], [role="spinbutton"]'))) return;
+  const stopMode = event.key === "2" ? "audio" : event.key === "4" ? "video" : null;
+  if (stopMode && stopCapture(stopMode)) {
+    event.preventDefault();
+    return;
+  }
+  if (busy) return;
   const button = event.key === "1" && ["idle", "error"].includes(state.status) ? ui.start
-    : event.key === "3" && ["idle", "error"].includes(state.status) ? ui.startVideo
-    : event.key === "2" && !videoMode() && ["recording", "paused"].includes(state.status) ? ui.stop
-    : event.key === "4" && videoMode() && ["recording", "paused", "selecting"].includes(state.status) ? ui.stop : null;
+    : event.key === "3" && ["idle", "error"].includes(state.status) ? ui.startVideo : null;
   if (!button || button.disabled || button.closest("[hidden]")) return;
   event.preventDefault();
   button.click();
@@ -431,6 +513,18 @@ ui.save.addEventListener("click", () => {
   }
 });
 ui.saveFormat.addEventListener("change", render);
+ui.shortcutSettings.addEventListener("click", async () => {
+  const scheme = /\bEdg\//.test(navigator.userAgent) ? "edge" : "chrome";
+  const url = `${scheme}://extensions/shortcuts`;
+  ui.shortcutSettings.disabled = true;
+  try {
+    await chrome.tabs.create({ url });
+  } catch {
+    setText(ui.shortcutAssignmentNote, `설정을 열지 못했어요. 주소창에 ${url}를 입력해 주세요.`);
+  } finally {
+    ui.shortcutSettings.disabled = false;
+  }
+});
 ui.saveRange.addEventListener("click", () => {
   const selection = readSelection();
   if (busy || state.status !== "ready" || state.download?.status === "pending" || !trimAvailable() || selection.error) return;
@@ -516,4 +610,5 @@ ui.discard.addEventListener("click", () => {
 
 render();
 void armShortcuts();
+void loadShortcutAssignments();
 void poll();

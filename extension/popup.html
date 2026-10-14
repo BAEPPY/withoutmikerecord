@@ -114,7 +114,16 @@
         <p class="control-hint" id="control-hint">먼저 페이지에서 소리를 재생해 주세요.</p>
         <p class="shortcut-hint">이 창에서 <kbd>1</kbd> 소리 시작 · <kbd>2</kbd> 소리 종료<br /><kbd>3</kbd> 영역 선택 후 영상 시작 · <kbd>4</kbd> 영상 종료</p>
         <p class="shortcut-status" id="shortcut-status" role="status" aria-live="polite" data-status="pending">페이지 단축키 연결 중…</p>
-        <p class="shortcut-hint" id="shortcut-fallback"><kbd>Alt+Shift+1</kbd> 소리 시작 · <kbd>Alt+Shift+2</kbd> 종료<br /><kbd>Alt+Shift+3</kbd> 영역 선택 · <kbd>Alt+Shift+4</kbd> 종료<br />아이콘을 열지 않고 사용할 수 있어요.</p>
+        <div class="shortcut-bindings" id="shortcut-fallback" aria-label="브라우저에 등록된 단축키">
+          <dl class="shortcut-binding-list">
+            <div><dt>소리 시작</dt><dd id="shortcut-audio-start">확인 중</dd></div>
+            <div><dt>소리 종료</dt><dd id="shortcut-audio-stop">확인 중</dd></div>
+            <div><dt>영상 선택</dt><dd id="shortcut-video-start">확인 중</dd></div>
+            <div><dt>영상 종료</dt><dd id="shortcut-video-stop">확인 중</dd></div>
+          </dl>
+          <p class="shortcut-status" id="shortcut-assignment-note" role="status"></p>
+          <button class="position-button" id="shortcut-settings" type="button">단축키 설정 열기</button>
+        </div>
       </div>
 
       <footer class="footer">

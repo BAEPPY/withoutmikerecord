@@ -27,7 +27,7 @@ function element(tagName, attributes = {}) {
 
 // Browser integration verifies actual trusted keyboard events. This isolated
 // context makes message timing and extension invalidation deterministic.
-function page({ runtimeMessages = false } = {}) {
+function page({ runtimeMessages = false, configure = () => {} } = {}) {
   const listeners = new Set();
   const windowListeners = new Map([['keydown', listeners]]);
   const messageListeners = new Set();
@@ -80,17 +80,19 @@ function page({ runtimeMessages = false } = {}) {
       clearTimeout(id) { timers.delete(id); },
     },
   });
+  env.context = context;
+  env.runtime = runtime;
   env.install = () => vm.runInContext(source, context);
-  env.press = (key, overrides = {}) => {
+  env.press = (key, overrides = {}, targets = listeners) => {
     const event = {
       key, isTrusted: true, defaultPrevented: false, repeat: false, isComposing: false,
-      keyCode: key.charCodeAt(0),
+      keyCode: typeof key === 'string' ? key.charCodeAt(0) : 0,
       composedPath: () => [element('video')],
       preventDefault() { this.prevented = true; },
       stopImmediatePropagation() { this.stopped = true; },
       ...overrides,
     };
-    return { event, completion: Promise.all([...listeners].map((listener) => listener(event))) };
+    return { event, completion: Promise.all([...targets].map((listener) => listener(event))) };
   };
   env.message = (message) => Promise.all([...messageListeners].map((listener) => (
     listener(message, { id: 'test-extension' }, (reply) => { messageReplies.push(structuredClone(reply)); })
@@ -106,7 +108,73 @@ function page({ runtimeMessages = false } = {}) {
   env.windowEvent = (type) => Promise.all([...(windowListeners.get(type) || [])].map((listener) => (
     listener({ type })
   )));
+  configure(context, env);
   env.install();
+  return env;
+}
+
+function framePage() {
+  const observers = [];
+  function documentWithFrames(document = { documentElement: {} }) {
+    document.frames = [];
+    document.scans = 0;
+    document.querySelectorAll = (selector) => {
+      assert.equal(selector, 'iframe, frame');
+      document.scans += 1;
+      return document.frames;
+    };
+    return document;
+  }
+  function frame(parentDocument, { crossOrigin = false } = {}) {
+    const listeners = new Set();
+    const loads = new Set();
+    const target = {
+      document: documentWithFrames(),
+      addEventListener(type, listener, capture) {
+        assert.equal(type, 'keydown');
+        assert.equal(capture, true);
+        listeners.add(listener);
+      },
+      removeEventListener(type, listener) { listeners.delete(listener); },
+    };
+    if (crossOrigin) Object.defineProperty(target, 'document', {
+      configurable: true,
+      get() { throw new Error('Cross-origin access denied'); },
+    });
+    const node = {
+      tagName: 'IFRAME', contentWindow: target, listeners, loads,
+      addEventListener(type, listener) { assert.equal(type, 'load'); loads.add(listener); },
+      removeEventListener(type, listener) { loads.delete(listener); },
+      async load() { for (const callback of loads) callback(); await Promise.resolve(); },
+    };
+    parentDocument.frames.push(node);
+    return node;
+  }
+  const env = page({
+    runtimeMessages: true,
+    configure(context, env) {
+      const document = documentWithFrames(context.document);
+      env.firstFrame = frame(document);
+      env.nestedFrame = frame(env.firstFrame.contentWindow.document);
+      env.foreignFrame = frame(document, { crossOrigin: true });
+      context.MutationObserver = class {
+        constructor(callback) { this.callback = callback; observers.push(this); }
+        observe(target) { this.target = target; this.active = true; }
+        disconnect() { this.active = false; }
+      };
+    },
+  });
+  env.documentWithFrames = documentWithFrames;
+  env.addFrame = frame;
+  env.observers = observers;
+  env.mutate = (document, addedNodes = [], removedNodes = []) => {
+    for (const observer of observers) {
+      if (observer.active && observer.target === document.documentElement) {
+        observer.callback([{ addedNodes, removedNodes }]);
+      }
+    }
+  };
+  env.pressFrame = (target, key, overrides = {}) => env.press(key, overrides, target.listeners);
   return env;
 }
 
@@ -148,7 +216,7 @@ test('a failed start drops the queued stop and clears it before the next start',
   env.respond = () => startReply.promise;
   const start = env.press('1');
   await env.press('2').completion;
-  startReply.resolve({ ok: false, error: '탭 권한이 없습니다.' });
+  startReply.resolve({ ok: false, error: '탭 권한이 없습니다.', state: { mode: 'audio', status: 'idle' } });
   await start.completion;
   assert.deepEqual(env.sent.map((message) => message.key), ['1']);
   assert.equal(env.toast(), '탭 권한이 없습니다.');
@@ -162,7 +230,7 @@ test('a failed start drops the queued stop and clears it before the next start',
 test('ignores repeats, synthetic keys, IME, modifiers, and editable controls', async () => {
   const env = page();
   for (const overrides of [
-    { repeat: true }, { isTrusted: false }, { defaultPrevented: true },
+    { repeat: true }, { isTrusted: false },
     { isComposing: true }, { keyCode: 229 },
     { ctrlKey: true }, { altKey: true }, { metaKey: true }, { shiftKey: true },
     ...['input', 'textarea', 'select'].map((tag) => ({ composedPath: () => [element(tag)] })),
@@ -171,7 +239,7 @@ test('ignores repeats, synthetic keys, IME, modifiers, and editable controls', a
       composedPath: () => [element('div', { role })],
     })),
   ]) {
-    const { event, completion } = env.press('1', overrides);
+    const { event, completion } = env.press('1', { code: 'Digit1', ...overrides });
     await completion;
     assert.equal(event.prevented, undefined);
   }
@@ -188,6 +256,125 @@ test('focused video and audio controls still support recording shortcuts', async
   assert.deepEqual(env.sent.map((message) => message.key), ['1', '2']);
 });
 
+test('native non-text input controls permit recording shortcuts', async () => {
+  const env = page();
+  const types = ['range', 'button', 'submit', 'reset', 'checkbox', 'radio', 'image', 'color', 'file', 'hidden'];
+  for (const type of types) {
+    const input = Object.assign(element('input', { type }), { type });
+    for (const key of ['1', '2']) {
+      const { event, completion } = env.press(key, { composedPath: () => [input] });
+      await completion;
+      assert.ok(event.prevented && event.stopped, `${type} should allow key ${key}`);
+    }
+  }
+  assert.equal(env.sent.length, types.length * 2);
+});
+
+test('text, numeric, and date input controls retain their editing keys', async () => {
+  const env = page();
+  for (const type of ['text', 'number', 'search', 'email', 'password', 'tel', 'url', 'date', 'datetime-local', 'month', 'week', 'time']) {
+    const input = Object.assign(element('input', { type }), { type });
+    for (const key of ['1', '2', '3', '4']) {
+      const { event, completion } = env.press(key, {
+        code: `Digit${key}`, defaultPrevented: true, composedPath: () => [input],
+      });
+      await completion;
+      assert.equal(event.prevented, undefined, `${type} must keep key ${key} for editing`);
+    }
+  }
+  assert.deepEqual(env.sent, []);
+});
+
+test('a trusted recorder key still works after the site prevented its default action', async () => {
+  const env = page();
+  for (const key of ['1', '2']) {
+    const { event, completion } = env.press(key, { defaultPrevented: true });
+    await completion;
+    assert.ok(event.prevented && event.stopped);
+  }
+  assert.deepEqual(env.sent.map((message) => message.key), ['1', '2']);
+});
+
+test('physical digit keys normalize differing keyboard layouts without changing numeric key priority', async () => {
+  const env = page();
+  env.respond = async () => ({ ok: false, error: 'test response' });
+  const cases = [
+    { key: '&', code: 'Digit1', expected: '1' },
+    { key: 'é', code: 'Digit2', expected: '2' },
+    { key: '"', code: 'Digit3', expected: '3' },
+    { key: "'", code: 'Digit4', expected: '4' },
+    { key: '2', code: 'Digit1', expected: '2' },
+  ];
+  for (const { key, code, expected } of cases) {
+    const { event, completion } = env.press(key, { code });
+    await completion;
+    assert.ok(event.prevented && event.stopped, `${code} should normalize to ${expected}`);
+    assert.equal(env.sent.at(-1).key, expected);
+  }
+  assert.equal(env.sent.length, cases.length);
+});
+
+test('numpad digit keys work when numeric or unidentified but preserve NumLock-off navigation', async () => {
+  const env = page();
+  env.respond = async () => ({ ok: false, error: 'test response' });
+  for (const number of ['1', '2', '3', '4']) {
+    for (const key of [number, undefined, 'Unidentified']) {
+      const { event, completion } = env.press(key, { code: `Numpad${number}` });
+      await completion;
+      assert.ok(event.prevented && event.stopped);
+      assert.equal(env.sent.at(-1).key, number);
+    }
+  }
+  const sentBeforeNavigation = env.sent.length;
+  for (const [key, code] of [
+    ['End', 'Numpad1'], ['ArrowDown', 'Numpad2'], ['PageDown', 'Numpad3'], ['ArrowLeft', 'Numpad4'],
+  ]) {
+    const { event, completion } = env.press(key, { code });
+    await completion;
+    assert.equal(event.prevented, undefined, `${key} must remain a navigation key`);
+  }
+  assert.equal(env.sent.length, sentBeforeNavigation);
+});
+
+test('layout normalization still ignores IME and modified physical digit keys', async () => {
+  const env = page();
+  for (const overrides of [
+    { repeat: true }, { isTrusted: false }, { isComposing: true }, { keyCode: 229 },
+    { ctrlKey: true }, { altKey: true }, { metaKey: true }, { shiftKey: true },
+  ]) {
+    const { event, completion } = env.press('&', { code: 'Digit1', ...overrides });
+    await completion;
+    assert.equal(event.prevented, undefined);
+  }
+  assert.deepEqual(env.sent, []);
+});
+
+test('a rejected audio start preserves queued 2 when that reply confirms audio is already recording',
+  { timeout: 2000 }, async () => {
+    const env = page();
+    const startReply = deferred();
+    env.respond = (message) => message.key === '1'
+      ? startReply.promise : { ok: true, state: { mode: 'audio', status: 'ready' } };
+    const start = env.press('1');
+    await env.press('2').completion;
+    await env.press('2').completion;
+    startReply.resolve({ ok: false, error: '이미 녹음 중입니다.', state: { mode: 'audio', status: 'recording' } });
+    await start.completion;
+    assert.deepEqual(env.sent.map((message) => message.key), ['1', '2']);
+    assert.match(env.toast(), /녹음을 마쳤어요/);
+  });
+
+test('a rejected audio start does not send queued 2 to an active video session', async () => {
+  const env = page();
+  const startReply = deferred();
+  env.respond = () => startReply.promise;
+  const start = env.press('1');
+  await env.press('2').completion;
+  startReply.resolve({ ok: false, error: '화면 녹화 중입니다.', state: { mode: 'video', status: 'recording' } });
+  await start.completion;
+  assert.deepEqual(env.sent.map((message) => message.key), ['1']);
+});
+
 test('repeated injection installs only one listener', async () => {
   const env = page();
   env.install();
@@ -195,6 +382,106 @@ test('repeated injection installs only one listener', async () => {
   assert.equal(env.listeners.size, 1);
   await env.press('1').completion;
   assert.equal(env.sent.length, 1);
+});
+
+test('legacy installation markers do not block a new usable installation', async () => {
+  for (const marker of [true, {}]) {
+    const env = page();
+    env.context.__withoutMikePageShortcuts.dispose();
+    env.context.__withoutMikePageShortcuts = marker;
+    env.install();
+    assert.equal(env.listeners.size, 1);
+    assert.equal(env.context.__withoutMikePageShortcuts.isAlive(), true);
+    await env.press('1').completion;
+    assert.equal(env.sent.length, 1);
+  }
+});
+
+test('reinjection replaces a dead runtime even when its id remains and cancels its scheduled selector', async () => {
+  const env = page({ runtimeMessages: true });
+  const oldInstallation = env.context.__withoutMikePageShortcuts;
+  await env.message({ type: 'SHOW_VIDEO_SELECTOR' });
+  env.runtime.getManifest = () => { throw new Error('Extension context invalidated.'); };
+  assert.equal(env.runtime.id, 'test-extension');
+  assert.equal(oldInstallation.isAlive(), false);
+  env.install();
+  env.runtime.getManifest = () => ({ version: 'test' });
+  assert.equal(oldInstallation.active, false);
+  assert.notEqual(env.context.__withoutMikePageShortcuts, oldInstallation);
+  assert.equal(env.listeners.size, 1);
+  assert.equal(env.messageListeners.size, 1);
+  await env.runTimers();
+  assert.deepEqual(env.sent, []);
+  await env.press('1').completion;
+  assert.deepEqual(env.sent.map((message) => message.key), ['1']);
+});
+
+test('same-origin frame and nested-frame keys share the top command queue without crossing origin boundaries', async () => {
+  const env = framePage();
+  assert.equal(env.firstFrame.listeners.size, 1);
+  assert.equal(env.nestedFrame.listeners.size, 1);
+  assert.equal(env.foreignFrame.listeners.size, 0);
+  const started = deferred();
+  env.respond = (message) => message.key === '1' ? started.promise : { ok: true };
+  const start = env.pressFrame(env.nestedFrame, '1');
+  await env.press('2').completion;
+  assert.deepEqual(env.sent.map((message) => message.key), ['1']);
+  started.resolve({ ok: true });
+  await start.completion;
+  assert.deepEqual(env.sent.map((message) => message.key), ['1', '2']);
+  const editable = env.pressFrame(env.firstFrame, '1', { composedPath: () => [element('input')] });
+  await editable.completion;
+  assert.equal(editable.event.prevented, undefined);
+});
+
+test('frame discovery batches additions, ignores unrelated mutations, and detaches removed frames', async () => {
+  const env = framePage();
+  const document = env.context.document;
+  const initialScans = document.scans;
+  env.mutate(document, [element('div'), { nodeType: 3 }]);
+  await Promise.resolve();
+  assert.equal(document.scans, initialScans);
+  const added = env.addFrame(document);
+  env.mutate(document, [added]);
+  env.mutate(document, [added]);
+  await Promise.resolve();
+  assert.equal(document.scans, initialScans + 1);
+  assert.equal(added.listeners.size, 1);
+  await env.pressFrame(added, '1').completion;
+  assert.equal(env.sent.length, 1);
+  const removedObserver = env.observers.find((observer) => observer.target === added.contentWindow.document.documentElement);
+  document.frames.splice(document.frames.indexOf(added), 1);
+  env.mutate(document, [], [added]);
+  await Promise.resolve();
+  assert.equal(added.listeners.size, 0);
+  assert.equal(added.loads.size, 0);
+  assert.equal(removedObserver.active, false);
+  const removedKey = env.pressFrame(added, '2');
+  await removedKey.completion;
+  assert.equal(removedKey.event.prevented, undefined);
+});
+
+test('frame reload replaces its document observer and disconnect releases every frame listener', async () => {
+  const env = framePage();
+  const frame = env.firstFrame;
+  const oldDocument = frame.contentWindow.document;
+  const oldObserver = env.observers.find((observer) => observer.target === oldDocument.documentElement);
+  frame.contentWindow.document = env.documentWithFrames();
+  await frame.load();
+  assert.equal(frame.listeners.size, 1);
+  assert.equal(oldObserver.active, false);
+  assert.equal(env.nestedFrame.listeners.size, 0);
+  assert.equal(env.nestedFrame.loads.size, 0);
+  await env.pressFrame(frame, '1').completion;
+  assert.equal(env.sent.length, 1);
+  env.runtime.getManifest = () => { throw new Error('Extension context invalidated.'); };
+  const rejected = env.pressFrame(frame, '2');
+  await rejected.completion;
+  assert.equal(rejected.event.prevented, undefined);
+  assert.equal(env.listeners.size, 0);
+  assert.equal(frame.listeners.size, 0);
+  assert.equal(frame.loads.size, 0);
+  assert.equal(env.observers.filter((observer) => observer.active).length, 0);
 });
 
 test('an invalidated extension context releases page keys and clears installation state', async () => {
@@ -224,6 +511,41 @@ const videoSelection = {
 const videoRegion = {
   x: 0.1, y: 0.2, width: 0.5, height: 0.4, viewportWidth: 1000, viewportHeight: 800,
 };
+
+test('a rejected video BEGIN preserves queued 4 when that reply confirms video is already recording',
+  { timeout: 2000 }, async () => {
+    const env = page();
+    const beginReply = deferred();
+    env.respond = (message) => message.key === '3'
+      ? beginReply.promise : { ok: true, state: videoState('ready') };
+    const start = env.press('3');
+    await env.press('4').completion;
+    await env.press('4').completion;
+    beginReply.resolve({ ok: false, error: '이미 화면 녹화 중입니다.', state: videoState('recording') });
+    await start.completion;
+    assert.deepEqual(env.sent, [
+      { target: 'background', type: 'PAGE_SHORTCUT', key: '3' },
+      { target: 'background', type: 'PAGE_SHORTCUT', key: '4' },
+    ]);
+    assert.deepEqual(env.selections, []);
+    assert.doesNotMatch(env.toast(), /이미 화면 녹화 중/);
+  });
+
+test('a rejected idle video BEGIN drops queued 4 and releases the next shortcut', async () => {
+  const env = page();
+  const beginReply = deferred();
+  env.respond = () => beginReply.promise;
+  const start = env.press('3');
+  await env.press('4').completion;
+  beginReply.resolve({ ok: false, error: '탭 권한이 없습니다.', state: videoState('idle', null) });
+  await start.completion;
+  assert.deepEqual(env.sent.map((message) => message.key), ['3']);
+  assert.equal(env.toast(), '탭 권한이 없습니다.');
+
+  env.respond = async () => ({ ok: true });
+  await env.press('1').completion;
+  assert.deepEqual(env.sent.map((message) => message.key), ['3', '1']);
+});
 
 test('4 cancels a pending 3 as soon as its selection token arrives, without opening the selector',
   { timeout: 2000 }, async () => {
@@ -364,12 +686,16 @@ test('CANCEL_VIDEO_SELECTOR acknowledges immediately and dismisses active select
     const start = env.press('3');
     await selectorEntered.promise;
     await env.message({ type: 'CANCEL_VIDEO_SELECTOR' });
-    assert.deepEqual(env.messageReplies, [{ ok: true }]);
+    assert.deepEqual(env.messageReplies, [{ ok: true, cancelled: true }]);
     await start.completion;
     assert.equal(env.selectorCancels, 1);
     assert.equal(env.sent.at(-1).type, 'CANCEL_VIDEO_SELECTION');
     assert.equal(env.sent.at(-1).selectionToken, videoSelection.selectionToken);
     assert.equal(env.sent.some((message) => message.type === 'VIDEO_REGION_SELECTED'), false);
+    await env.message({ type: 'CANCEL_VIDEO_SELECTOR' });
+    assert.deepEqual(env.messageReplies, [
+      { ok: true, cancelled: true }, { ok: true, cancelled: false },
+    ]);
   });
 
 test('resizing while BEGIN is pending cancels the stale screenshot selection',
@@ -435,7 +761,7 @@ test('background cancellation before the scheduled selector launch prevents BEGI
   env.respond = async () => videoSelection;
   await env.message({ type: 'SHOW_VIDEO_SELECTOR' });
   await env.message({ type: 'CANCEL_VIDEO_SELECTOR' });
-  assert.deepEqual(env.messageReplies, [{ ok: true }, { ok: true }]);
+  assert.deepEqual(env.messageReplies, [{ ok: true }, { ok: true, cancelled: true }]);
   await env.runTimers();
   assert.deepEqual(env.sent, []);
   assert.deepEqual(env.selections, []);

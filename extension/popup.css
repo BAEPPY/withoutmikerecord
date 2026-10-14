@@ -117,6 +117,12 @@ h1 { font-size: 19px; font-weight: 750; letter-spacing: -.7px; }
 .shortcut-hint kbd { padding: 1px 5px; border: 1px solid #40556d; border-radius: 4px; color: #edf4f8; font: inherit; }
 .shortcut-status { color: var(--muted); font-size: 10px; line-height: 1.6; text-align: center; }
 .shortcut-status[data-status="connected"] { color: #b3d8ce; }
+.shortcut-bindings { padding: 10px 12px 3px; border: 1px solid #304055; border-radius: 9px; }
+.shortcut-binding-list { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; margin: 0 0 9px; }
+.shortcut-binding-list > div { display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 7px; font-size: 10px; }
+.shortcut-binding-list dt { color: var(--muted); }
+.shortcut-binding-list dd { margin: 0; color: #edf4f8; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.shortcut-binding-list dd[data-assigned="false"] { color: #e6c58b; }
 .message { margin-bottom: 13px; padding: 10px 12px; border-radius: 9px; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
 .error-message { color: #ffd1d6; background: #39232e; border: 1px solid #623846; }
 .notice-message { color: #c3e7df; background: #193331; border: 1px solid #2e514b; }

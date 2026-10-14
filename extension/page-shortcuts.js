@@ -2,7 +2,15 @@
   'use strict';
 
   const installationKey = '__withoutMikePageShortcuts';
-  if (globalThis[installationKey]) return;
+  const installationVersion = 2;
+  const previous = globalThis[installationKey];
+  try {
+    if (previous?.version === installationVersion && previous.isAlive?.()) {
+      previous.refresh?.();
+      return;
+    }
+    previous?.dispose?.();
+  } catch { /* An older extension context may already be invalidated. */ }
 
   let pendingKey = null;
   let stopAfterStart = false;
@@ -13,11 +21,23 @@
   let toastHost = null;
   let toastMessage = null;
   let toastTimer = null;
-  const installation = {};
+  const connectedWindows = new Map();
+  const connectedFrames = new Map();
+  let frameRefreshPending = false;
+  const installation = {
+    version: installationVersion,
+    active: true,
+    isAlive: () => installation.active && runtimeAvailable(),
+    dispose: disconnect,
+    refresh: refreshFrames,
+  };
   globalThis[installationKey] = installation;
 
   function runtimeAvailable() {
     try {
+      // runtime.id alone can outlive an extension reload in an old isolated
+      // world. A callable API checks whether that world's connection survives.
+      globalThis.chrome?.runtime?.getManifest?.();
       return Boolean(globalThis.chrome?.runtime?.id
         && typeof globalThis.chrome.runtime.sendMessage === 'function');
     } catch {
@@ -33,7 +53,8 @@
     toastMessage = null;
   }
 
-  function showToast(message) {
+  function showToast(message, reconnect = false) {
+    if (!installation.active && (!reconnect || globalThis[installationKey])) return;
     if (videoRecording) {
       removeToast();
       return;
@@ -90,22 +111,36 @@
     return path.some((node) => {
       if (!node) return false;
       const tagName = String(node.tagName || '').toLowerCase();
-      if (['input', 'textarea', 'select'].includes(tagName) || node.isContentEditable) return true;
+      if (['textarea', 'select'].includes(tagName) || node.isContentEditable) return true;
+      if (tagName === 'input') {
+        const inputType = String(node.type || node.getAttribute?.('type') || 'text').toLowerCase();
+        if (!['range', 'button', 'submit', 'reset', 'checkbox', 'radio', 'image', 'color', 'file', 'hidden']
+          .includes(inputType)) return true;
+      }
       const roles = (node.getAttribute?.('role') || '').toLowerCase().split(/\s+/);
       return roles.some((role) => ['textbox', 'spinbutton', 'combobox'].includes(role));
     });
   }
 
   function disconnect() {
-    window.removeEventListener('keydown', onKeydown, true);
+    installation.active = false;
+    for (const [target, entry] of connectedWindows) {
+      try { target.removeEventListener('keydown', onKeydown, true); } catch { /* Navigated frame. */ }
+      entry.observer?.disconnect();
+    }
+    connectedWindows.clear();
+    for (const frame of connectedFrames.keys()) frame.removeEventListener('load', scheduleFrameRefresh);
+    connectedFrames.clear();
     try { globalThis.chrome?.runtime?.onMessage?.removeListener?.(onBackgroundMessage); }
     catch { /* An extension update can invalidate this API before cleanup. */ }
     removeVideoViewportWatch();
     cancelVideoSelection();
+    removeToast();
     if (globalThis[installationKey] === installation) delete globalThis[installationKey];
   }
 
   function cancelVideoSelection() {
+    const cancelled = scheduledVideoStart !== null || pendingKey === '3';
     if (scheduledVideoStart !== null) window.clearTimeout(scheduledVideoStart);
     scheduledVideoStart = null;
     if (pendingKey === '3') {
@@ -113,6 +148,74 @@
       if (videoViewportWatch?.starting) removeVideoViewportWatch();
     }
     globalThis.__withoutMikeCancelRegion?.();
+    return cancelled;
+  }
+
+  function scheduleFrameRefresh() {
+    if (!installation.active || frameRefreshPending) return;
+    frameRefreshPending = true;
+    void Promise.resolve().then(() => {
+      frameRefreshPending = false;
+      if (installation.active) refreshFrames();
+    });
+  }
+
+  function onFrameMutation(records) {
+    const containsFrame = (node) => ['iframe', 'frame'].includes(String(node.tagName || '').toLowerCase())
+      || Boolean(node.querySelector?.('iframe, frame'));
+    if (records.some((record) => [...record.addedNodes, ...record.removedNodes].some(containsFrame))) {
+      scheduleFrameRefresh();
+    }
+  }
+
+  function refreshFrames() {
+    if (!installation.active) return;
+    const seenWindows = new Set();
+    const seenFrames = new Set();
+    const visit = (target, targetDocument) => {
+      if (seenWindows.has(target)) return;
+      try {
+        targetDocument ||= target.document;
+        if (!targetDocument) return;
+        seenWindows.add(target);
+        let entry = connectedWindows.get(target);
+        if (entry?.document !== targetDocument) {
+          if (entry) {
+            target.removeEventListener('keydown', onKeydown, true);
+            entry.observer?.disconnect();
+          }
+          target.addEventListener('keydown', onKeydown, true);
+          entry = { document: targetDocument, observer: null };
+          connectedWindows.set(target, entry);
+          if (typeof MutationObserver === 'function' && targetDocument.documentElement) {
+            entry.observer = new MutationObserver(onFrameMutation);
+            entry.observer.observe(targetDocument.documentElement, { childList: true, subtree: true });
+          }
+        }
+        for (const frame of targetDocument.querySelectorAll?.('iframe, frame') || []) {
+          seenFrames.add(frame);
+          if (!connectedFrames.has(frame)) {
+            frame.addEventListener('load', scheduleFrameRefresh);
+            connectedFrames.set(frame, true);
+          }
+          if (frame.contentWindow) visit(frame.contentWindow);
+        }
+      } catch { /* Cross-origin player frames use the browser shortcuts. */ }
+    };
+    // All listeners retain this top-frame closure: messages and region geometry
+    // always belong to the top viewport, including a focused embedded player.
+    visit(window, document);
+    for (const [target, entry] of connectedWindows) {
+      if (seenWindows.has(target)) continue;
+      try { target.removeEventListener('keydown', onKeydown, true); } catch { /* Navigated frame. */ }
+      entry.observer?.disconnect();
+      connectedWindows.delete(target);
+    }
+    for (const frame of connectedFrames.keys()) {
+      if (seenFrames.has(frame)) continue;
+      frame.removeEventListener('load', scheduleFrameRefresh);
+      connectedFrames.delete(frame);
+    }
   }
 
   function removeVideoViewportWatch(expected = videoViewportWatch) {
@@ -159,6 +262,7 @@
   async function send(message) {
     const watchAtRequest = videoViewportWatch;
     const reply = await chrome.runtime.sendMessage(message);
+    if (!installation.active) return reply;
     if (reply?.state) {
       // A delayed resize/stop reply from an earlier recording must not remove
       // the new recording's watcher or make its page notifications visible.
@@ -176,8 +280,8 @@
   function onBackgroundMessage(message, sender, respond) {
     if (sender.id !== chrome.runtime.id || sender.tab) return;
     if (message.type === 'CANCEL_VIDEO_SELECTOR') {
-      cancelVideoSelection();
-      respond({ ok: true });
+      const cancelled = cancelVideoSelection();
+      respond({ ok: true, cancelled });
     } else if (message.type === 'SHOW_VIDEO_SELECTOR') {
       if (pendingKey !== null || scheduledVideoStart !== null) {
         respond({ ok: false, error: '진행 중인 요청이 끝난 뒤 다시 시도해 주세요.' });
@@ -198,6 +302,17 @@
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
     const reply = await send({ target: 'background', type: 'PAGE_SHORTCUT', key: '3' });
+    if (!reply?.ok && cancelVideoRequested && reply?.state?.mode === 'video'
+      && ['starting', 'recording', 'paused'].includes(reply.state.status)) {
+      // A second start can be rejected because a recording already exists.
+      // Its immediately following stop must still reach that recording.
+      const stopped = await send({ target: 'background', type: 'PAGE_SHORTCUT', key: '4' });
+      if (!stopped?.ok) throw new Error(stopped?.error || '녹화를 중지하지 못했어요. 4를 다시 눌러 주세요.');
+      removeVideoViewportWatch();
+      videoRecording = false;
+      showToast('화면 녹화를 마쳤어요. 확장 아이콘을 눌러 파일을 저장해 주세요.');
+      return;
+    }
     if (!reply?.ok) throw new Error(reply?.error || '영역 선택을 시작하지 못했어요. 다시 시도해 주세요.');
     const selectionToken = reply.selectionToken;
     let submitted = false;
@@ -258,14 +373,15 @@
   }
 
   async function onKeydown(event) {
-    if (!event.isTrusted || event.defaultPrevented || event.repeat || event.isComposing
+    const key = shortcutKey(event);
+    if (!installation.active || !event.isTrusted || event.repeat || event.isComposing
       || event.keyCode === 229 || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey
-      || !['1', '2', '3', '4'].includes(event.key) || isEditing(event)) return;
+      || !key || isEditing(event)) return;
 
     const reconnectHint = '확장 프로그램을 다시 연결하려면 페이지를 새로고침한 뒤 확장 아이콘을 눌러 주세요.';
     if (!runtimeAvailable()) {
       disconnect();
-      showToast(reconnectHint);
+      showToast(reconnectHint, true);
       return;
     }
 
@@ -273,7 +389,16 @@
     // numeric seek shortcuts. Native play controls remain usable and focused.
     event.preventDefault();
     event.stopImmediatePropagation();
-    await performShortcut(event.key);
+    await performShortcut(key);
+  }
+
+  function shortcutKey(event) {
+    if (/^[1-4]$/.test(event.key || '')) return event.key;
+    const digit = /^Digit([1-4])$/.exec(event.code || '');
+    if (digit) return digit[1];
+    // With Num Lock off, Numpad1/2/3/4 are navigation keys, not recorder keys.
+    if (!event.key || event.key === 'Unidentified') return /^Numpad([1-4])$/.exec(event.code || '')?.[1];
+    return null;
   }
 
   async function performShortcut(key) {
@@ -300,7 +425,9 @@
       const reply = await send({
         target: 'background', type: 'PAGE_SHORTCUT', key,
       });
-      if (!reply?.ok) throw new Error(reply?.error || reconnectHint);
+      const stopExistingAudio = key === '1' && stopAfterStart && reply?.state?.mode === 'audio'
+        && ['starting', 'recording', 'paused'].includes(reply.state.status);
+      if (!reply?.ok && !stopExistingAudio) throw new Error(reply?.error || reconnectHint);
       if (key === '1' || key === '4') {
         videoRecording = false;
         removeVideoViewportWatch();
@@ -321,7 +448,7 @@
     } catch (error) {
       if (!runtimeAvailable() || /extension context invalidated/i.test(error?.message || '')) {
         disconnect();
-        showToast(reconnectHint);
+        showToast(reconnectHint, true);
       } else {
         showToast(error?.message || reconnectHint);
       }
@@ -332,6 +459,6 @@
     }
   }
 
-  window.addEventListener('keydown', onKeydown, true);
+  refreshFrames();
   chrome.runtime.onMessage?.addListener(onBackgroundMessage);
 })();

@@ -9,6 +9,7 @@ export function createController(api) {
   let creatingDocument;
   let saveInFlight = false;
   let commands = Promise.resolve();
+  let previousControlRequest = null;
   const offscreenUrl = api.runtime.getURL('offscreen.html');
 
   async function hasDocument() {
@@ -94,6 +95,12 @@ export function createController(api) {
     return tab;
   }
 
+  function connectShortcuts(tabId) {
+    return api.scripting.executeScript({
+      target: { tabId }, files: ['region-selector.js', 'page-shortcuts.js'],
+    });
+  }
+
   async function run(message) {
     if (message.type === 'VIDEO_VIEWPORT_CHANGED') {
       if (!Number.isInteger(message.targetTabId) || typeof message.selectionToken !== 'string') {
@@ -112,7 +119,7 @@ export function createController(api) {
       }
       const tab = await activeWebTab(message.targetTabId);
       try {
-        await api.scripting.executeScript({ target: { tabId: tab.id }, files: ['region-selector.js', 'page-shortcuts.js'] });
+        await connectShortcuts(tab.id);
       } catch {
         throw new Error('단축키 연결 권한을 확인하지 못했어요. 이 탭에서 확장 프로그램을 다시 눌러 주세요.');
       }
@@ -120,7 +127,7 @@ export function createController(api) {
         const response = await api.tabs.sendMessage(tab.id, { type: 'SHOW_VIDEO_SELECTOR' }, { frameId: 0 });
         if (!response?.ok) throw new Error('영역 선택 화면을 열지 못했어요. 페이지를 새로고침하고 다시 연결해 주세요.');
       }
-      return { ok: true, state: current };
+      return { ok: true, state: current, shortcutTabId: tab.id };
     }
     if (message.type === 'BEGIN_VIDEO') {
       if (!['idle', 'error'].includes(current.status)) throw new Error('진행 중인 녹음을 마치고 새 녹음을 준비해 주세요.');
@@ -135,6 +142,15 @@ export function createController(api) {
       const reply = await send('SELECT_VIDEO', { tab: { id: tab.id, title: tab.title, url: tab.url }, selectionToken });
       await badge(reply.state);
       return reply.ok ? { ...reply, imageDataUrl, selectionToken } : reply;
+    }
+    if (['CANCEL_VIDEO', 'STOP_VIDEO'].includes(message.type) &&
+        message.selectionToken === undefined && ['idle', 'error'].includes(current.status)) {
+      // Opening the selector is acknowledged before its page task starts.
+      // A quick stop must cancel that task even before SELECT_VIDEO exists.
+      const tabId = message.targetTabId === undefined ? (await activeWebTab()).id : message.targetTabId;
+      if (!Number.isInteger(tabId) || tabId < 0) throw new Error('취소할 탭을 확인하지 못했어요.');
+      const response = await api.tabs.sendMessage(tabId, { type: 'CANCEL_VIDEO_SELECTOR' }, { frameId: 0 }).catch(() => null);
+      if (response?.cancelled) return { ok: true, state: current };
     }
     if (message.type === 'CANCEL_VIDEO' || (message.type === 'STOP_VIDEO' && current.status === 'selecting')) {
       if (current.status !== 'selecting' ||
@@ -194,11 +210,16 @@ export function createController(api) {
         (current.tab?.id !== message.expectedTabId || !['recording', 'paused'].includes(current.status))) {
       return { ok: true, state: current };
     }
-    if (message.type === 'START') {
+    if (message.type === 'START' || message.type === 'BROWSER_START') {
       if (!['idle', 'error'].includes(current.status)) {
         throw new Error('진행 중인 녹음을 마치고 새 녹음을 시작해 주세요.');
       }
       const tab = await activeWebTab(message.targetTabId);
+      if (message.type === 'BROWSER_START') {
+        // Browser commands grant activeTab too; plain 2 should then work.
+        // Keep the browser command usable if a page rejects script injection.
+        await connectShortcuts(tab.id).catch(() => {});
+      }
       await ensureDocument();
       let streamId;
       try { streamId = await api.tabCapture.getMediaStreamId({ targetTabId: tab.id }); }
@@ -260,13 +281,46 @@ export function createController(api) {
     }
   }
 
+  async function stopPending(message, previous) {
+    // The popup sends this immediately, so closing its document cannot erase
+    // an early stop. Bind it to that exact preceding operation, never whatever
+    // capture happens to be active after an unrelated or failed start.
+    if (typeof message.operationId !== 'string' || !message.operationId ||
+        message.operationId !== previous?.operationId ||
+        !['START', 'OPEN_VIDEO_SELECTOR', 'PAUSE', 'RESUME'].includes(previous?.type) ||
+        !['audio', 'video'].includes(message.mode)) {
+      return { ok: false, error: '종료 요청이 만료됐어요. 종료 키를 다시 눌러 주세요.', state: await state() };
+    }
+    const original = await previous.result;
+    if (previous.type === 'OPEN_VIDEO_SELECTOR') {
+      if (message.mode !== 'video') return { ok: false, error: '영상 종료 키는 4예요.', state: await state() };
+      if (!original.ok) return original;
+      return safeRun({ type: 'CANCEL_VIDEO', targetTabId: original.shortcutTabId });
+    }
+    if (previous.type === 'START' && !original.ok) return original;
+    const source = original.state;
+    const current = await state();
+    if (!Number.isInteger(source?.tab?.id) || source.mode !== message.mode ||
+        current.tab?.id !== source.tab.id || current.mode !== message.mode) {
+      return { ok: false, error: '종료할 녹음이 바뀌었어요. 상태를 확인해 주세요.', state: current };
+    }
+    if (!['starting', 'recording', 'paused'].includes(current.status)) return { ok: true, state: current };
+    return safeRun({ type: message.mode === 'video' ? 'STOP_VIDEO' : 'PAGE_STOP', targetTabId: source.tab.id });
+  }
+
   return {
     badge,
     // Reads remain responsive while a native Save As dialog is open.
     handle(message) {
       if (message.type === 'STATUS' || message.type === 'VIDEO_VIEWPORT_CHANGED') return safeRun(message);
-      const result = commands.then(() => safeRun(message));
+      const previous = previousControlRequest;
+      const result = commands.then(() => message.type === 'STOP_PENDING'
+        ? stopPending(message, previous).catch((error) => ({ ok: false, error: error.message }))
+        : safeRun(message));
       commands = result.catch(() => {});
+      if (message.type !== 'ARM_SHORTCUTS') {
+        previousControlRequest = { type: message.type, operationId: message.operationId, result };
+      }
       return result;
     },
     async onDownloadChanged(delta) {
@@ -283,6 +337,13 @@ export function createController(api) {
       }
     },
     async onTabUpdated(tabId, change) {
+      if (change.status === 'complete') {
+        // activeTab survives same-origin reloads but injected listeners do not.
+        // Chrome enforces the temporary grant here; ungranted tabs and a new
+        // origin reject injection without requesting additional permissions.
+        await connectShortcuts(tabId).catch(() => {});
+        return;
+      }
       if (change.status !== 'loading') return;
       const current = await state();
       if (current.tab?.id === tabId && current.status === 'selecting') {

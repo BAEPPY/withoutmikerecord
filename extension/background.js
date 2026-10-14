@@ -31,7 +31,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 
 chrome.commands.onCommand.addListener((command, tab) => {
   if (!Number.isInteger(tab?.id)) return;
-  const type = command === 'start-recording' ? 'START'
+  const type = command === 'start-recording' ? 'BROWSER_START'
     : command === 'stop-recording' ? 'PAGE_STOP'
       : command === 'start-video' ? 'OPEN_VIDEO_SELECTOR'
         : command === 'stop-video' ? 'STOP_VIDEO' : null;

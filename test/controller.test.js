@@ -1209,3 +1209,255 @@ test('delayed source navigation retains its old nonce and cannot end a newer vid
   assert.equal(messages(env, 'STOP').length, 0);
   assert.equal(messages(env, 'CANCEL_VIDEO').length, 0);
 });
+
+test('browser audio start arms page shortcuts before requesting its source stream', async () => {
+  const env = browser();
+  const reply = await env.controller.handle({ type: 'BROWSER_START', targetTabId: 17 });
+  assert.equal(reply.ok, true);
+  assert.equal(reply.state.status, 'recording');
+  assert.deepEqual(events(env, 'executeScript').map(({ data }) => data), [{
+    target: { tabId: 17 }, files: ['region-selector.js', 'page-shortcuts.js'],
+  }]);
+  const injectionIndex = env.calls.findIndex((call) => call.kind === 'executeScript');
+  const captureIndex = env.calls.findIndex((call) => call.kind === 'capture');
+  assert.ok(injectionIndex >= 0 && injectionIndex < captureIndex);
+  assert.deepEqual(events(env, 'capture').map(({ data }) => data), [{ targetTabId: 17 }]);
+  assert.equal(messages(env, 'START').length, 1);
+  assert.equal((await env.controller.handle({ type: 'PAGE_STOP', targetTabId: 17 })).ok, true);
+});
+
+test('browser start still captures when page shortcut injection is unavailable, while ordinary START stays unchanged', async () => {
+  const browserStart = browser();
+  browserStart.executeScript = async () => { throw new Error('Cannot inject into this document'); };
+  const started = await browserStart.controller.handle({ type: 'BROWSER_START', targetTabId: 17 });
+  assert.equal(started.ok, true);
+  assert.equal(started.state.status, 'recording');
+  assert.equal(events(browserStart, 'executeScript').length, 1);
+  assert.equal(events(browserStart, 'capture').length, 1);
+  const popupStart = browser();
+  assert.equal((await popupStart.controller.handle({ type: 'START' })).ok, true);
+  assert.equal(events(popupStart, 'executeScript').length, 0);
+  assert.equal(events(popupStart, 'capture').length, 1);
+});
+
+test('completed page navigation restores shortcuts using the browser permission gate without reading recorder state', async () => {
+  const env = browser();
+  await env.controller.onTabUpdated(88, { status: 'complete' });
+  assert.deepEqual(events(env, 'executeScript').map(({ data }) => data), [{
+    target: { tabId: 88 }, files: ['region-selector.js', 'page-shortcuts.js'],
+  }]);
+  assert.equal(events(env, 'contexts').length, 0);
+  assert.equal(events(env, 'message').length, 0);
+  assert.equal(events(env, 'queryTabs').length, 0);
+  assert.equal(events(env, 'capture').length, 0);
+  env.executeScript = async () => { throw new Error('This origin has no activeTab grant'); };
+  await assert.doesNotReject(env.controller.onTabUpdated(99, { status: 'complete' }));
+  assert.equal(events(env, 'executeScript').at(-1).data.target.tabId, 99);
+  assert.equal(events(env, 'capture').length, 0);
+  assert.equal(events(env, 'createDocument').length, 0);
+});
+
+test('stop or popup cancel can dismiss an acknowledged video selector before BEGIN_VIDEO runs', async () => {
+  for (const type of ['STOP_VIDEO', 'CANCEL_VIDEO']) {
+    const env = browser();
+    let scheduled = false;
+    env.sendTabMessage = async (_tabId, message) => {
+      if (message.type === 'SHOW_VIDEO_SELECTOR') {
+        scheduled = true;
+        return { ok: true };
+      }
+      if (message.type === 'CANCEL_VIDEO_SELECTOR') {
+        const cancelled = scheduled;
+        scheduled = false;
+        return { ok: true, cancelled };
+      }
+      throw new Error(`Unexpected page message ${message.type}`);
+    };
+    const opened = await env.controller.handle({ type: 'OPEN_VIDEO_SELECTOR', targetTabId: 17 });
+    assert.equal(opened.ok, true);
+    assert.equal(opened.state.status, 'idle');
+    assert.equal(scheduled, true);
+    const cancelled = await env.controller.handle(type === 'STOP_VIDEO' ? { type, targetTabId: 17 } : { type });
+    assert.equal(cancelled.ok, true);
+    assert.equal(cancelled.state.status, 'idle');
+    assert.equal(scheduled, false);
+    assert.deepEqual(events(env, 'sendTabMessage').at(-1).data, {
+      tabId: 17, message: { type: 'CANCEL_VIDEO_SELECTOR' }, options: { frameId: 0 },
+    });
+    assert.equal(events(env, 'captureVisibleTab').length, 0);
+    assert.equal(events(env, 'capture').length, 0);
+    assert.equal(messages(env, 'SELECT_VIDEO').length, 0);
+    assert.equal(messages(env, 'STOP').length, 0);
+  }
+});
+
+test('idle video cancellation requires a positive page acknowledgement instead of claiming a recording stopped', async () => {
+  for (const status of ['idle', 'error']) {
+    for (const acknowledgement of [undefined, { ok: true }, { ok: true, cancelled: false }]) {
+      const env = browser({ status });
+      env.sendTabMessage = async () => acknowledgement;
+      const reply = await env.controller.handle({ type: 'STOP_VIDEO', targetTabId: 17 });
+      assert.equal(reply.ok, false);
+      assert.equal(reply.state.status, status);
+      assert.equal(messages(env, 'STOP').length, 0);
+    }
+  }
+});
+
+test('stale token cancellation cannot dismiss a pending or newer page selector', async () => {
+  for (const status of ['idle', 'error', 'selecting', 'recording']) {
+    const env = browser({ status, mode: 'video' });
+    env.state.selectionToken = 'new-selection-token';
+    env.state.videoSessionToken = 'new-video-session';
+    const reply = await env.controller.handle({ type: 'CANCEL_VIDEO', targetTabId: 17, selectionToken: 'stale-token' });
+    assert.equal(reply.ok, false);
+    assert.equal(reply.state.status, status);
+    assert.equal(events(env, 'sendTabMessage').length, 0);
+    assert.equal(messages(env, 'CANCEL_VIDEO').length, 0);
+    assert.equal(messages(env, 'STOP').length, 0);
+  }
+});
+
+test('STOP_PENDING persists in the worker before START replies even when its popup caller disappears', async () => {
+  const env = browser();
+  const entered = deferred();
+  const release = deferred();
+  env.startRecording = async () => { entered.resolve(); await release.promise; };
+  // Intentionally abandon the START response: the popup must not be needed to
+  // forward the stop after media setup eventually finishes.
+  void env.controller.handle({ type: 'START', operationId: 'popup-start-a' });
+  await entered.promise;
+  assert.equal((await env.controller.handle({ type: 'STATUS' })).state.status, 'starting');
+  void env.controller.handle({ type: 'ARM_SHORTCUTS' });
+  const stopping = env.controller.handle({ type: 'STOP_PENDING', operationId: 'popup-start-a', mode: 'audio' });
+  assert.equal(messages(env, 'STOP').length, 0);
+  release.resolve();
+  const stopped = await stopping;
+  assert.equal(stopped.ok, true);
+  assert.equal(stopped.state.status, 'ready');
+  assert.equal(stopped.state.mode, 'audio');
+  assert.equal(messages(env, 'START').length, 1);
+  assert.equal(messages(env, 'STOP').length, 1);
+});
+
+test('STOP_PENDING after a rejected START never stops the recording that already existed', async () => {
+  const env = browser({ status: 'recording' });
+  const start = env.controller.handle({ type: 'START', operationId: 'rejected-start' });
+  const stopped = await env.controller.handle({ type: 'STOP_PENDING', operationId: 'rejected-start', mode: 'audio' });
+  assert.equal((await start).ok, false);
+  assert.equal(stopped.ok, false);
+  assert.equal(stopped.state.status, 'recording');
+  assert.equal(stopped.state.tab.id, 17);
+  assert.equal(messages(env, 'STOP').length, 0);
+  assert.equal(events(env, 'capture').length, 0);
+});
+
+test('STOP_PENDING rejects unknown operations and mode mismatches without stopping the current source', async () => {
+  const unknown = browser({ status: 'recording' });
+  assert.equal((await unknown.controller.handle({ type: 'STOP_PENDING', operationId: 'missing', mode: 'audio' })).ok, false);
+  assert.equal(messages(unknown, 'STOP').length, 0);
+  for (const request of [
+    { operationId: 'wrong-operation', mode: 'audio' },
+    { operationId: 'valid-operation', mode: 'video' },
+    { operationId: 'valid-operation', mode: 'invalid' },
+    { mode: 'audio' },
+  ]) {
+    const env = browser();
+    void env.controller.handle({ type: 'START', operationId: 'valid-operation' });
+    const stopped = await env.controller.handle({ type: 'STOP_PENDING', ...request });
+    assert.equal(stopped.ok, false);
+    assert.equal(stopped.state.status, 'recording');
+    assert.equal(messages(env, 'STOP').length, 0);
+  }
+});
+
+test('duplicate STOP_PENDING messages stop once and cannot be replayed for a newer operation', async () => {
+  const env = browser();
+  void env.controller.handle({ type: 'START', operationId: 'first-start' });
+  const first = env.controller.handle({ type: 'STOP_PENDING', operationId: 'first-start', mode: 'audio' });
+  const duplicate = env.controller.handle({ type: 'STOP_PENDING', operationId: 'first-start', mode: 'audio' });
+  assert.equal((await first).ok, true);
+  assert.equal((await duplicate).ok, false);
+  assert.equal(messages(env, 'STOP').length, 1);
+  await env.controller.handle({ type: 'DISCARD' });
+  await env.controller.handle({ type: 'START', operationId: 'second-start' });
+  const replay = await env.controller.handle({ type: 'STOP_PENDING', operationId: 'first-start', mode: 'audio' });
+  assert.equal(replay.ok, false);
+  assert.equal(replay.state.status, 'recording');
+  assert.equal(messages(env, 'STOP').length, 1);
+});
+
+test('an intervening mutation invalidates a STOP_PENDING binding to an earlier start', async () => {
+  const env = browser();
+  void env.controller.handle({ type: 'START', operationId: 'start-before-pause' });
+  const pausing = env.controller.handle({ type: 'PAUSE', operationId: 'separate-pause' });
+  const stopped = await env.controller.handle({ type: 'STOP_PENDING', operationId: 'start-before-pause', mode: 'audio' });
+  assert.equal((await pausing).ok, true);
+  assert.equal(stopped.ok, false);
+  assert.equal(stopped.state.status, 'paused');
+  assert.equal(messages(env, 'STOP').length, 0);
+});
+
+test('STOP_PENDING cancels the selector on its original tab after the user switches tabs', async () => {
+  const env = browser();
+  const entered = deferred();
+  const acknowledge = deferred();
+  let scheduledTab = null;
+  env.sendTabMessage = async (tabId, message) => {
+    if (message.type === 'SHOW_VIDEO_SELECTOR') {
+      scheduledTab = tabId;
+      entered.resolve();
+      await acknowledge.promise;
+      return { ok: true };
+    }
+    if (message.type === 'CANCEL_VIDEO_SELECTOR') {
+      const cancelled = scheduledTab === tabId;
+      if (cancelled) scheduledTab = null;
+      return { ok: true, cancelled };
+    }
+    throw new Error(`Unexpected page message ${message.type}`);
+  };
+  const opening = env.controller.handle({ type: 'OPEN_VIDEO_SELECTOR', operationId: 'open-original-tab' });
+  await entered.promise;
+  const stopping = env.controller.handle({ type: 'STOP_PENDING', operationId: 'open-original-tab', mode: 'video' });
+  env.tabsById.set(17, { ...env.activeTab, active: false });
+  env.activeTab = { id: 88, title: 'Another tab', url: 'https://other.test/', active: true, windowId: 5 };
+  acknowledge.resolve();
+  const opened = await opening;
+  assert.equal(opened.ok, true);
+  assert.equal(opened.shortcutTabId, 17);
+  const cancelled = await stopping;
+  assert.equal(cancelled.ok, true);
+  assert.equal(cancelled.state.status, 'idle');
+  assert.equal(scheduledTab, null);
+  assert.deepEqual(events(env, 'sendTabMessage').at(-1).data, {
+    tabId: 17, message: { type: 'CANCEL_VIDEO_SELECTOR' }, options: { frameId: 0 },
+  });
+  assert.equal(events(env, 'capture').length, 0);
+  assert.equal(messages(env, 'SELECT_VIDEO').length, 0);
+});
+
+test('STOP_PENDING also preserves a stop requested while pause or resume is awaiting its reply', async () => {
+  for (const [type, status, mode] of [['PAUSE', 'recording', 'audio'], ['RESUME', 'paused', 'video']]) {
+    const env = browser({ status, mode });
+    const entered = deferred();
+    const release = deferred();
+    const send = env.api.runtime.sendMessage;
+    env.api.runtime.sendMessage = async (message) => {
+      if (message.type === type) {
+        entered.resolve();
+        await release.promise;
+      }
+      return send(message);
+    };
+    void env.controller.handle({ type, operationId: `pending-${type}` });
+    await entered.promise;
+    const stopping = env.controller.handle({ type: 'STOP_PENDING', operationId: `pending-${type}`, mode });
+    release.resolve();
+    const stopped = await stopping;
+    assert.equal(stopped.ok, true);
+    assert.equal(stopped.state.status, 'ready');
+    assert.equal(stopped.state.mode, mode);
+    assert.equal(messages(env, 'STOP').length, 1);
+  }
+});

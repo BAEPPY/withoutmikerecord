@@ -42,16 +42,23 @@ async def main():
           const output = sourceContext.createMediaStreamDestination();
           oscillator.connect(gain).connect(output); oscillator.start();
           await sourceContext.resume();
+          window.captureGate = null;
+          window.captureGateEntered = false;
+          window.lastCapturedTracks = [];
           window.recorder = new TabAudioRecorder({mediaDevices:{getUserMedia:async (constraints)=>{
             if (constraints.video !== false || constraints.audio.mandatory.chromeMediaSource !== 'tab')
               throw Error('Unexpected capture source');
-            return output.stream;
+            if(captureGate) { captureGateEntered=true;await captureGate; }
+            const stream = new MediaStream(output.stream.getTracks().map(track=>track.clone()));
+            lastCapturedTracks = stream.getTracks();
+            return stream;
           }}});
           window.downloaded = [];
           window.pageCommands = [];
+          window.popupCommands = [];
           const sourceTab = {id:1,active:true,url:'https://example.test',title:'테스트 음원 · 440/880 Hz'};
           window.chrome = {
-            runtime: {id:'test-extension',getURL: (path)=>location.origin+'/'+path, getContexts:async()=>[{}],
+            runtime: {id:'test-extension',getManifest:()=>({version:'1.3.2'}),getURL: (path)=>location.origin+'/'+path, getContexts:async()=>[{}],
               sendMessage:(message)=>{
                 if (message.target === 'offscreen') return recorder.handle(message);
                 if (message.type !== 'PAGE_SHORTCUT') throw Error('Unexpected page request');
@@ -72,15 +79,34 @@ async def main():
               search:async()=>[{state:'complete'}]},
           };
           window.controller = createController(chrome);
-          document.body.innerHTML = '<input id="page-input"><button id="page-play">재생</button><video id="page-video" tabindex="0"></video><div id="shadow-editor"></div>';
+          document.body.innerHTML = '<input id="page-input"><input id="page-volume" type="range"><input id="page-player-input" type="button" value="재생"><button id="page-play">재생</button><video id="page-video" tabindex="0"></video><div id="shadow-editor"></div><iframe id="existing-player" style="height:100px;width:100%"></iframe>';
           const shadow = document.querySelector('#shadow-editor').attachShadow({mode:'open'});
           shadow.innerHTML = '<input id="shadow-input">';
+          // Install a realistic site's key handler BEFORE the extension. Its
+          // preventDefault must not suppress the recorder's trusted digits.
+          window.sitePrevented = 0;
+          window.addEventListener('keydown',event=>{
+            if(!['1','2'].includes(event.key)) return;
+            const editing=event.composedPath().some(node=>node.isContentEditable ||
+              node.tagName==='INPUT' && node.type==='text');
+            if(!editing) { event.preventDefault(); sitePrevented++; }
+          },true);
+          window.playerFrameMarkup = `<input id="frame-volume" type="range"><input id="frame-input-button" type="button" value="재생"><button id="frame-play">재생</button><input id="frame-text"><script>
+            window.sitePrevented=0;
+            window.addEventListener('keydown',event=>{
+              if(['1','2'].includes(event.key) && event.target.type!=='text') {
+                event.preventDefault(); sitePrevented++;
+              }
+            },true);
+          </script>`;
+          const existing = document.querySelector('#existing-player');
+          await new Promise(resolve=>{existing.onload=resolve;existing.srcdoc=playerFrameMarkup;});
         }''')
 
         async def bridge(message):
             if message['type'] == 'START':
                 await owner.evaluate('syntheticTone.frequency.setValueAtTime(880, sourceContext.currentTime + 0.6)')
-            reply = await owner.evaluate('(message)=>controller.handle(message)', message)
+            reply = await owner.evaluate('(message)=>{popupCommands.push(message);return controller.handle(message);}', message)
             if message['type'] != 'STATUS':
                 print(message['type'], json.dumps(reply, ensure_ascii=False), flush=True)
             return reply
@@ -88,13 +114,25 @@ async def main():
         async def popup_page():
             popup = await context.new_page()
             await popup.expose_function('testBridge', bridge)
-            await popup.add_init_script('window.chrome={runtime:{sendMessage:(message)=>window.testBridge(message)}}')
+            await popup.add_init_script('''window.openedSettings=[];
+              window.chrome={runtime:{sendMessage:(message)=>window.testBridge(message)},
+                commands:{getAll:async()=>[
+                  {name:'start-recording',shortcut:'Ctrl+Shift+8'},
+                  {name:'stop-recording',shortcut:'Alt+Shift+2'},
+                  {name:'start-video',shortcut:''},
+                  {name:'stop-video',shortcut:'Alt+Shift+4'}]},
+                tabs:{create:async(options)=>{openedSettings.push(options);return {id:99};}}};''')
             await popup.goto(f'http://127.0.0.1:{server.server_port}/popup.html')
             return popup
 
         popup = await popup_page()
         await popup.wait_for_selector('#start-button:enabled')
         await popup.wait_for_selector('#shortcut-status[data-status="connected"]')
+        await popup.wait_for_function("document.querySelector('#shortcut-audio-start').textContent === 'Ctrl+Shift+8'")
+        assert await popup.locator('#shortcut-video-start').inner_text() == '미지정'
+        assert await popup.locator('#shortcut-video-start').get_attribute('data-assigned') == 'false'
+        await popup.click('#shortcut-settings')
+        assert await popup.evaluate('openedSettings.at(-1).url') == 'chrome://extensions/shortcuts'
         await popup.locator('body').screenshot(path=str(OUTPUT / 'popup-idle.png'))
         await popup.close()
         # A real trusted key event reaches the injected page listener after the
@@ -111,11 +149,13 @@ async def main():
         await owner.keyboard.press('Alt+1')
         await owner.evaluate("window.dispatchEvent(new KeyboardEvent('keydown', {key:'1',bubbles:true,cancelable:true}))")
         assert await owner.evaluate('pageCommands.length') == 0
+        await owner.locator('#page-volume').focus()
         await owner.keyboard.down('1')
         await owner.wait_for_function("recorder.getState().status === 'recording'")
         await owner.keyboard.down('1')  # auto-repeat must not issue another START
         await owner.keyboard.up('1')
         assert await owner.evaluate('pageCommands.length') == 1
+        assert await owner.evaluate('sitePrevented') > 0
         popup = await popup_page()
         await popup.wait_for_function("document.querySelector('#status-label').textContent === '녹음 중'")
         assert re.fullmatch(r'\d{2}:\d{2}\.\d{2}', await popup.locator('#timer').inner_text())
@@ -196,11 +236,102 @@ async def main():
         await popup.wait_for_function("document.querySelector('#save-button').disabled === false")
         assert await owner.evaluate('downloaded.at(-1).url === recorder.getState().result.url')
         await popup.locator('body').screenshot(path=str(OUTPUT / 'popup-trimmed.png'))
+        await popup.close()
+        await owner.bring_to_front()
+
+        async def player_pair(player, start='#frame-volume', stop='#frame-input-button'):
+            """Real trusted keys in a player must route once to its top tab."""
+            await owner.evaluate("controller.handle({type:'DISCARD'})")
+            before = await owner.evaluate('pageCommands.length')
+            text = player.locator('#frame-text')
+            await text.fill('')
+            await owner.keyboard.type('12')
+            assert await text.input_value() == '12'
+            assert await owner.evaluate('pageCommands.length') == before
+            await player.locator(start).focus()
+            await owner.keyboard.press('1')
+            await owner.wait_for_function("recorder.getState().status === 'recording'")
+            await text.fill('')
+            await owner.keyboard.type('2')
+            assert await text.input_value() == '2'
+            assert await owner.evaluate('recorder.getState().status') == 'recording'
+            await asyncio.sleep(0.15)
+            await player.locator(stop).focus()
+            await owner.keyboard.press('2')
+            await owner.wait_for_function("recorder.getState().status === 'ready'")
+            assert await owner.evaluate('(before)=>pageCommands.slice(before).map(command=>command.key)',before) == ['1','2']
+            assert await player.locator('body').evaluate('()=>window.sitePrevented') >= 2
+
+        # The first iframe existed before injection. Dynamic and reloaded
+        # same-origin documents must receive listeners without opening a popup.
+        await player_pair(owner.frame_locator('#existing-player'))
+        await owner.evaluate('''async()=>{
+          const iframe=document.createElement('iframe');iframe.id='dynamic-player';
+          iframe.style.cssText='height:100px;width:100%';
+          const loaded=new Promise(resolve=>iframe.onload=resolve);
+          iframe.srcdoc=playerFrameMarkup;document.body.append(iframe);await loaded;
+        }''')
+        await player_pair(owner.frame_locator('#dynamic-player'),start='#frame-input-button',stop='#frame-volume')
+        await owner.evaluate('''async()=>{
+          const iframe=document.querySelector('#dynamic-player');
+          await new Promise(resolve=>{iframe.onload=resolve;iframe.srcdoc=playerFrameMarkup+'<p>reloaded</p>';});
+        }''')
+        await player_pair(owner.frame_locator('#dynamic-player'),start='#frame-play',stop='#frame-volume')
+
+        # A stale installation object must be disposed and replaced, rather
+        # than causing the reinjection guard to silently leave dead listeners.
+        await owner.evaluate('''async()=>{
+          const old=window.__withoutMikePageShortcuts;
+          const dispose=old.dispose.bind(old);
+          window.staleDisposals=0;
+          old.isAlive=()=>false;
+          old.dispose=()=>{staleDisposals++;dispose();};
+          const reply=await controller.handle({type:'ARM_SHORTCUTS'});
+          if(!reply.ok)throw Error(reply.error);
+        }''')
+        assert await owner.evaluate('staleDisposals') == 1
+        await player_pair(owner.frame_locator('#existing-player'))
+        await owner.evaluate('''async()=>{
+          window.__withoutMikePageShortcuts.dispose();
+          window.__withoutMikePageShortcuts=true;
+          const reply=await controller.handle({type:'ARM_SHORTCUTS'});
+          if(!reply.ok)throw Error(reply.error);
+        }''')
+        await player_pair(owner.frame_locator('#existing-player'),start='#frame-input-button',stop='#frame-play')
+
+        # A quick stop must reach the background while native capture is still
+        # pending. Destroying the popup must not discard its stop intention.
+        await owner.evaluate('''async()=>{
+          await controller.handle({type:'DISCARD'});
+          popupCommands.length=0;captureGateEntered=false;
+          captureGate=new Promise(resolve=>window.releaseCaptureGate=resolve);
+        }''')
+        timing_popup = await popup_page()
+        await timing_popup.wait_for_selector('#start-button:enabled')
+        await timing_popup.keyboard.press('1')
+        await owner.wait_for_function('captureGateEntered')
+        await timing_popup.keyboard.press('2')
+        await timing_popup.keyboard.press('2')
+        await owner.wait_for_function("popupCommands.some(message=>message.type === 'STOP_PENDING')")
+        pending = await owner.evaluate("popupCommands.filter(message=>['START','STOP_PENDING'].includes(message.type))")
+        assert [message['type'] for message in pending] == ['START','STOP_PENDING'], pending
+        assert pending[0]['operationId'] and pending[0]['operationId'] == pending[1]['operationId'], pending
+        assert pending[1]['mode'] == 'audio', pending
+        assert await owner.evaluate('recorder.getState().status') == 'starting'
+        await timing_popup.close()
+        # The START promise still has not completed, and no live popup remains
+        # to send any later STOP. Only the already-bound request can end it.
+        assert await owner.evaluate('recorder.getState().status') == 'starting'
+        await owner.evaluate('releaseCaptureGate();captureGate=null')
+        await owner.wait_for_function("['ready','error'].includes(recorder.getState().status)")
+        assert await owner.evaluate('recorder.stream === null && recorder.mediaRecorder === null')
+        assert await owner.evaluate("lastCapturedTracks.length > 0 && lastCapturedTracks.every(track=>track.readyState === 'ended')")
+        assert await owner.evaluate("popupCommands.filter(message=>message.type === 'STOP_PENDING').length") == 1
         print(json.dumps({'container': probe['format']['format_name'],
                           'codec': probe['streams'][0]['codec_name'],
                           'duration': probe['format']['duration'], 'bytes': sample.stat().st_size,
                           'trimDuration': clip_probe['format']['duration'], 'trimFrequency': frequency,
-                          'ui': 'popup closed: page1 record, pause, resume, page2 stop with player focus; input guards, idempotent injection, hundredths, preview, trim, persist range, full save passed',
+                          'ui': 'popup closed: range1 record despite prior preventDefault, pause, resume, player2 stop; input guards, existing/dynamic/reloaded iframe keys, stale/legacy reinjection, actual command assignment/settings, hundredths, preview, trim, persist range, full save; quick popup1→2 sends durable STOP_PENDING before delayed capture and survives popup close',
                           'scope': 'synthetic input and Chrome API bridge; real page keys, MP4 encoder and popup UI'}, ensure_ascii=False))
         await browser.close()
 
