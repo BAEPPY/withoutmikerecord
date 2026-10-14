@@ -104,6 +104,8 @@ h1 { font-size: 19px; font-weight: 750; letter-spacing: -.7px; }
 .record-icon { width: 9px; height: 9px; border-radius: 50%; background: currentColor; }
 .stop-icon { width: 8px; height: 8px; border-radius: 2px; background: currentColor; }
 .control-hint { min-height: 17px; text-align: center; font-size: 10px; line-height: 1.6; color: var(--muted); }
+.shortcut-hint { text-align: center; font-size: 10px; line-height: 1.8; color: var(--muted); }
+.shortcut-hint kbd { padding: 1px 5px; border: 1px solid #40556d; border-radius: 4px; color: #edf4f8; font: inherit; }
 .message { margin-bottom: 13px; padding: 10px 12px; border-radius: 9px; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
 .error-message { color: #ffd1d6; background: #39232e; border: 1px solid #623846; }
 .notice-message { color: #c3e7df; background: #193331; border: 1px solid #2e514b; }

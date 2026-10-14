@@ -280,6 +280,19 @@ ui.pause.addEventListener("click", () => {
 ui.stop.addEventListener("click", () => {
   if (state.status === "recording" || state.status === "paused") void command("STOP");
 });
+document.addEventListener("keydown", (event) => {
+  // Shortcuts belong to this popup; preserve typing and native media controls.
+  if (busy || event.defaultPrevented || event.repeat || event.isComposing || event.keyCode === 229
+    || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+  const target = event.target;
+  if (target instanceof Element && (target.isContentEditable
+    || target.closest('input, textarea, select, audio, video, [role="textbox"], [role="spinbutton"]'))) return;
+  const button = event.key === "1" && ["idle", "error"].includes(state.status) ? ui.start
+    : event.key === "2" && ["recording", "paused"].includes(state.status) ? ui.stop : null;
+  if (!button || button.disabled || button.closest("[hidden]")) return;
+  event.preventDefault();
+  button.click();
+});
 ui.save.addEventListener("click", () => {
   if (state.status === "ready" && state.result && state.download?.status !== "pending") {
     stopRangePreview();

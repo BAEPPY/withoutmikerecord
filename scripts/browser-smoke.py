@@ -76,7 +76,7 @@ async def main():
         popup = await popup_page()
         await popup.wait_for_selector('#start-button:enabled')
         await popup.locator('body').screenshot(path=str(OUTPUT / 'popup-idle.png'))
-        await popup.click('#start-button')
+        await popup.keyboard.press('1')
         await popup.wait_for_function("document.querySelector('#status-label').textContent === '녹음 중'")
         await asyncio.sleep(1.2)
         recording = await bridge({'type': 'STATUS'})
@@ -94,7 +94,7 @@ async def main():
         assert (await bridge({'type': 'STATUS'}))['state']['status'] == 'recording'
         popup = await popup_page()
         await popup.wait_for_selector('#stop-button:visible')
-        await popup.click('#stop-button')
+        await popup.keyboard.press('2')
         await popup.wait_for_function("document.querySelector('#status-label').textContent === '녹음 완료'")
         state = (await bridge({'type': 'STATUS'}))['state']
         assert state['result']['mimeType'].startswith('audio/mp4'), state
@@ -150,7 +150,7 @@ async def main():
                           'codec': probe['streams'][0]['codec_name'],
                           'duration': probe['format']['duration'], 'bytes': sample.stat().st_size,
                           'trimDuration': clip_probe['format']['duration'], 'trimFrequency': frequency,
-                          'ui': 'record, pause, resume, close/reopen, stop, preview, trim, persist range, full save passed',
+                          'ui': 'key1 record, pause, resume, close/reopen, key2 stop, preview, trim, persist range, full save passed',
                           'scope': 'synthetic input; native MP4 encoder and popup UI'}, ensure_ascii=False))
         await browser.close()
 

@@ -58,13 +58,13 @@
       <p class="message notice-message" id="notice-message" role="status" aria-live="polite" hidden></p>
 
       <div class="controls" aria-label="녹음 제어">
-        <button class="button primary" id="start-button" type="button" disabled>
+        <button class="button primary" id="start-button" type="button" aria-keyshortcuts="1" title="녹음 시작 (키보드 1)" disabled>
           <span class="record-icon" aria-hidden="true"></span>
           <span id="start-label">녹음 시작</span>
         </button>
         <div class="button-row" id="recording-controls" hidden>
           <button class="button secondary" id="pause-button" type="button">일시 정지</button>
-          <button class="button stop" id="stop-button" type="button">
+          <button class="button stop" id="stop-button" type="button" aria-keyshortcuts="2" title="녹음 끝내기 (키보드 2)">
             <span class="stop-icon" aria-hidden="true"></span>녹음 끝내기
           </button>
         </div>
@@ -99,6 +99,7 @@
           </div>
         </div>
         <p class="control-hint" id="control-hint">먼저 페이지에서 소리를 재생해 주세요.</p>
+        <p class="shortcut-hint">이 창에서 <kbd>1</kbd> 녹음 시작 · <kbd>2</kbd> 녹음 끝내기</p>
       </div>
 
       <footer class="footer">
