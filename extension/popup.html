@@ -32,7 +32,7 @@
           </p>
           <span class="format-tag">MP4 / AUDIO</span>
         </div>
-        <p class="timer" id="timer" aria-label="녹음 시간 0분 0초">00:00</p>
+        <p class="timer" id="timer" aria-label="녹음 시간 0분 0.00초">00:00.00</p>
         <p class="timer-caption" id="timer-caption">녹음할 탭에서 시작해 주세요</p>
         <div class="level" aria-hidden="true">
           <div class="level-fill" id="level-fill"></div>
@@ -72,6 +72,7 @@
           <section class="trim-editor" aria-labelledby="trim-title">
             <h2 id="trim-title">듣고, 원하는 구간만 저장하기</h2>
             <audio id="audio-preview" controls preload="metadata" aria-label="녹음 미리 듣기"></audio>
+            <p class="preview-position" id="preview-position" aria-label="미리 듣기 현재 위치와 전체 길이">00:00.00 / 00:00.00</p>
             <p class="trim-note" id="trim-unavailable" hidden>이 녹음의 길이를 확인할 수 없어 구간을 자를 수 없어요. 전체 파일은 저장할 수 있어요.</p>
             <div class="trim-fields">
               <div>
@@ -90,7 +91,7 @@
               <button class="button secondary preview-button" id="preview-range" type="button">선택 구간 듣기</button>
             </div>
             <p id="trim-error" class="trim-error" role="alert" hidden></p>
-            <p class="trim-note trim-precision">저장 구간의 시작·끝은 약 0.1초 차이가 날 수 있어요.</p>
+            <p class="trim-note trim-precision">시간은 0.01초 단위로 표시해요. 저장 구간의 시작·끝은 약 0.1초 차이가 날 수 있어요.</p>
           </section>
           <button class="button primary" id="save-range-button" type="button">선택 구간 저장 · .mp4</button>
           <div class="save-row">
@@ -100,6 +101,8 @@
         </div>
         <p class="control-hint" id="control-hint">먼저 페이지에서 소리를 재생해 주세요.</p>
         <p class="shortcut-hint">이 창에서 <kbd>1</kbd> 녹음 시작 · <kbd>2</kbd> 녹음 끝내기</p>
+        <p class="shortcut-status" id="shortcut-status" role="status" aria-live="polite" data-status="pending">페이지 단축키 연결 중…</p>
+        <p class="shortcut-hint" id="shortcut-fallback"><kbd>Alt+Shift+1</kbd> 시작 · <kbd>Alt+Shift+2</kbd> 종료<br />아이콘을 열지 않고 사용할 수 있어요.</p>
       </div>
 
       <footer class="footer">

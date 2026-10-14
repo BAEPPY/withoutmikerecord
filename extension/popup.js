@@ -22,6 +22,7 @@ const ui = {
   save: byId("save-button"),
   saveRange: byId("save-range-button"),
   audio: byId("audio-preview"),
+  previewPosition: byId("preview-position"),
   trimStart: byId("trim-start"),
   trimEnd: byId("trim-end"),
   setTrimStart: byId("set-trim-start"),
@@ -32,6 +33,7 @@ const ui = {
   trimUnavailable: byId("trim-unavailable"),
   discard: byId("discard-button"),
   hint: byId("control-hint"),
+  shortcutStatus: byId("shortcut-status"),
 };
 
 const statusLabels = {
@@ -55,6 +57,8 @@ let previewUrl = "";
 let previewEnd = null;
 let previewFrame = null;
 let selectionVersion = 0;
+let shortcutConnection = "pending";
+let shortcutDetail = "";
 
 function setText(element, value) {
   // Avoid repeatedly announcing unchanged live-region content on each poll.
@@ -68,21 +72,44 @@ function formatBytes(value) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function floorHundredths(value) {
+  let units = Math.floor(value * 100);
+  // Recover exact decimal hundredths such as 1.15 without rounding past value.
+  if ((units + 1) / 100 <= value) units += 1;
+  return units / 100;
+}
+
+function formatTime(value) {
+  const seconds = Number.isFinite(value) ? Math.max(0, value) : 0;
+  const totalHundredths = Math.round(floorHundredths(seconds) * 100);
+  const hours = Math.floor(totalHundredths / 360000);
+  const minutes = Math.floor(totalHundredths / 6000) % 60;
+  const remainder = Math.floor(totalHundredths / 100) % 60;
+  const hundredths = totalHundredths % 100;
+  const mmss = `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}.${String(hundredths).padStart(2, "0")}`;
+  return hours ? `${hours}:${mmss}` : mmss;
+}
+
 function durationSeconds() {
   const duration = state.result?.durationSeconds;
   return typeof duration === "number" && Number.isFinite(duration) && duration > 0 ? duration : null;
 }
 
+function trimAvailable() {
+  const duration = durationSeconds();
+  return duration !== null && duration >= 0.01;
+}
+
 function readSelection() {
   const duration = durationSeconds();
-  if (duration === null) return { error: "" };
+  if (!trimAvailable()) return { error: "" };
   const startSeconds = ui.trimStart.valueAsNumber;
   const endSeconds = ui.trimEnd.valueAsNumber;
   if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds)) {
     return { error: "시작과 끝 시간을 숫자로 입력해 주세요." };
   }
   if (startSeconds < 0 || endSeconds < 0) return { error: "시간은 0초 이상이어야 해요." };
-  if (endSeconds > duration) return { error: `끝 시간은 전체 길이 ${duration.toFixed(3)}초 이하여야 해요.` };
+  if (endSeconds > duration) return { error: `끝 시간은 전체 길이 ${floorHundredths(duration).toFixed(2)}초 이하여야 해요.` };
   if (startSeconds >= endSeconds) return { error: "끝 시간을 시작 시간보다 크게 입력해 주세요." };
   return { startSeconds, endSeconds, error: "" };
 }
@@ -93,6 +120,7 @@ function stopRangePreview(pauseAudio = true) {
   previewFrame = null;
   if (pauseAudio) ui.audio.pause();
   setText(ui.previewRange, "선택 구간 듣기");
+  renderPreviewPosition();
 }
 
 function checkRangePreview() {
@@ -107,7 +135,18 @@ function checkRangePreview() {
 function trackRangePreview() {
   previewFrame = null;
   checkRangePreview();
-  if (previewEnd !== null && !ui.audio.paused) previewFrame = window.requestAnimationFrame(trackRangePreview);
+  renderPreviewPosition();
+  if (!ui.audio.paused && !document.hidden) previewFrame = window.requestAnimationFrame(trackRangePreview);
+}
+
+function startPreviewClock() {
+  if (previewFrame === null && !ui.audio.paused && !document.hidden) previewFrame = window.requestAnimationFrame(trackRangePreview);
+}
+
+function renderPreviewPosition() {
+  const duration = durationSeconds() ?? (Number.isFinite(ui.audio.duration) ? ui.audio.duration : null);
+  const position = duration === null ? ui.audio.currentTime : Math.min(ui.audio.currentTime, duration);
+  setText(ui.previewPosition, `${formatTime(position)} / ${duration === null ? "--:--.--" : formatTime(duration)}`);
 }
 
 function renderEditor() {
@@ -125,27 +164,32 @@ function renderEditor() {
     const selection = state.selection || {};
     const validSavedSelection = Number.isFinite(selection.startSeconds) && Number.isFinite(selection.endSeconds)
       && selection.startSeconds >= 0 && selection.endSeconds > selection.startSeconds && selection.endSeconds <= duration;
-    ui.trimStart.value = duration === null ? "" : String(validSavedSelection ? selection.startSeconds : 0);
-    ui.trimEnd.value = duration === null ? "" : String(validSavedSelection ? selection.endSeconds : duration);
+    ui.trimStart.value = duration === null ? "" : floorHundredths(validSavedSelection ? selection.startSeconds : 0).toFixed(2);
+    ui.trimEnd.value = duration === null ? "" : floorHundredths(validSavedSelection ? selection.endSeconds : duration).toFixed(2);
   }
   const duration = durationSeconds();
+  const available = trimAvailable();
   const selection = readSelection();
   const locked = busy || state.status !== "ready" || state.download?.status === "pending";
-  ui.trimUnavailable.hidden = duration !== null;
-  ui.trimStart.disabled = locked || duration === null;
-  ui.trimEnd.disabled = locked || duration === null;
-  ui.setTrimStart.disabled = locked || duration === null;
-  ui.setTrimEnd.disabled = locked || duration === null;
-  ui.trimStart.max = duration === null ? "" : String(duration);
-  ui.trimEnd.max = duration === null ? "" : String(duration);
+  ui.trimUnavailable.hidden = available;
+  setText(ui.trimUnavailable, duration === null
+    ? "이 녹음의 길이를 확인할 수 없어 구간을 자를 수 없어요. 전체 파일은 저장할 수 있어요."
+    : "녹음이 0.01초보다 짧아 구간을 나눌 수 없어요. 전체 파일을 저장해 주세요.");
+  ui.trimStart.disabled = locked || !available;
+  ui.trimEnd.disabled = locked || !available;
+  ui.setTrimStart.disabled = locked || !available;
+  ui.setTrimEnd.disabled = locked || !available;
+  ui.trimStart.max = duration === null ? "" : floorHundredths(duration).toFixed(2);
+  ui.trimEnd.max = duration === null ? "" : floorHundredths(duration).toFixed(2);
   ui.trimStart.setAttribute("aria-invalid", String(Boolean(selection.error)));
   ui.trimEnd.setAttribute("aria-invalid", String(Boolean(selection.error)));
-  ui.previewRange.disabled = locked || duration === null || Boolean(selection.error);
-  ui.saveRange.disabled = locked || duration === null || Boolean(selection.error);
+  ui.previewRange.disabled = locked || !available || Boolean(selection.error);
+  ui.saveRange.disabled = locked || !available || Boolean(selection.error);
   setText(ui.trimError, selection.error);
   ui.trimError.hidden = !selection.error;
-  setText(ui.trimSummary, duration === null ? "구간 편집 불가" : selection.error ? `전체 ${duration.toFixed(2)}초` : `선택 ${(selection.endSeconds - selection.startSeconds).toFixed(2)}초 / 전체 ${duration.toFixed(2)}초`);
+  setText(ui.trimSummary, !available ? "구간 편집 불가" : selection.error ? `전체 ${floorHundredths(duration).toFixed(2)}초` : `선택 ${(selection.endSeconds - selection.startSeconds).toFixed(2)}초 / 전체 ${floorHundredths(duration).toFixed(2)}초`);
   setText(ui.saveRange, state.status === "trimming" ? "구간 만드는 중…" : "선택 구간 저장 · .mp4");
+  renderPreviewPosition();
 }
 
 function render() {
@@ -158,14 +202,11 @@ function render() {
   const pending = download.status === "pending";
   const complete = download.status === "complete";
   const interrupted = download.status === "interrupted";
-  const totalSeconds = Math.max(0, Math.floor((Number(state.elapsedMs) || 0) / 1000));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  const mmss = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  const elapsedSeconds = Math.max(0, (Number(state.elapsedMs) || 0) / 1000);
+  const time = formatTime(elapsedSeconds);
   ui.app.dataset.ready = String(ready);
-  setText(ui.timer, hours ? `${hours}:${mmss}` : mmss);
-  ui.timer.setAttribute("aria-label", `녹음 시간 ${hours}시간 ${minutes}분 ${seconds}초`);
+  setText(ui.timer, time);
+  ui.timer.setAttribute("aria-label", `녹음 시간 ${time}`);
   ui.statusPill.dataset.status = status;
   setText(ui.statusLabel, statusLabels[status] || "상태 확인 중");
   setText(ui.timerCaption, recording ? "팝업을 닫아도 계속 녹음돼요" : paused ? "잠시 쉬는 중 · 정지한 시간은 제외돼요" : ready ? "녹음 파일을 기기에 저장하세요" : status === "stopping" ? "오디오 파일을 정리하고 있어요" : "녹음할 탭에서 시작해 주세요");
@@ -206,6 +247,23 @@ async function request(type, payload = {}) {
   return response;
 }
 
+async function armShortcuts() {
+  try {
+    const response = await request("ARM_SHORTCUTS");
+    shortcutConnection = response.ok ? "connected" : "unavailable";
+    shortcutDetail = response.ok ? "" : response.error || "이 페이지에 단축키를 연결할 수 없어요.";
+  } catch (error) {
+    shortcutConnection = "unavailable";
+    shortcutDetail = error.message || "이 페이지에 단축키를 연결할 수 없어요.";
+  }
+  // Permission/injection failures do not interfere with recorder controls or errors.
+  ui.shortcutStatus.dataset.status = shortcutConnection;
+  ui.shortcutStatus.title = shortcutDetail;
+  setText(ui.shortcutStatus, shortcutConnection === "connected"
+    ? "이 탭에 연결됨 · 창을 닫아도 1 시작 / 2 종료"
+    : "페이지 단축키 연결 불가 · 아래 Alt+Shift 단축키를 사용해 주세요.");
+}
+
 async function command(type, payload = {}) {
   if (busy) return;
   busy = true;
@@ -230,7 +288,7 @@ function selectionChanged() {
   stopRangePreview();
   const selection = readSelection();
   renderEditor();
-  if (durationSeconds() === null || selection.error || busy || state.status !== "ready" || state.download?.status === "pending") return;
+  if (!trimAvailable() || selection.error || busy || state.status !== "ready" || state.download?.status === "pending") return;
   const version = ++selectionVersion;
   const url = previewUrl;
   const { startSeconds, endSeconds } = selection;
@@ -301,19 +359,30 @@ ui.save.addEventListener("click", () => {
 });
 ui.saveRange.addEventListener("click", () => {
   const selection = readSelection();
-  if (busy || state.status !== "ready" || state.download?.status === "pending" || durationSeconds() === null || selection.error) return;
+  if (busy || state.status !== "ready" || state.download?.status === "pending" || !trimAvailable() || selection.error) return;
   stopRangePreview();
   void command("SAVE_RANGE", { startSeconds: selection.startSeconds, endSeconds: selection.endSeconds });
 });
 ui.trimStart.addEventListener("input", selectionChanged);
 ui.trimEnd.addEventListener("input", selectionChanged);
+for (const input of [ui.trimStart, ui.trimEnd]) {
+  input.addEventListener("blur", () => {
+    if (!Number.isFinite(input.valueAsNumber)) return;
+    const formatted = floorHundredths(input.valueAsNumber).toFixed(2);
+    if (input.value !== formatted) {
+      input.value = formatted;
+      selectionChanged();
+    }
+  });
+}
 ui.setTrimStart.addEventListener("click", () => {
-  ui.trimStart.value = String(Math.max(0, Math.floor(ui.audio.currentTime * 100) / 100));
+  const position = Math.min(Math.max(0, ui.audio.currentTime), durationSeconds() || 0);
+  ui.trimStart.value = floorHundredths(position).toFixed(2);
   selectionChanged();
 });
 ui.setTrimEnd.addEventListener("click", () => {
   const position = Math.min(ui.audio.currentTime, durationSeconds() || 0);
-  ui.trimEnd.value = String(position === durationSeconds() ? position : Math.floor(position * 100) / 100);
+  ui.trimEnd.value = floorHundredths(position).toFixed(2);
   selectionChanged();
 });
 ui.previewRange.addEventListener("click", async () => {
@@ -322,7 +391,7 @@ ui.previewRange.addEventListener("click", async () => {
     return;
   }
   const selection = readSelection();
-  if (busy || state.status !== "ready" || state.download?.status === "pending" || durationSeconds() === null || selection.error) return;
+  if (busy || state.status !== "ready" || state.download?.status === "pending" || !trimAvailable() || selection.error) return;
   try {
     ui.audio.currentTime = selection.startSeconds;
     previewEnd = selection.endSeconds;
@@ -332,14 +401,20 @@ ui.previewRange.addEventListener("click", async () => {
       return;
     }
     setText(ui.previewRange, "구간 듣기 정지");
-    trackRangePreview();
+    startPreviewClock();
   } catch {
     stopRangePreview();
     commandError = "미리 듣기를 시작하지 못했어요. 다시 시도하거나 전체 파일을 저장해 주세요.";
     render();
   }
 });
-ui.audio.addEventListener("timeupdate", checkRangePreview);
+ui.audio.addEventListener("timeupdate", () => {
+  checkRangePreview();
+  renderPreviewPosition();
+});
+ui.audio.addEventListener("play", startPreviewClock);
+ui.audio.addEventListener("loadedmetadata", renderPreviewPosition);
+ui.audio.addEventListener("seeked", renderPreviewPosition);
 ui.audio.addEventListener("pause", () => stopRangePreview(false));
 ui.audio.addEventListener("ended", () => stopRangePreview(false));
 document.addEventListener("visibilitychange", () => {
@@ -357,4 +432,5 @@ ui.discard.addEventListener("click", () => {
 });
 
 render();
+void armShortcuts();
 void poll();

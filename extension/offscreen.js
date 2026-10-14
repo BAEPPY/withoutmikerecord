@@ -11,7 +11,7 @@ const recorder = new TabAudioRecorder({
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (sender.id !== chrome.runtime.id || message?.target !== 'offscreen') {
+  if (sender.id !== chrome.runtime.id || sender.tab || message?.target !== 'offscreen') {
     return false;
   }
   recorder.handle(message).then(sendResponse, (error) => sendResponse({

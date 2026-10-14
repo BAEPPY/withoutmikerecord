@@ -67,7 +67,8 @@ h1 { font-size: 19px; font-weight: 750; letter-spacing: -.7px; }
 .save-row { display: grid; grid-template-columns: 1.5fr 1fr; gap: 9px; }
 .trim-editor { padding: 12px; border: 1px solid #304055; border-radius: 12px; background: #101d2d; }
 .trim-editor h2 { margin: 0 0 10px; font-size: 12px; font-weight: 650; }
-.trim-editor audio { display: block; width: 100%; height: 34px; margin-bottom: 12px; }
+.trim-editor audio { display: block; width: 100%; height: 34px; margin-bottom: 6px; }
+.preview-position { margin-bottom: 10px; color: #c4d2df; font-size: 11px; text-align: right; font-variant-numeric: tabular-nums; }
 .trim-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .trim-fields label { display: block; margin-bottom: 5px; color: var(--muted); font-size: 11px; }
 .trim-fields input { width: 100%; min-width: 0; padding: 8px; border: 1px solid #40556d; border-radius: 7px; background: #0c1422; color: #edf4f8; font-size: 13px; font-variant-numeric: tabular-nums; }
@@ -106,6 +107,8 @@ h1 { font-size: 19px; font-weight: 750; letter-spacing: -.7px; }
 .control-hint { min-height: 17px; text-align: center; font-size: 10px; line-height: 1.6; color: var(--muted); }
 .shortcut-hint { text-align: center; font-size: 10px; line-height: 1.8; color: var(--muted); }
 .shortcut-hint kbd { padding: 1px 5px; border: 1px solid #40556d; border-radius: 4px; color: #edf4f8; font: inherit; }
+.shortcut-status { color: var(--muted); font-size: 10px; line-height: 1.6; text-align: center; }
+.shortcut-status[data-status="connected"] { color: #b3d8ce; }
 .message { margin-bottom: 13px; padding: 10px 12px; border-radius: 9px; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
 .error-message { color: #ffd1d6; background: #39232e; border: 1px solid #623846; }
 .notice-message { color: #c3e7df; background: #193331; border: 1px solid #2e514b; }

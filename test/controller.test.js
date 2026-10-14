@@ -31,11 +31,18 @@ function browser({ status = 'idle', download, document = status !== 'idle' } = {
   if (download) state.download = structuredClone(download);
   const env = {
     calls, state, document,
-    activeTab: { id: 17, title: 'A playing tab', url: 'https://example.test/player' },
+    activeTab: { id: 17, title: 'A playing tab', url: 'https://example.test/player', active: true },
+    tabsById: new Map(),
     items: new Map(),
     async capture() { return 'stream-for-tab-17'; },
     async download() { return 91; },
     async createDocument() {},
+    async executeScript() {},
+    async getTab(tabId) {
+      const tab = env.tabsById.get(tabId) || (env.activeTab?.id === tabId ? env.activeTab : null);
+      if (!tab) throw new Error(`No tab with id: ${tabId}`);
+      return structuredClone(tab);
+    },
     async prepareExport(startSeconds, endSeconds) {
       return {
         url: 'blob:chrome-extension://recorder/clip-1',
@@ -100,6 +107,16 @@ function browser({ status = 'idle', download, document = status !== 'idle' } = {
       async query(options) {
         record('queryTabs', options);
         return env.activeTab ? [structuredClone(env.activeTab)] : [];
+      },
+      async get(tabId) {
+        record('getTab', tabId);
+        return env.getTab(tabId);
+      },
+    },
+    scripting: {
+      async executeScript(options) {
+        record('executeScript', options);
+        return env.executeScript(options);
       },
     },
     tabCapture: {
@@ -198,7 +215,7 @@ test('a capture permission failure is reported and a later start can recover', a
 
 test('closing another active tab leaves the original recording running', async () => {
   const env = browser({ status: 'recording' });
-  env.activeTab = { id: 88, title: 'Another tab', url: 'https://other.test/' };
+  env.activeTab = { id: 88, title: 'Another tab', url: 'https://other.test/', active: true };
   await env.controller.onTabRemoved(88);
   assert.equal(env.state.status, 'recording');
   assert.equal(messages(env, 'STOP').length, 0);
@@ -210,7 +227,7 @@ test('closing another active tab leaves the original recording running', async (
 
 test('manual stop targets the existing recording even after the active tab changes', async () => {
   const env = browser({ status: 'recording' });
-  env.activeTab = { id: 88, title: 'Another tab', url: 'https://other.test/' };
+  env.activeTab = { id: 88, title: 'Another tab', url: 'https://other.test/', active: true };
   const reply = await env.controller.handle({ type: 'STOP' });
   assert.equal(reply.ok, true);
   assert.equal(reply.state.tab.id, 17);
@@ -347,7 +364,7 @@ test('a delayed tab-close notification cannot stop a newer recording in another 
   await entered.promise;
   await env.controller.handle({ type: 'STOP' });
   await env.controller.handle({ type: 'DISCARD' });
-  env.activeTab = { id: 88, title: 'New recording', url: 'https://other.test/' };
+  env.activeTab = { id: 88, title: 'New recording', url: 'https://other.test/', active: true };
   await env.controller.handle({ type: 'START' });
   release.resolve();
   await removed;
@@ -491,4 +508,155 @@ test('a recreated worker recovers a cancelled clip picker without losing the cli
   assert.deepEqual(events(env, 'download')[0].data, {
     url: clip.url, filename: clip.filename, saveAs: true, conflictAction: 'uniquify',
   });
+});
+
+test('arming page shortcuts injects only into the active tab without starting capture', async () => {
+  const env = browser();
+  const reply = await env.controller.handle({ type: 'ARM_SHORTCUTS' });
+  assert.equal(reply.ok, true);
+  assert.equal(reply.state.status, 'idle');
+  assert.deepEqual(events(env, 'queryTabs').map(({ data }) => data), [{ active: true, currentWindow: true }]);
+  assert.deepEqual(events(env, 'executeScript').map(({ data }) => data), [{
+    target: { tabId: 17 }, files: ['page-shortcuts.js'],
+  }]);
+  assert.equal(events(env, 'capture').length, 0);
+  assert.equal(events(env, 'createDocument').length, 0);
+  assert.equal(messages(env, 'START').length, 0);
+});
+
+test('arming shortcuts on browser and store pages fails before any injection', async (t) => {
+  for (const url of [
+    'chrome://settings/', 'edge://extensions/', 'about:blank',
+    'chrome-extension://other-extension/page.html',
+    'https://chromewebstore.google.com/detail/example/123',
+    'https://chrome.google.com/webstore/detail/example/123',
+    'https://microsoftedge.microsoft.com/addons/detail/example/123',
+  ]) {
+    await t.test(url, async () => {
+      const env = browser();
+      env.activeTab.url = url;
+      const reply = await env.controller.handle({ type: 'ARM_SHORTCUTS' });
+      assert.equal(reply.ok, false);
+      assert.ok(reply.error);
+      assert.equal(events(env, 'executeScript').length, 0);
+      assert.equal(events(env, 'capture').length, 0);
+      assert.equal(events(env, 'createDocument').length, 0);
+    });
+  }
+});
+
+test('missing tabs and denied script access give an actionable shortcut activation error', async () => {
+  const missing = browser();
+  missing.activeTab = null;
+  const absent = await missing.controller.handle({ type: 'ARM_SHORTCUTS' });
+  assert.equal(absent.ok, false);
+  assert.ok(absent.error);
+  assert.equal(events(missing, 'executeScript').length, 0);
+
+  const denied = browser();
+  denied.executeScript = async () => { throw new Error('Cannot access contents of the page'); };
+  const reply = await denied.controller.handle({ type: 'ARM_SHORTCUTS' });
+  assert.equal(reply.ok, false);
+  assert.match(reply.error, /확장 프로그램|다시|권한/);
+  assert.equal(reply.state.status, 'idle');
+  assert.equal(events(denied, 'capture').length, 0);
+  assert.equal(events(denied, 'createDocument').length, 0);
+});
+
+test('arming another page does not replace or stop the original recording', async () => {
+  const env = browser({ status: 'recording' });
+  env.activeTab = { id: 88, title: 'Another tab', url: 'https://other.test/', active: true };
+  const reply = await env.controller.handle({ type: 'ARM_SHORTCUTS' });
+  assert.equal(reply.ok, true);
+  assert.equal(reply.state.status, 'recording');
+  assert.equal(reply.state.tab.id, 17);
+  assert.deepEqual(events(env, 'executeScript')[0].data.target, { tabId: 88 });
+  assert.equal(messages(env, 'STOP').length, 0);
+  assert.equal(events(env, 'capture').length, 0);
+});
+
+test('page START resolves and captures the explicit source tab', async () => {
+  const env = browser();
+  env.activeTab = { id: 88, title: 'Page key source', url: 'https://other.test/player', active: true };
+  const reply = await env.controller.handle({ type: 'START', targetTabId: 88 });
+  assert.equal(reply.ok, true);
+  assert.equal(reply.state.status, 'recording');
+  assert.deepEqual(events(env, 'getTab').map(({ data }) => data), [88]);
+  assert.deepEqual(events(env, 'capture').map(({ data }) => data), [{ targetTabId: 88 }]);
+  assert.deepEqual(messages(env, 'START')[0].data.tab, { id: 88, title: 'Page key source' });
+  assert.equal(reply.state.tab.id, 88);
+});
+
+test('closed, malformed, restricted, and inactive page START targets never fall back to another tab', async (t) => {
+  const cases = [
+    { name: 'closed target', targetTabId: 88 },
+    { name: 'negative target', targetTabId: -1 },
+    { name: 'text target', targetTabId: '17' },
+    { name: 'null target', targetTabId: null },
+    { name: 'fractional target', targetTabId: 17.5 },
+    { name: 'nonfinite target', targetTabId: NaN },
+    { name: 'inactive target', targetTabId: 88, tab: { id: 88, title: 'Background', url: 'https://other.test/', active: false } },
+    { name: 'different active window', targetTabId: 88, tab: { id: 88, title: 'Other window', url: 'https://other.test/', active: true } },
+    { name: 'restricted target', targetTabId: 17, tab: { id: 17, title: 'Settings', url: 'chrome://settings/', active: true } },
+    { name: 'store target', targetTabId: 17, tab: { id: 17, title: 'Store', url: 'https://chromewebstore.google.com/detail/example/123', active: true } },
+  ];
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const env = browser();
+      if (item.tab) env.tabsById.set(item.tab.id, item.tab);
+      const reply = await env.controller.handle({ type: 'START', targetTabId: item.targetTabId });
+      assert.equal(reply.ok, false);
+      assert.ok(reply.error);
+      assert.equal(reply.state.status, 'idle');
+      assert.equal(events(env, 'capture').length, 0);
+      assert.equal(events(env, 'createDocument').length, 0);
+      assert.equal(messages(env, 'START').length, 0);
+    });
+  }
+});
+
+test('PAGE_STOP stops only its source recording, including a paused source after switching tabs', async (t) => {
+  for (const status of ['recording', 'paused']) {
+    await t.test(status, async () => {
+      const env = browser({ status });
+      env.activeTab = { id: 88, title: 'Another tab', url: 'https://other.test/', active: true };
+      const reply = await env.controller.handle({ type: 'PAGE_STOP', targetTabId: 17 });
+      assert.equal(reply.ok, true);
+      assert.equal(reply.state.status, 'ready');
+      assert.equal(reply.state.tab.id, 17);
+      assert.equal(messages(env, 'STOP').length, 1);
+      assert.equal(events(env, 'capture').length, 0);
+      assert.equal(events(env, 'queryTabs').length, 0);
+    });
+  }
+});
+
+test('PAGE_STOP from another page cannot stop the original source and ordinary STOP still can', async () => {
+  const env = browser({ status: 'recording' });
+  env.activeTab = { id: 88, title: 'Another tab', url: 'https://other.test/', active: true };
+  const wrongSource = await env.controller.handle({ type: 'PAGE_STOP', targetTabId: 88 });
+  assert.equal(wrongSource.ok, false);
+  assert.ok(wrongSource.error);
+  assert.equal(wrongSource.state.status, 'recording');
+  assert.equal(wrongSource.state.tab.id, 17);
+  assert.equal(messages(env, 'STOP').length, 0);
+  const stopped = await env.controller.handle({ type: 'STOP' });
+  assert.equal(stopped.ok, true);
+  assert.equal(stopped.state.status, 'ready');
+  assert.equal(stopped.state.tab.id, 17);
+  assert.equal(messages(env, 'STOP').length, 1);
+});
+
+test('PAGE_STOP cannot stop idle, finalizing, ready, or trimming state', async (t) => {
+  for (const status of ['idle', 'starting', 'stopping', 'ready', 'trimming', 'error']) {
+    await t.test(status, async () => {
+      const env = browser({ status });
+      const reply = await env.controller.handle({ type: 'PAGE_STOP', targetTabId: 17 });
+      assert.equal(reply.ok, false);
+      assert.ok(reply.error);
+      assert.equal(reply.state.status, status);
+      assert.equal(messages(env, 'STOP').length, 0);
+      assert.equal(events(env, 'capture').length, 0);
+    });
+  }
 });

@@ -73,9 +73,45 @@ export function createController(api) {
     return reply.state;
   }
 
+  async function activeWebTab(targetTabId) {
+    let tab;
+    if (targetTabId !== undefined) {
+      if (!Number.isInteger(targetTabId) || targetTabId < 0) throw new Error('녹음할 탭을 다시 선택해 주세요.');
+      try { tab = await api.tabs.get(targetTabId); }
+      catch { throw new Error('탭이 닫혔어요. 녹음할 탭에서 확장 프로그램을 다시 열어 주세요.'); }
+      const [active] = await api.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.active || active?.id !== targetTabId) throw new Error('녹음할 탭을 선택한 상태에서 다시 눌러 주세요.');
+    } else {
+      [tab] = await api.tabs.query({ active: true, currentWindow: true });
+    }
+    if (!Number.isInteger(tab?.id) || !/^https?:\/\//i.test(tab.url || '') ||
+        /^https:\/\/(chromewebstore\.google\.com|chrome\.google\.com\/webstore|microsoftedge\.microsoft\.com\/addons)(\/|$)/i.test(tab.url)) {
+      throw new Error('소리가 재생되는 일반 웹페이지에서 확장 프로그램을 열어 주세요. 브라우저 설정이나 스토어 페이지는 녹음할 수 없어요.');
+    }
+    return tab;
+  }
+
   async function run(message) {
     let current = await reconcileDownload(await state());
     if (message.type === 'STATUS') return { ok: true, state: current };
+    if (message.type === 'ARM_SHORTCUTS') {
+      const tab = await activeWebTab();
+      try {
+        await api.scripting.executeScript({ target: { tabId: tab.id }, files: ['page-shortcuts.js'] });
+      } catch {
+        throw new Error('단축키 연결 권한을 확인하지 못했어요. 이 탭에서 확장 프로그램을 다시 눌러 주세요.');
+      }
+      return { ok: true, state: current };
+    }
+    if (message.type === 'PAGE_STOP') {
+      if (!Number.isInteger(message.targetTabId) || current.tab?.id !== message.targetTabId ||
+          !['recording', 'paused'].includes(current.status)) {
+        throw new Error('이 탭에서 진행 중인 녹음이 없어요. 녹음한 탭에서 2를 눌러 주세요.');
+      }
+      const reply = await send('STOP');
+      await badge(reply.state);
+      return reply;
+    }
     if (message.type === 'STOP' && message.expectedTabId !== undefined &&
         (current.tab?.id !== message.expectedTabId || !['recording', 'paused'].includes(current.status))) {
       return { ok: true, state: current };
@@ -84,11 +120,7 @@ export function createController(api) {
       if (!['idle', 'error'].includes(current.status)) {
         throw new Error('진행 중인 녹음을 마치고 새 녹음을 시작해 주세요.');
       }
-      const [tab] = await api.tabs.query({ active: true, currentWindow: true });
-      if (!tab?.id || !/^https?:\/\//i.test(tab.url || '') ||
-          /^https:\/\/(chromewebstore\.google\.com|chrome\.google\.com\/webstore|microsoftedge\.microsoft\.com\/addons)(\/|$)/i.test(tab.url)) {
-        throw new Error('소리가 재생되는 일반 웹페이지에서 확장 프로그램을 열어 주세요. 브라우저 설정이나 스토어 페이지는 녹음할 수 없어요.');
-      }
+      const tab = await activeWebTab(message.targetTabId);
       await ensureDocument();
       let streamId;
       try { streamId = await api.tabCapture.getMediaStreamId({ targetTabId: tab.id }); }

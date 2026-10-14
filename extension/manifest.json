@@ -1,14 +1,24 @@
 {
   "manifest_version": 3,
   "name": "Without Mike · 탭 소리 녹음",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "마이크 없이 탭 소리를 녹음하고 원하는 구간을 잘라 MP4 오디오 파일로 저장하세요.",
   "minimum_chrome_version": "128",
-  "permissions": ["activeTab", "tabCapture", "offscreen", "downloads"],
+  "permissions": ["activeTab", "tabCapture", "offscreen", "downloads", "scripting"],
   "background": { "service_worker": "background.js", "type": "module" },
   "action": {
     "default_title": "탭 소리 녹음",
     "default_popup": "popup.html"
+  },
+  "commands": {
+    "start-recording": {
+      "suggested_key": { "default": "Alt+Shift+1" },
+      "description": "현재 탭 소리 녹음 시작"
+    },
+    "stop-recording": {
+      "suggested_key": { "default": "Alt+Shift+2" },
+      "description": "현재 탭 소리 녹음 끝내기"
+    }
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"

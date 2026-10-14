@@ -5,6 +5,7 @@ import asyncio
 import functools
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import threading
@@ -47,15 +48,33 @@ async def main():
             return output.stream;
           }}});
           window.downloaded = [];
-          window.controller = createController({
-            runtime: {getURL: (path)=>location.origin+'/'+path, getContexts:async()=>[{}],
-              sendMessage:(message)=>recorder.handle(message)},
-            tabs: {query:async()=>[{id:1,url:'https://example.test',title:'테스트 음원 · 440/880 Hz'}]},
+          window.pageCommands = [];
+          const sourceTab = {id:1,active:true,url:'https://example.test',title:'테스트 음원 · 440/880 Hz'};
+          window.chrome = {
+            runtime: {id:'test-extension',getURL: (path)=>location.origin+'/'+path, getContexts:async()=>[{}],
+              sendMessage:(message)=>{
+                if (message.target === 'offscreen') return recorder.handle(message);
+                if (message.type !== 'PAGE_SHORTCUT') throw Error('Unexpected page request');
+                pageCommands.push(message);
+                if (message.key === '1') syntheticTone.frequency.setValueAtTime(880, sourceContext.currentTime + 0.6);
+                return controller.handle({type:message.key === '1' ? 'START' : 'PAGE_STOP',targetTabId:1});
+              }},
+            tabs: {query:async()=>[sourceTab],get:async(id)=>{
+              if(id !== 1) throw Error('Missing source tab'); return sourceTab;
+            }},
+            scripting: {executeScript:async(options)=>{
+              if(options.target.tabId !== 1 || options.files[0] !== 'page-shortcuts.js') throw Error('Wrong injection target');
+              new Function(await (await fetch('./page-shortcuts.js')).text())();
+            }},
             tabCapture: {getMediaStreamId:async()=> 'synthetic-tab-test'},
             action: {setBadgeText:async()=>{},setBadgeBackgroundColor:async()=>{},setTitle:async()=>{}},
             downloads: {download:async(options)=>{downloaded.push(options);return downloaded.length;},
               search:async()=>[{state:'complete'}]},
-          });
+          };
+          window.controller = createController(chrome);
+          document.body.innerHTML = '<input id="page-input"><button id="page-play">재생</button><video id="page-video" tabindex="0"></video><div id="shadow-editor"></div>';
+          const shadow = document.querySelector('#shadow-editor').attachShadow({mode:'open'});
+          shadow.innerHTML = '<input id="shadow-input">';
         }''')
 
         async def bridge(message):
@@ -75,9 +94,31 @@ async def main():
 
         popup = await popup_page()
         await popup.wait_for_selector('#start-button:enabled')
+        await popup.wait_for_selector('#shortcut-status[data-status="connected"]')
         await popup.locator('body').screenshot(path=str(OUTPUT / 'popup-idle.png'))
-        await popup.keyboard.press('1')
+        await popup.close()
+        # A real trusted key event reaches the injected page listener after the
+        # popup has closed. Editable fields, shadow inputs and synthetic events
+        # must not start a recording or steal typed digits.
+        await owner.bring_to_front()
+        await owner.click('#page-input')
+        await owner.keyboard.type('12')
+        assert await owner.input_value('#page-input') == '12'
+        await owner.locator('#shadow-input').fill('')
+        await owner.keyboard.type('12')
+        assert await owner.locator('#shadow-input').input_value() == '12'
+        await owner.click('#page-play')
+        await owner.keyboard.press('Alt+1')
+        await owner.evaluate("window.dispatchEvent(new KeyboardEvent('keydown', {key:'1',bubbles:true,cancelable:true}))")
+        assert await owner.evaluate('pageCommands.length') == 0
+        await owner.keyboard.down('1')
+        await owner.wait_for_function("recorder.getState().status === 'recording'")
+        await owner.keyboard.down('1')  # auto-repeat must not issue another START
+        await owner.keyboard.up('1')
+        assert await owner.evaluate('pageCommands.length') == 1
+        popup = await popup_page()
         await popup.wait_for_function("document.querySelector('#status-label').textContent === '녹음 중'")
+        assert re.fullmatch(r'\d{2}:\d{2}\.\d{2}', await popup.locator('#timer').inner_text())
         await asyncio.sleep(1.2)
         recording = await bridge({'type': 'STATUS'})
         assert recording['state']['level'] > 0, recording
@@ -92,15 +133,23 @@ async def main():
         await popup.close()
         await asyncio.sleep(0.6)
         assert (await bridge({'type': 'STATUS'}))['state']['status'] == 'recording'
+        # Focus on a player must still allow STOP. Reopening the popup above
+        # reinjects the script; exactly one request proves injection is idempotent.
+        await owner.bring_to_front()
+        await owner.locator('#page-video').focus()
+        await owner.keyboard.press('2')
+        await owner.wait_for_function("recorder.getState().status === 'ready'")
+        assert await owner.evaluate('pageCommands.map(command=>command.key)') == ['1', '2']
         popup = await popup_page()
-        await popup.wait_for_selector('#stop-button:visible')
-        await popup.keyboard.press('2')
         await popup.wait_for_function("document.querySelector('#status-label').textContent === '녹음 완료'")
         state = (await bridge({'type': 'STATUS'}))['state']
         assert state['result']['mimeType'].startswith('audio/mp4'), state
         assert state['result']['filename'].endswith('.mp4'), state
         assert '.mp4' in await popup.locator('#save-button').inner_text()
         assert state['result']['durationSeconds'] > 1.5
+        assert await popup.input_value('#trim-start') == '0.00'
+        assert re.fullmatch(r'\d+\.\d{2}', await popup.input_value('#trim-end'))
+        assert re.fullmatch(r'00:00\.00 / \d{2}:\d{2}\.\d{2}', await popup.locator('#preview-position').inner_text())
         await popup.locator('body').screenshot(path=str(OUTPUT / 'popup-ready.png'))
         payload = await owner.evaluate('''async () => Array.from(new Uint8Array(
           await (await fetch(recorder.getState().result.url)).arrayBuffer()))''')
@@ -112,12 +161,13 @@ async def main():
         assert 'mp4' in probe['format']['format_name'], probe
         assert float(probe['format']['duration']) > 1.5, probe
         subprocess.run(['ffmpeg', '-v', 'error', '-i', str(sample), '-f', 'null', '-'], check=True)
-        await popup.fill('#trim-start', '0.90')
-        await popup.fill('#trim-end', '1.50')
+        await popup.fill('#trim-start', '0.91')
+        await popup.fill('#trim-end', '1.51')
         await popup.click('#preview-range')
         await popup.wait_for_function("document.querySelector('#audio-preview').paused", timeout=5000)
         position = await popup.locator('#audio-preview').evaluate('(audio)=>audio.currentTime')
         assert 1.45 <= position <= 1.60, position
+        assert (await popup.locator('#preview-position').inner_text()).startswith('00:01.51 / ')
         await popup.click('#save-range-button')
         await popup.wait_for_function("document.querySelector('#notice-message').textContent.includes('완료')")
         state = (await bridge({'type': 'STATUS'}))['state']
@@ -140,8 +190,8 @@ async def main():
         await popup.close()
         popup = await popup_page()
         await popup.wait_for_selector('#trim-start:enabled')
-        assert float(await popup.input_value('#trim-start')) == 0.9
-        assert float(await popup.input_value('#trim-end')) == 1.5
+        assert await popup.input_value('#trim-start') == '0.91'
+        assert await popup.input_value('#trim-end') == '1.51'
         await popup.click('#save-button')
         await popup.wait_for_function("document.querySelector('#save-button').disabled === false")
         assert await owner.evaluate('downloaded.at(-1).url === recorder.getState().result.url')
@@ -150,8 +200,8 @@ async def main():
                           'codec': probe['streams'][0]['codec_name'],
                           'duration': probe['format']['duration'], 'bytes': sample.stat().st_size,
                           'trimDuration': clip_probe['format']['duration'], 'trimFrequency': frequency,
-                          'ui': 'key1 record, pause, resume, close/reopen, key2 stop, preview, trim, persist range, full save passed',
-                          'scope': 'synthetic input; native MP4 encoder and popup UI'}, ensure_ascii=False))
+                          'ui': 'popup closed: page1 record, pause, resume, page2 stop with player focus; input guards, idempotent injection, hundredths, preview, trim, persist range, full save passed',
+                          'scope': 'synthetic input and Chrome API bridge; real page keys, MP4 encoder and popup UI'}, ensure_ascii=False))
         await browser.close()
 
 try:
