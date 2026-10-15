@@ -61,17 +61,19 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
     async executeScript() {},
     async captureVisibleTab() { return screenshot; },
     async sendTabMessage() { return { ok: true }; },
-    async prepareGif(startSeconds, endSeconds) {
-      return startSeconds === undefined && endSeconds === undefined ? structuredClone(recordedGif) : {
+    async prepareGif(startSeconds, endSeconds, quality) {
+      const output = startSeconds === undefined && endSeconds === undefined ? structuredClone(recordedGif) : {
         ...recordedRangeGif, startSeconds, endSeconds, durationSeconds: endSeconds - startSeconds,
       };
+      return quality === undefined ? output : { ...output, url: `${output.url}-${quality}`, quality };
     },
-    async prepareVideoExport(content) {
+    async prepareVideoExport(content, quality) {
       return {
         ...recordedVideo,
-        url: `blob:chrome-extension://recorder/video-export-${content}`,
+        url: `blob:chrome-extension://recorder/video-export-${content}${quality === undefined ? '' : `-${quality}`}`,
         filename: `tab-video-${content}.mp4`,
         mimeType: content === 'audio' ? 'audio/mp4' : 'video/mp4', content,
+        ...(quality === undefined ? {} : { quality }),
       };
     },
     async cancelExport() {},
@@ -82,13 +84,14 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
       if (!tab) throw new Error(`No tab with id: ${tabId}`);
       return structuredClone(tab);
     },
-    async prepareExport(startSeconds, endSeconds, content) {
+    async prepareExport(startSeconds, endSeconds, content, quality) {
       return {
-        url: `blob:chrome-extension://recorder/clip-${content || '1'}`,
+        url: `blob:chrome-extension://recorder/clip-${content || '1'}${quality === undefined ? '' : `-${quality}`}`,
         filename: `tab-${content || 'audio'}-2026-10-13-trim.mp4`,
         bytes: 768, mimeType: content === 'audio' ? 'audio/mp4' : state.result?.mimeType || recordedFile.mimeType,
         durationSeconds: endSeconds - startSeconds, startSeconds, endSeconds,
         ...(content === undefined ? {} : { content }),
+        ...(quality === undefined ? {} : { quality }),
       };
     },
   };
@@ -132,7 +135,7 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
           case 'PREPARE_EXPORT':
             state.status = 'trimming';
             try {
-              const output = await env.prepareExport(message.startSeconds, message.endSeconds, message.content);
+              const output = await env.prepareExport(message.startSeconds, message.endSeconds, message.content, message.quality);
               if (output?.cancelled) {
                 state.status = 'ready';
                 return { ok: false, cancelled: true, state: structuredClone(state) };
@@ -148,7 +151,7 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
           case 'PREPARE_VIDEO_EXPORT':
             state.status = 'trimming';
             try {
-              const output = await env.prepareVideoExport(message.content);
+              const output = await env.prepareVideoExport(message.content, message.quality);
               if (output?.cancelled) {
                 state.status = 'ready';
                 return { ok: false, cancelled: true, state: structuredClone(state) };
@@ -163,7 +166,7 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
           case 'PREPARE_GIF':
             state.status = 'exporting';
             try {
-              const output = await env.prepareGif(message.startSeconds, message.endSeconds);
+              const output = await env.prepareGif(message.startSeconds, message.endSeconds, message.quality);
               if (output?.cancelled) {
                 state.status = 'ready';
                 return { ok: false, cancelled: true, state: structuredClone(state) };
@@ -1865,4 +1868,169 @@ test('cancelling a video-only Save As dialog still allows retrying with audio-on
   assert.notEqual(events(env, 'download')[0].data.url, events(env, 'download')[1].data.url);
   assert.equal(events(env, 'download')[1].data.url, retried.state.videoExportResult.url);
   assert.deepEqual(retried.state.result, recordedVideo);
+});
+
+test('whole MP4 quality changes prepare and download the matching variant while original keeps its URL', async () => {
+  const env = browser({ status: 'ready', mode: 'video' });
+  env.items.set(91, { id: 91, state: 'complete' });
+  for (const content of ['both', 'video']) {
+    for (const quality of ['balanced', 'small', 'balanced', 'original']) {
+      const previousPreparations = messages(env, 'PREPARE_VIDEO_EXPORT').length;
+      const reply = await env.controller.handle({ type: 'SAVE_VIDEO', format: 'mp4', content, quality });
+      assert.equal(reply.ok, true);
+      assert.deepEqual(reply.state.result, recordedVideo);
+      if (content === 'both' && quality === 'original') {
+        assert.equal(messages(env, 'PREPARE_VIDEO_EXPORT').length, previousPreparations);
+        assert.equal(events(env, 'download').at(-1).data.url, recordedVideo.url);
+      } else {
+        assert.deepEqual(messages(env, 'PREPARE_VIDEO_EXPORT').at(-1).data, {
+          target: 'offscreen', type: 'PREPARE_VIDEO_EXPORT', content, quality,
+        });
+        assert.equal(reply.state.videoExportResult.quality, quality);
+        assert.equal(events(env, 'download').at(-1).data.url, reply.state.videoExportResult.url);
+      }
+    }
+  }
+  assert.equal(messages(env, 'PREPARE_EXPORT').length, 0);
+});
+
+test('range MP4 quality changes retain selected bounds and content and download the new result', async () => {
+  const env = browser({ status: 'ready', mode: 'video' });
+  const range = { startSeconds: 1.25, endSeconds: 6.75 };
+  env.items.set(91, { id: 91, state: 'complete' });
+  for (const content of ['both', 'video']) {
+    for (const quality of ['original', 'balanced', 'small']) {
+      const reply = await env.controller.handle({ type: 'SAVE_VIDEO_RANGE', format: 'mp4', content, quality, ...range });
+      assert.equal(reply.ok, true);
+      assert.deepEqual(messages(env, 'PREPARE_EXPORT').at(-1).data, {
+        target: 'offscreen', type: 'PREPARE_EXPORT', content, quality, ...range,
+      });
+      assert.equal(reply.state.exportResult.quality, quality);
+      assert.equal(events(env, 'download').at(-1).data.url, reply.state.exportResult.url);
+      assert.deepEqual(reply.state.result, recordedVideo);
+    }
+  }
+});
+
+test('audio-only MP4 normalizes valid video qualities without changing the audio range route', async () => {
+  const range = { startSeconds: 1, endSeconds: 4 };
+  for (const type of ['SAVE_VIDEO', 'SAVE_VIDEO_RANGE']) {
+    const env = browser({ status: 'ready', mode: 'video' });
+    env.items.set(91, { id: 91, state: 'complete' });
+    for (const quality of ['original', 'balanced', 'small']) {
+      const reply = await env.controller.handle({ type, format: 'mp4', content: 'audio', quality, ...range });
+      assert.equal(reply.ok, true);
+      const preparation = type === 'SAVE_VIDEO' ? 'PREPARE_VIDEO_EXPORT' : 'PREPARE_EXPORT';
+      assert.deepEqual(messages(env, preparation).at(-1).data, {
+        target: 'offscreen', type: preparation, content: 'audio', quality: 'original',
+        ...(type === 'SAVE_VIDEO_RANGE' ? range : {}),
+      });
+    }
+  }
+  const audio = browser({ status: 'ready' });
+  audio.items.set(91, { id: 91, state: 'complete' });
+  assert.equal((await audio.controller.handle({ type: 'SAVE_RANGE', quality: 'small', ...range })).ok, true);
+  assert.deepEqual(messages(audio, 'PREPARE_EXPORT')[0].data, { target: 'offscreen', type: 'PREPARE_EXPORT', ...range });
+});
+
+test('whole and range GIF saving and copying forward every selected quality to conversion', async () => {
+  const range = { startSeconds: 1.25, endSeconds: 5.75 };
+  for (const scope of ['whole', 'range']) {
+    for (const copy of [false, true]) {
+      const env = browser({ status: 'ready', mode: 'video' });
+      env.items.set(91, { id: 91, state: 'complete' });
+      for (const quality of ['original', 'balanced', 'small']) {
+        const request = copy ? { type: 'PREPARE_GIF_COPY', scope }
+          : { type: scope === 'whole' ? 'SAVE_VIDEO' : 'SAVE_VIDEO_RANGE', format: 'gif' };
+        const reply = await env.controller.handle({ ...request, quality, ...(scope === 'range' ? range : {}) });
+        assert.equal(reply.ok, true);
+        assert.deepEqual(messages(env, 'PREPARE_GIF').at(-1).data, {
+          target: 'offscreen', type: 'PREPARE_GIF', quality, ...(scope === 'range' ? range : {}),
+        });
+        const output = reply.state[scope === 'whole' ? 'gifResult' : 'rangeGifResult'];
+        assert.equal(output.quality, quality);
+        if (copy) {
+          assert.equal(reply.output.url, output.url);
+          assert.equal(events(env, 'download').length, 0);
+        } else assert.equal(events(env, 'download').at(-1).data.url, output.url);
+        assert.deepEqual(reply.state.result, recordedVideo);
+      }
+    }
+  }
+});
+
+test('invalid qualities fail before preparing, downloading or normalizing an audio-only request', async () => {
+  for (const request of [
+    { type: 'SAVE_VIDEO', format: 'mp4', content: 'both' },
+    { type: 'SAVE_VIDEO', format: 'mp4', content: 'audio' },
+    { type: 'SAVE_VIDEO_RANGE', format: 'mp4', content: 'video' },
+    { type: 'SAVE_VIDEO_RANGE', format: 'mp4', content: 'audio' },
+    { type: 'SAVE_VIDEO', format: 'gif' },
+    { type: 'SAVE_VIDEO_RANGE', format: 'gif' },
+    { type: 'PREPARE_GIF_COPY', scope: 'whole' },
+    { type: 'PREPARE_GIF_COPY', scope: 'range' },
+  ]) {
+    const env = browser({ status: 'ready', mode: 'video' });
+    for (const quality of [null, '', '1080p', 'SMALL', 0, false, {}, [], '__proto__']) {
+      const reply = await env.controller.handle({ ...request, quality, startSeconds: 1, endSeconds: 4 });
+      assert.equal(reply.ok, false, `${request.type}: ${JSON.stringify(quality)}`);
+      assert.deepEqual(reply.state.result, recordedVideo);
+    }
+    for (const type of ['PREPARE_VIDEO_EXPORT', 'PREPARE_EXPORT', 'PREPARE_GIF', 'DOWNLOAD_UPDATE']) {
+      assert.equal(messages(env, type).length, 0, type);
+    }
+    assert.equal(events(env, 'download').length, 0);
+  }
+});
+
+test('cancelling a pending quality conversion preserves its successful variant and permits another quality', { timeout: 3000 }, async () => {
+  for (const format of ['mp4', 'gif']) {
+    const env = browser({ status: 'ready', mode: 'video' });
+    env.state.videoExportResult = await env.prepareVideoExport('both', 'balanced');
+    env.state.gifResult = await env.prepareGif(undefined, undefined, 'balanced');
+    const previousVideo = structuredClone(env.state.videoExportResult);
+    const previousGif = structuredClone(env.state.gifResult);
+    const entered = deferred();
+    const conversion = deferred();
+    const prepare = format === 'mp4' ? 'prepareVideoExport' : 'prepareGif';
+    const realPreparation = env[prepare];
+    env[prepare] = async () => { entered.resolve(); return conversion.promise; };
+    env.cancelExport = async () => { conversion.resolve({ cancelled: true }); };
+    const saving = env.controller.handle({ type: 'SAVE_VIDEO', format, quality: 'small' });
+    await entered.promise;
+    try {
+      assert.equal((await env.controller.handle({ type: 'CANCEL_EXPORT' })).ok, true);
+      const reply = await saving;
+      assert.equal(reply.cancelled, true);
+      assert.deepEqual(reply.state.result, recordedVideo);
+      assert.deepEqual(reply.state.videoExportResult, previousVideo);
+      assert.deepEqual(reply.state.gifResult, previousGif);
+      assert.equal(events(env, 'download').length, 0);
+      env[prepare] = realPreparation;
+      env.items.set(91, { id: 91, state: 'complete' });
+      const retry = await env.controller.handle({ type: 'SAVE_VIDEO', format, quality: 'balanced' });
+      assert.equal(retry.ok, true);
+      const result = retry.state[format === 'mp4' ? 'videoExportResult' : 'gifResult'];
+      assert.equal(result.quality, 'balanced');
+      assert.equal(events(env, 'download').at(-1).data.url, result.url);
+    } finally {
+      conversion.resolve({ cancelled: true });
+    }
+  }
+});
+
+test('a cancelled Save As dialog can be retried with a different quality without reusing stale output', async () => {
+  const env = browser({ status: 'ready', mode: 'video' });
+  env.download = async () => { throw new Error('USER_CANCELED'); };
+  const cancelled = await env.controller.handle({ type: 'SAVE_VIDEO', format: 'mp4', quality: 'balanced' });
+  assert.equal(cancelled.ok, false);
+  assert.equal(cancelled.state.download.status, 'interrupted');
+  assert.equal(cancelled.state.videoExportResult.quality, 'balanced');
+  env.download = async () => 92;
+  env.items.set(92, { id: 92, state: 'complete' });
+  const retry = await env.controller.handle({ type: 'SAVE_VIDEO', format: 'mp4', quality: 'small' });
+  assert.equal(retry.ok, true);
+  assert.equal(retry.state.videoExportResult.quality, 'small');
+  assert.notEqual(events(env, 'download')[0].data.url, events(env, 'download')[1].data.url);
+  assert.deepEqual(retry.state.result, recordedVideo);
 });

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Without Mike · 탭 소리·화면 녹화",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "마이크 없이 탭 소리·화면을 녹화해 MP4·GIF로 저장하고, 기존 파일에서 소리만 추출하세요.",
   "minimum_chrome_version": "128",
   "permissions": [

@@ -1,8 +1,9 @@
+import { getVideoQuality } from './video-quality.js';
+
 export const VIDEO_TRIM_MIN_SECONDS = 0.04;
 export const VIDEO_TRIM_MAX_SECONDS = 2 * 60 * 60;
 export const VIDEO_TRIM_MAX_COMBINED_BYTES = 128 * 1024 * 1024;
 const MEDIA_TIMEOUT_MS = 30_000;
-const FRAME_RATE = 30;
 const VIDEO_MIME_TYPES = [
   'video/mp4;codecs=avc1.420028,mp4a.40.2', 'video/mp4;codecs=avc1,mp4a.40.2',
   'video/mp4;codecs=vp9,opus', 'video/mp4;codecs=avc1,opus', 'video/mp4',
@@ -136,8 +137,11 @@ export function createVideoTrimmer(overrides = {}) {
     try { return resource.metadata; } finally { resource.dispose(); }
   }
 
-  async function trim(blob, startSeconds, endSeconds, { onProgress = () => {}, signal } = {}) {
+  async function trim(blob, startSeconds = 0, endSeconds, {
+    onProgress = () => {}, signal, quality = 'original',
+  } = {}) {
     checkAbort(signal);
+    const profile = getVideoQuality(quality);
     let resource;
     let canvas;
     let canvasStream;
@@ -153,8 +157,9 @@ export function createVideoTrimmer(overrides = {}) {
       onProgress(0);
       resource = await openVideo(blob, signal);
       const { video, metadata } = resource;
+      if (endSeconds === undefined) endSeconds = metadata.durationSeconds;
       ({ startSeconds, endSeconds } = validateVideoTrimRange(startSeconds, endSeconds, metadata.durationSeconds));
-      if (startSeconds === 0 && endSeconds === metadata.durationSeconds) {
+      if (quality === 'original' && startSeconds === 0 && endSeconds === metadata.durationSeconds) {
         onProgress(1);
         return { blob, ...metadata, startSeconds, endSeconds, mimeType: blob.type || 'video/mp4' };
       }
@@ -169,13 +174,13 @@ export function createVideoTrimmer(overrides = {}) {
       }
       if (video.readyState < 2) await waitForMedia(video, 'loadeddata', undefined, env, signal);
       canvas = env.document.createElement('canvas');
-      const scale = Math.min(1, 1920 / metadata.width, 1080 / metadata.height);
+      const scale = Math.min(1, profile.maxWidth / metadata.width, profile.maxHeight / metadata.height);
       canvas.width = Math.max(2, Math.floor(metadata.width * scale / 2) * 2);
       canvas.height = Math.max(2, Math.floor(metadata.height * scale / 2) * 2);
       const drawing = canvas.getContext('2d', { alpha: false });
       if (!drawing || !canvas.captureStream) throw new Error('영상 구간을 만들 화면을 준비하지 못했어요.');
       drawing.drawImage(video, 0, 0, canvas.width, canvas.height);
-      canvasStream = canvas.captureStream(FRAME_RATE);
+      canvasStream = canvas.captureStream(profile.frameRate);
       if (!canvasStream.getVideoTracks().length) throw new Error('영상 구간의 영상 트랙을 준비하지 못했어요.');
       context = new env.AudioContext();
       source = context.createMediaElementSource(video);
@@ -192,7 +197,7 @@ export function createVideoTrimmer(overrides = {}) {
         ...canvasStream.getVideoTracks(), ...destination.stream.getAudioTracks(),
       ]);
       recorder = new env.MediaRecorder(outputStream, {
-        mimeType, audioBitsPerSecond: 128000, videoBitsPerSecond: 5000000,
+        mimeType, audioBitsPerSecond: 128000, videoBitsPerSecond: profile.videoBitsPerSecond,
       });
       if (recorder.mimeType && !/^video\/mp4(?:;|$)/i.test(recorder.mimeType)) {
         throw new Error('브라우저가 MP4 형식으로 영상을 만들지 못했어요. 전체 MP4 원본은 저장할 수 있어요.');
@@ -227,6 +232,14 @@ export function createVideoTrimmer(overrides = {}) {
         };
         const aborted = () => finish(abortError());
         const failed = () => finish(new Error('영상 구간을 읽는 중 오류가 발생했어요. 원본 영상은 그대로 남아 있어요.'));
+        const ended = () => {
+          if (settled || stopping) return;
+          // A hidden/offscreen document can throttle interval and frame
+          // callbacks after the last frame. Stop at the media event itself so
+          // its delayed next timer does not append silence or a frozen tail.
+          if (video.currentTime >= endSeconds - 0.1) stop();
+          else finish(new Error('영상이 선택한 구간보다 일찍 끝나 저장을 마치지 못했어요. 다시 시도해 주세요.'));
+        };
         const tick = () => {
           if (settled || stopping) return;
           const now = env.now();
@@ -241,7 +254,7 @@ export function createVideoTrimmer(overrides = {}) {
             finish(new Error('영상 재생이 멈춰 구간 저장을 끝내지 못했어요. 다시 시도해 주세요.'));
             return;
           }
-          if (video.readyState >= 2 && now - lastDraw >= 1000 / FRAME_RATE * 0.9) {
+          if (video.readyState >= 2 && now - lastDraw >= 1000 / profile.frameRate * 0.9) {
             try { drawing.drawImage(video, 0, 0, canvas.width, canvas.height); }
             catch (error) { finish(error); return; }
             lastDraw = now;
@@ -261,9 +274,11 @@ export function createVideoTrimmer(overrides = {}) {
           frameId = null;
           signal?.removeEventListener('abort', aborted);
           video.removeEventListener('error', failed);
+          video.removeEventListener('ended', ended);
         };
         signal?.addEventListener('abort', aborted, { once: true });
         video.addEventListener('error', failed);
+        video.addEventListener('ended', ended);
         recorder.ondataavailable = ({ data }) => {
           if (settled || !data?.size) return;
           byteLength += data.size;

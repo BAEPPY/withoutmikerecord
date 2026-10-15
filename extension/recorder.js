@@ -3,6 +3,7 @@ import { createVideoCropper, validateVideoRegion, videoCaptureSize } from './vid
 import { exportGif } from './gif-export.js';
 import { inspectVideo, trimVideo } from './video-trim.js';
 import { selectMp4Tracks } from './mp4-tracks.js';
+import { getVideoQuality, qualitySuffix } from './video-quality.js';
 
 export const MAX_RECORDING_BYTES = 128 * 1024 * 1024;
 export const MAX_RECORDING_MS = 2 * 60 * 60 * 1000;
@@ -24,6 +25,7 @@ function initialState() {
     exportProgress: 0,
     exportFormat: null,
     exportContent: null,
+    exportQuality: null,
     tab: null,
     elapsedMs: 0,
     bytes: 0,
@@ -89,6 +91,7 @@ export class TabAudioRecorder {
     this.exportRange = null;
     this.videoExportContent = null;
     this.gifRange = null;
+    this.gifWhole = null;
     this.exportJob = null;
 
     this.state = initialState();
@@ -490,7 +493,7 @@ export class TabAudioRecorder {
       const filename = recordingFilename(this.state.tab?.title, this.wallNow());
       const url = this.url.createObjectURL(blob);
       this.originalBlob = blob;
-      this.state.result = { url, filename, mimeType, bytes: blob.size, durationSeconds, trimError,
+      this.state.result = { url, filename, mimeType, bytes: blob.size, durationSeconds, trimError, quality: 'original',
         kind: this.state.mode, ...(this.state.mode === 'video' ? videoDimensions : {}) };
       this.state.selection = durationSeconds ? { startSeconds: 0, endSeconds: durationSeconds } : null;
       this.state.bytes = blob.size;
@@ -523,13 +526,14 @@ export class TabAudioRecorder {
     this.emit();
   }
 
-  beginExport(status, { format, content }) {
+  beginExport(status, { format, content, quality = 'original' }) {
     const job = { controller: new AbortController() };
     this.exportJob = job;
     this.state.status = status;
     this.state.exportProgress = 0;
     this.state.exportFormat = format;
     this.state.exportContent = content;
+    this.state.exportQuality = quality;
     if (this.state.notice === EXPORT_CANCELLED_NOTICE) this.state.notice = null;
     this.emit();
     return job;
@@ -567,6 +571,7 @@ export class TabAudioRecorder {
     this.state.exportProgress = succeeded ? 1 : 0;
     this.state.exportFormat = null;
     this.state.exportContent = null;
+    this.state.exportQuality = null;
     this.emit();
   }
 
@@ -608,34 +613,42 @@ export class TabAudioRecorder {
     return kind;
   }
 
-  async prepareVideoExport({ content: requestedContent } = {}) {
+  async prepareVideoExport({ content: requestedContent, quality: requestedQuality } = {}) {
     const content = this.validateVideoContent(requestedContent);
+    const validatedQuality = getVideoQuality(requestedQuality).id;
+    const quality = content === 'audio' ? 'original' : validatedQuality;
     if (this.state.status !== 'ready' || this.state.result?.kind !== 'video' || !this.originalBlob) {
       throw new Error('화면 녹화를 마친 뒤 저장할 내용을 선택해 주세요.');
     }
     if (this.state.download.status === 'pending') throw new Error('진행 중인 저장을 먼저 마쳐 주세요.');
     // Both tracks already exist in the original. The controller saves result
     // directly for this choice, without another Blob or re-encoding pass.
-    if (content === 'both' || (this.state.videoExportResult &&
-        this.videoExportContent?.blob === this.originalBlob && this.videoExportContent.content === content)) {
+    if ((content === 'both' && quality === 'original') || (this.state.videoExportResult &&
+        this.videoExportContent?.blob === this.originalBlob && this.videoExportContent.content === content &&
+        this.videoExportContent.quality === quality)) {
       if (this.state.notice === EXPORT_CANCELLED_NOTICE) this.state.notice = null;
       this.emit();
       return;
     }
-    const job = this.beginExport('trimming', { format: 'mp4', content });
+    const job = this.beginExport('trimming', { format: 'mp4', content, quality });
     let succeeded = false;
     try {
-      const output = await this.runExport(job, (settings) => this.selectMp4Tracks(this.originalBlob, content, settings));
+      const output = await this.runExport(job, (settings) => quality === 'original'
+        ? this.selectMp4Tracks(this.originalBlob, content, settings)
+        // The decoder determines the endpoint; a stopwatch or stale metadata
+        // must not shorten the complete recording when reducing its quality.
+        : this.makeVideoClip({ startSeconds: 0 }, content, quality, job, settings));
       const kind = this.validateVideoOutput(output, content);
       const previousUrl = this.state.videoExportResult?.url;
       this.state.videoExportResult = {
         url: this.url.createObjectURL(output.blob),
-        filename: this.state.result.filename.replace(/\.mp4$/i, `${this.videoContentSuffix(content)}.mp4`),
+        filename: this.state.result.filename.replace(/\.mp4$/i,
+          `${this.videoContentSuffix(content)}${qualitySuffix(quality)}.mp4`),
         mimeType: output.mimeType || output.blob.type, bytes: output.blob.size,
-        durationSeconds: output.durationSeconds, content, kind,
+        durationSeconds: output.durationSeconds, content, kind, quality,
         ...(kind === 'video' ? { width: output.width, height: output.height } : {}),
       };
-      this.videoExportContent = { blob: this.originalBlob, content };
+      this.videoExportContent = { blob: this.originalBlob, content, quality };
       if (previousUrl) this.url.revokeObjectURL(previousUrl);
       succeeded = true;
     } finally {
@@ -643,40 +656,46 @@ export class TabAudioRecorder {
     }
   }
 
+  async makeVideoClip(selection, content, quality, job, settings) {
+    const trimWeight = content === 'both' ? 1 : 0.85;
+    const trimmed = await this.trimVideo(this.originalBlob, selection.startSeconds, selection.endSeconds, {
+      quality, signal: settings.signal, onProgress: (progress) => settings.onProgress(progress * trimWeight),
+    });
+    this.assertExportActive(job);
+    this.validateVideoOutput(trimmed);
+    if (content === 'both') return trimmed;
+    settings.onProgress(trimWeight);
+    this.assertExportActive(job);
+    const selected = await this.selectMp4Tracks(trimmed.blob, content, {
+      signal: settings.signal,
+      onProgress: (progress) => settings.onProgress(trimWeight + progress * (1 - trimWeight)),
+    });
+    return { ...selected, startSeconds: trimmed.startSeconds, endSeconds: trimmed.endSeconds };
+  }
+
   async prepareExport(message) {
     const selection = this.validateSelection(message);
     const isVideo = this.state.result.kind === 'video';
     const content = isVideo ? this.validateVideoContent(message.content) : null;
+    const validatedQuality = getVideoQuality(message.quality).id;
+    const quality = isVideo && content !== 'audio' ? validatedQuality : 'original';
     if (!isVideo && message.content !== undefined) {
       const audioContent = this.validateVideoContent(message.content);
       if (audioContent === 'video') throw new Error('오디오 녹음에는 저장할 영상이 없어요.');
     }
     this.state.selection = selection;
-    if (this.state.exportResult && this.cachedRange(this.exportRange, selection) && this.exportRange.content === content) {
+    if (this.state.exportResult && this.cachedRange(this.exportRange, selection) && this.exportRange.content === content &&
+        this.exportRange.quality === quality) {
       if (this.state.notice === EXPORT_CANCELLED_NOTICE) this.state.notice = null;
       this.emit();
       return;
     }
-    const job = this.beginExport('trimming', { format: 'mp4', content: isVideo ? content : 'audio' });
+    const job = this.beginExport('trimming', { format: 'mp4', content: isVideo ? content : 'audio', quality });
     let succeeded = false;
     try {
-      const clip = await this.runExport(job, async (settings) => {
-        if (!isVideo) return this.trimMp4(this.originalBlob, selection.startSeconds, selection.endSeconds);
-        const trimWeight = content === 'both' ? 1 : 0.85;
-        const trimmed = await this.trimVideo(this.originalBlob, selection.startSeconds, selection.endSeconds, {
-          signal: settings.signal, onProgress: (progress) => settings.onProgress(progress * trimWeight),
-        });
-        this.assertExportActive(job);
-        this.validateVideoOutput(trimmed);
-        if (content === 'both') return trimmed;
-        settings.onProgress(trimWeight);
-        this.assertExportActive(job);
-        const selected = await this.selectMp4Tracks(trimmed.blob, content, {
-          signal: settings.signal,
-          onProgress: (progress) => settings.onProgress(trimWeight + progress * (1 - trimWeight)),
-        });
-        return { ...selected, startSeconds: trimmed.startSeconds, endSeconds: trimmed.endSeconds };
-      });
+      const clip = await this.runExport(job, (settings) => isVideo
+        ? this.makeVideoClip(selection, content, quality, job, settings)
+        : this.trimMp4(this.originalBlob, selection.startSeconds, selection.endSeconds));
       if (!clip.blob?.size || !Number.isFinite(clip.durationSeconds) || clip.durationSeconds <= 0) {
         throw new Error('선택한 구간의 파일을 만들지 못했어요. 다른 구간으로 다시 시도해 주세요.');
       }
@@ -686,12 +705,12 @@ export class TabAudioRecorder {
       const previousUrl = this.state.exportResult?.url;
       this.state.exportResult = {
         url, filename: this.state.result.filename.replace(/\.mp4$/i,
-          `-clip-${suffix}${isVideo ? this.videoContentSuffix(content) : ''}.mp4`),
+          `-clip-${suffix}${isVideo ? this.videoContentSuffix(content) : ''}${qualitySuffix(quality)}.mp4`),
         mimeType: clip.mimeType || clip.blob.type || this.state.result.mimeType, bytes: clip.blob.size,
         durationSeconds: clip.durationSeconds, startSeconds: clip.startSeconds, endSeconds: clip.endSeconds,
-        kind, ...(isVideo ? { content } : {}), ...(kind === 'video' ? { width: clip.width, height: clip.height } : {}),
+        kind, quality, ...(isVideo ? { content } : {}), ...(kind === 'video' ? { width: clip.width, height: clip.height } : {}),
       };
-      this.exportRange = { ...selection, blob: this.originalBlob, content };
+      this.exportRange = { ...selection, blob: this.originalBlob, content, quality };
       if (previousUrl) this.url.revokeObjectURL(previousUrl);
       succeeded = true;
     } finally {
@@ -702,6 +721,7 @@ export class TabAudioRecorder {
 
   async prepareGif(message = {}) {
     const content = this.validateVideoContent(message.content);
+    const quality = getVideoQuality(message.quality).id;
     if (content === 'audio') throw new Error('GIF에는 소리를 저장할 수 없어요. 소리만 저장하려면 MP4를 선택해 주세요.');
     if (this.state.status !== 'ready' || this.state.result?.kind !== 'video' || !this.originalBlob) {
       throw new Error('화면 녹화를 마친 뒤 GIF로 저장할 수 있어요.');
@@ -711,29 +731,33 @@ export class TabAudioRecorder {
       ? this.validateSelection(message) : null;
     if (selection) this.state.selection = selection;
     const resultKey = selection ? 'rangeGifResult' : 'gifResult';
-    if (this.state[resultKey] && (!selection || this.cachedRange(this.gifRange, selection))) {
+    const cached = selection
+      ? this.cachedRange(this.gifRange, selection) && this.gifRange.quality === quality
+      : this.gifWhole?.blob === this.originalBlob && this.gifWhole.quality === quality;
+    if (this.state[resultKey] && cached) {
       if (this.state.notice === EXPORT_CANCELLED_NOTICE) this.state.notice = null;
       this.emit();
       return;
     }
-    const job = this.beginExport('exporting', { format: 'gif', content: 'video' });
+    const job = this.beginExport('exporting', { format: 'gif', content: 'video', quality });
     let succeeded = false;
     try {
       // Convert the selected range directly from the original MP4. Converting a
       // previously trimmed MP4 would repeat encoding and shift the time bounds.
       const output = await this.runExport(job, (settings) => this.exportGif(this.originalBlob, {
-        ...settings, ...(selection || {}),
+        ...settings, ...(selection || {}), quality,
       }));
       if (!output.blob?.size || output.blob.type !== 'image/gif') throw new Error('GIF 파일을 만들지 못했어요. MP4 원본은 저장할 수 있어요.');
-      const suffix = selection ? `-clip-${selection.startSeconds.toFixed(2)}-${selection.endSeconds.toFixed(2)}s.gif` : '.gif';
+      const suffix = `${selection ? `-clip-${selection.startSeconds.toFixed(2)}-${selection.endSeconds.toFixed(2)}s` : ''}${qualitySuffix(quality, 'gif')}.gif`;
       const previousUrl = this.state[resultKey]?.url;
       this.state[resultKey] = {
         url: this.url.createObjectURL(output.blob), filename: this.state.result.filename.replace(/\.mp4$/i, suffix),
         mimeType: 'image/gif', bytes: output.blob.size, width: output.width, height: output.height,
-        frameCount: output.frameCount, durationSeconds: output.durationSeconds, kind: 'video',
+        frameCount: output.frameCount, durationSeconds: output.durationSeconds, kind: 'video', quality,
         ...(selection ? { startSeconds: selection.startSeconds, endSeconds: selection.endSeconds } : {}),
       };
-      if (selection) this.gifRange = { ...selection, blob: this.originalBlob };
+      if (selection) this.gifRange = { ...selection, blob: this.originalBlob, quality };
+      else this.gifWhole = { blob: this.originalBlob, quality };
       if (previousUrl) this.url.revokeObjectURL(previousUrl);
       succeeded = true;
     } finally {
@@ -804,10 +828,12 @@ export class TabAudioRecorder {
     this.state.exportProgress = 0;
     this.state.exportFormat = null;
     this.state.exportContent = null;
+    this.state.exportQuality = null;
     this.originalBlob = null;
     this.exportRange = null;
     this.videoExportContent = null;
     this.gifRange = null;
+    this.gifWhole = null;
   }
 
   disposeMedia() {

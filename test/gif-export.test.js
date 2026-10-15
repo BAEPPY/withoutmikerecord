@@ -12,8 +12,8 @@ function fakeBrowser(t, options = {}) {
     constructor() {
       super();
       this.duration = options.duration ?? 2;
-      this.videoWidth = 64;
-      this.videoHeight = 32;
+      this.videoWidth = options.width ?? 64;
+      this.videoHeight = options.height ?? 32;
       this.readyState = 0;
       this.position = 0;
       this.src = '';
@@ -126,6 +126,57 @@ test('small sources stay native size and very short sources keep a frame', () =>
   assert.equal(plan.height, 9);
   assert.equal(plan.frameCount, 1);
   assert.deepEqual(plan.frames, [{ timeSeconds: 0, delayMs: 10 }]);
+});
+
+for (const [quality, width, height, frameCount] of [
+  ['balanced', 480, 270, 19], ['small', 320, 180, 15],
+]) {
+  test(`${quality} GIF reduces resolution and frame count while preserving duration`, () => {
+    const plan = createGifPlan(1920, 1080, 2.345, quality);
+    assert.equal(plan.width, width);
+    assert.equal(plan.height, height);
+    assert.equal(plan.frameCount, frameCount);
+    assert.equal(plan.frames[0].timeSeconds, 0);
+    assert.ok(plan.frames.at(-1).timeSeconds < 2.345);
+    assert.equal(plan.frames.reduce((sum, frame) => sum + frame.delayMs, 0), 2350);
+    assert.ok(plan.frames.every(frame => frame.delayMs > 0 && frame.delayMs % 10 === 0));
+    const portrait = createGifPlan(1080, 1920, 7200, quality);
+    assert.equal(portrait.width, height);
+    assert.equal(portrait.height, width);
+    assert.equal(portrait.frameCount, 600);
+    assert.equal(portrait.frames.reduce((sum, frame) => sum + frame.delayMs, 0), 7200000);
+    const tiny = createGifPlan(17, 9, 0.007, quality);
+    assert.equal(tiny.width, 17);
+    assert.equal(tiny.height, 9);
+    assert.equal(tiny.frameCount, 1);
+  });
+}
+
+test('unknown GIF quality is rejected before allocating browser resources', async () => {
+  for (const quality of ['high', null, 0, {}, false]) {
+    assert.throws(() => createGifPlan(320, 240, 1, quality), /화질/);
+    await assert.rejects(exportGif(new Blob(['source']), { quality }), /화질/);
+  }
+});
+
+test('selected low-quality GIF sends smaller frames to its worker with the exact selected duration', async (t) => {
+  const env = fakeBrowser(t, { width: 1920, height: 1080 });
+  const source = new Blob(['original MP4']);
+  const result = await exportGif(source, { startSeconds: 0.25, endSeconds: 1.5, quality: 'small' });
+  assert.equal(result.width, 320);
+  assert.equal(result.height, 180);
+  assert.equal(result.frameCount, 8);
+  const init = env.messages.find(message => message.type === 'INIT');
+  assert.equal(init.width, 320);
+  assert.equal(init.height, 180);
+  const frames = env.messages.filter(message => message.type === 'FRAME');
+  assert.equal(frames.length, 8);
+  assert.ok(frames.every(frame => frame.pixels.byteLength === 320 * 180 * 4));
+  assert.equal(frames.reduce((sum, frame) => sum + frame.delayMs, 0), 1250);
+  assert.equal(env.draws[0], 0.25);
+  assert.ok(env.draws.at(-1) < 1.5);
+  assert.equal(await source.text(), 'original MP4');
+  env.assertReleased();
 });
 
 test('invalid or unsupported media is rejected before encoding', async () => {

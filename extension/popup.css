@@ -76,6 +76,7 @@ h1 { font-size: 19px; font-weight: 750; letter-spacing: -.7px; }
 .save-format-field select { min-width: 175px; padding: 9px; border: 1px solid #40556d; border-radius: 7px; background: #101d2d; color: #edf4f8; font-size: 12px; }
 .save-format-field select:focus-visible { outline: 2px solid #c7fff3; outline-offset: 2px; }
 .save-format-field select:disabled { opacity: .45; }
+.save-quality-note { margin-top: -3px; color: var(--muted); font-size: 10px; line-height: 1.6; }
 .trim-editor { padding: 12px; border: 1px solid #304055; border-radius: 12px; background: #101d2d; }
 .trim-editor h2 { margin: 0 0 10px; font-size: 12px; font-weight: 650; }
 .trim-editor audio { display: block; width: 100%; height: 34px; margin-bottom: 6px; }

@@ -81,8 +81,14 @@ function harness(options = {}) {
       if (options.changeDuringStart) settings.onGeometryChanged();
       return crop;
     },
-    inspectMp4: () => { throw new Error('video must not use the audio-only parser'); },
-    trimMp4: () => { throw new Error('video must not use the audio-only trimmer'); },
+    inspectMp4: (blob) => {
+      if (options.inspectMp4) return options.inspectMp4(blob);
+      throw new Error('video must not use the audio-only parser');
+    },
+    trimMp4: (blob, start, end) => {
+      if (options.trimMp4) return options.trimMp4(blob, start, end);
+      throw new Error('video must not use the audio-only trimmer');
+    },
     inspectVideo: async (blob) => {
       inspections.push(blob);
       const output = options.inspectVideo ? await options.inspectVideo(blob)
@@ -92,9 +98,10 @@ function harness(options = {}) {
     },
     trimVideo: async (blob, startSeconds, endSeconds, settings) => {
       trims.push({ blob, startSeconds, endSeconds, settings });
+      const actualEnd = endSeconds ?? metadata.get(blob)?.durationSeconds ?? elapsed / 1000;
       const output = options.trimVideo ? await options.trimVideo(blob, startSeconds, endSeconds, settings)
         : { blob: new Blob(['trimmed-video'], { type: 'video/mp4;codecs=vp9,opus' }),
-        startSeconds, endSeconds, durationSeconds: endSeconds - startSeconds, width: 640, height: 360 };
+        startSeconds, endSeconds: actualEnd, durationSeconds: actualEnd - startSeconds, width: 640, height: 360 };
       if (!options.trimVideo) settings.onProgress(1);
       if (output.blob) metadata.set(output.blob, output);
       return output;
@@ -1111,4 +1118,293 @@ test('popup status restores the active export choice and clears it only after jo
       assert.equal(h.engine.getState().exportContent, null);
     }
   }
+});
+
+test('whole MP4 quality changes happen only at save time and use the decoder full duration', async () => {
+  const h = await recordedVideo();
+  const original = h.engine.getState().result;
+  assert.equal(original.quality, 'original');
+  assert.equal(h.recorders[0].settings.videoBitsPerSecond, 5_000_000);
+  const unchanged = await h.engine.handle({ type: 'PREPARE_VIDEO_EXPORT' });
+  assert.equal(unchanged.ok, true);
+  assert.equal(unchanged.state.videoExportResult, null);
+  assert.equal(h.trims.length, 0);
+
+  const balanced = await h.engine.handle({ type: 'PREPARE_VIDEO_EXPORT', content: 'both', quality: 'balanced' });
+  assert.equal(balanced.ok, true);
+  assert.equal(balanced.state.videoExportResult.quality, 'balanced');
+  assert.equal(balanced.state.videoExportResult.content, 'both');
+  assert.match(balanced.state.videoExportResult.filename, /-720p\.mp4$/);
+  assert.equal(h.trims[0].blob, h.urls[0]);
+  assert.equal(h.trims[0].startSeconds, 0);
+  assert.equal(h.trims[0].endSeconds, undefined, 'whole export must use actual decoded duration, not a state estimate');
+  assert.equal(h.trims[0].settings.quality, 'balanced');
+  assert.equal(h.trackSelections.length, 0);
+  assert.deepEqual(balanced.state.result, original);
+  const cached = await h.engine.handle({ type: 'PREPARE_VIDEO_EXPORT', content: 'both', quality: 'balanced' });
+  assert.deepEqual(cached.state.videoExportResult, balanced.state.videoExportResult);
+  assert.equal(h.trims.length, 1);
+
+  const silent = await h.engine.handle({ type: 'PREPARE_VIDEO_EXPORT', content: 'video', quality: 'balanced' });
+  assert.equal(silent.ok, true);
+  assert.equal(silent.state.videoExportResult.kind, 'video');
+  assert.match(silent.state.videoExportResult.filename, /-video-only-720p\.mp4$/);
+  assert.equal(h.trims.length, 2, 'different content must not reuse the both-track cached result');
+  assert.equal(await h.trackSelections[0].blob.text(), 'trimmed-video');
+  assert.notEqual(h.trackSelections[0].blob, h.urls[0]);
+  assert.equal(h.trackSelections[0].settings.signal, h.trims[1].settings.signal);
+  const small = await h.engine.handle({ type: 'PREPARE_VIDEO_EXPORT', content: 'video', quality: 'small' });
+  assert.equal(small.state.videoExportResult.quality, 'small');
+  assert.match(small.state.videoExportResult.filename, /-video-only-480p\.mp4$/);
+  assert.equal(h.trims.length, 3);
+  assert.equal(h.trims[2].settings.quality, 'small');
+  assert.equal(h.captures.length, 1, 'saving another quality never recaptures the tab');
+  assert.equal(h.recorders.length, 1);
+  const fullOriginal = await h.engine.handle({ type: 'PREPARE_VIDEO_EXPORT', content: 'both', quality: 'original' });
+  assert.equal(fullOriginal.ok, true);
+  assert.deepEqual(fullOriginal.state.result, original);
+  assert.equal(h.trims.length, 3, 'saving the original still bypasses conversion');
+});
+
+test('reduced whole-file quality still uses decoder duration when initial trim metadata was unavailable', async () => {
+  const h = await recordedVideo({ inspectVideo: async () => { throw new Error('initial metadata unavailable'); } });
+  assert.equal(h.engine.getState().result.durationSeconds, null);
+  const result = await h.engine.handle({ type: 'PREPARE_VIDEO_EXPORT', quality: 'small' });
+  assert.equal(result.ok, true);
+  assert.equal(result.state.videoExportResult.quality, 'small');
+  assert.equal(result.state.videoExportResult.durationSeconds, 1.5);
+  assert.equal(h.trims[0].endSeconds, undefined);
+  assert.equal(result.state.result.durationSeconds, null, 'the retained original metadata is not replaced');
+});
+
+test('MP4 range caches and filenames distinguish quality while preserving the requested timeline', async () => {
+  const h = await recordedVideo();
+  const selection = { startSeconds: 0.25, endSeconds: 1.25 };
+  const filenames = [];
+  for (const quality of ['original', 'balanced', 'small']) {
+    const result = await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'video', quality, ...selection });
+    assert.equal(result.ok, true);
+    assert.equal(result.state.exportResult.quality, quality);
+    assert.equal(result.state.exportResult.startSeconds, 0.25);
+    assert.equal(result.state.exportResult.endSeconds, 1.25);
+    assert.equal(h.trims.at(-1).settings.quality, quality);
+    filenames.push(result.state.exportResult.filename);
+    const cached = await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'video', quality, ...selection });
+    assert.deepEqual(cached.state.exportResult, result.state.exportResult);
+  }
+  assert.equal(h.trims.length, 3);
+  assert.equal(h.trackSelections.length, 3);
+  assert.equal(new Set(filenames).size, 3);
+  assert.match(filenames[0], /-clip-0\.25-1\.25s-video-only\.mp4$/);
+  assert.match(filenames[1], /-720p\.mp4$/);
+  assert.match(filenames[2], /-480p\.mp4$/);
+  assert.equal(h.revoked.length, 2);
+  assert.equal(h.engine.getState().result.quality, 'original');
+});
+
+test('audio-only MP4 exports ignore visual quality and reuse the unchanged audio output', async () => {
+  const h = await recordedVideo();
+  const fullOutputs = [];
+  for (const quality of ['small', 'balanced', 'original']) {
+    const full = await h.engine.handle({ type: 'PREPARE_VIDEO_EXPORT', content: 'audio', quality });
+    assert.equal(full.ok, true);
+    assert.equal(full.state.videoExportResult.quality, 'original');
+    assert.match(full.state.videoExportResult.filename, /-audio-only\.mp4$/);
+    fullOutputs.push(full.state.videoExportResult.url);
+  }
+  assert.equal(new Set(fullOutputs).size, 1);
+  assert.equal(h.trackSelections.length, 1);
+  assert.equal(h.trims.length, 0, 'whole audio remains lossless extraction of the original');
+  const selection = { startSeconds: 0, endSeconds: 1 };
+  const rangeOutputs = [];
+  for (const quality of ['small', 'balanced', 'original']) {
+    const range = await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'audio', quality, ...selection });
+    assert.equal(range.ok, true);
+    assert.equal(range.state.exportResult.quality, 'original');
+    assert.match(range.state.exportResult.filename, /-audio-only\.mp4$/);
+    rangeOutputs.push(range.state.exportResult.url);
+  }
+  assert.equal(new Set(rangeOutputs).size, 1);
+  assert.equal(h.trims.length, 1);
+  assert.equal(h.trims[0].settings.quality, 'original');
+  assert.equal(h.trackSelections.length, 2);
+});
+
+test('audio-only recordings keep their audio trimmer and do not use visual quality settings', async () => {
+  const audioTrims = [];
+  const h = harness({ types: ['audio/mp4;codecs=mp4a.40.2'],
+    inspectMp4: async () => ({ durationSeconds: 1.5 }),
+    trimMp4: async (blob, startSeconds, endSeconds) => {
+      audioTrims.push({ blob, startSeconds, endSeconds });
+      return { blob: new Blob(['audio-clip'], { type: 'audio/mp4' }),
+        durationSeconds: endSeconds - startSeconds, startSeconds, endSeconds };
+    },
+  });
+  await h.engine.handle({ type: 'START', tab, streamId: 'audio-stream' });
+  h.advance(1500);
+  await h.engine.handle({ type: 'STOP' });
+  const small = await h.engine.handle({ type: 'PREPARE_EXPORT', quality: 'small', startSeconds: 0, endSeconds: 1 });
+  const normal = await h.engine.handle({ type: 'PREPARE_EXPORT', startSeconds: 0, endSeconds: 1 });
+  assert.equal(small.ok, true);
+  assert.equal(small.state.exportResult.quality, 'original');
+  assert.deepEqual(normal.state.exportResult, small.state.exportResult);
+  assert.equal(audioTrims.length, 1);
+  assert.equal(h.trims.length, 0);
+  assert.equal(h.trackSelections.length, 0);
+  assert.equal(h.exports.length, 0);
+  assert.equal(h.states.filter((state) => state.status === 'trimming')[0].exportQuality, 'original');
+});
+
+test('whole and range GIF quality caches remain separate and always encode the original source', async () => {
+  const h = await recordedVideo();
+  const selection = { startSeconds: 0.2, endSeconds: 1.2 };
+  const original = h.engine.getState().result;
+  for (const ranged of [false, true]) {
+    const key = ranged ? 'rangeGifResult' : 'gifResult';
+    const args = ranged ? selection : {};
+    for (const quality of ['original', 'balanced', 'small']) {
+      const result = await h.engine.handle({ type: 'PREPARE_GIF', quality, ...args });
+      assert.equal(result.ok, true);
+      assert.equal(result.state[key].quality, quality);
+      assert.equal(h.exportSettings.at(-1).quality, quality);
+      assert.equal(h.exports.at(-1), h.urls[0]);
+      assert.match(result.state[key].filename,
+        quality === 'original' ? /(?:s|Z)\.gif$/ : quality === 'balanced' ? /-480px\.gif$/ : /-320px\.gif$/);
+      const cached = await h.engine.handle({ type: 'PREPARE_GIF', quality, ...args });
+      assert.deepEqual(cached.state[key], result.state[key]);
+      assert.deepEqual(cached.state.result, original);
+    }
+  }
+  assert.equal(h.exports.length, 6);
+  assert.equal(h.engine.getState().gifResult.quality, 'small');
+  assert.equal(h.engine.getState().rangeGifResult.quality, 'small');
+  const rangeUrl = h.engine.getState().rangeGifResult.url;
+  const changedWhole = await h.engine.handle({ type: 'PREPARE_GIF', quality: 'balanced' });
+  assert.equal(changedWhole.state.gifResult.quality, 'balanced');
+  assert.equal(changedWhole.state.rangeGifResult.url, rangeUrl);
+  assert.equal(h.trims.length, 0);
+  assert.equal(h.trackSelections.length, 0);
+});
+
+test('quality omission remains original and explicitly invalid quality cannot change selections or caches', async () => {
+  const h = await recordedVideo();
+  const commands = [
+    { type: 'PREPARE_VIDEO_EXPORT', content: 'both' },
+    { type: 'PREPARE_VIDEO_EXPORT', content: 'audio' },
+    { type: 'PREPARE_EXPORT', startSeconds: 0, endSeconds: 1 },
+    { type: 'PREPARE_GIF' },
+  ];
+  for (const command of commands) {
+    const first = await h.engine.handle(command);
+    const again = await h.engine.handle({ ...command, quality: 'original' });
+    assert.equal(first.ok, true);
+    assert.deepEqual(again.state.result, first.state.result);
+    assert.deepEqual(again.state.exportResult, first.state.exportResult);
+    assert.deepEqual(again.state.videoExportResult, first.state.videoExportResult);
+    assert.deepEqual(again.state.gifResult, first.state.gifResult);
+  }
+  const ready = h.engine.getState();
+  const calls = [h.trims.length, h.trackSelections.length, h.exports.length];
+  for (const quality of [null, '', 'low', 720, {}, ['small']]) {
+    for (const command of commands) {
+      const result = await h.engine.handle({ ...command, quality });
+      assert.equal(result.ok, false);
+      assert.deepEqual(result.state.selection, ready.selection);
+      assert.deepEqual(result.state.result, ready.result);
+      assert.deepEqual(result.state.exportResult, ready.exportResult);
+      assert.deepEqual(result.state.videoExportResult, ready.videoExportResult);
+      assert.deepEqual(result.state.gifResult, ready.gifResult);
+    }
+  }
+  assert.deepEqual([h.trims.length, h.trackSelections.length, h.exports.length], calls);
+});
+
+test('failed or cancelled quality changes retain the previous output and expose the active quality until cleanup', async () => {
+  const cases = [
+    { command: { type: 'PREPARE_VIDEO_EXPORT', content: 'both' }, key: 'videoExportResult' },
+    { command: { type: 'PREPARE_EXPORT', startSeconds: 0, endSeconds: 1 }, key: 'exportResult' },
+    { command: { type: 'PREPARE_GIF' }, key: 'gifResult' },
+    { command: { type: 'PREPARE_GIF', startSeconds: 0, endSeconds: 1 }, key: 'rangeGifResult' },
+  ];
+  for (const { command, key } of cases) {
+    for (const outcome of ['error', 'cancel']) {
+      let enter;
+      let finish;
+      let block = true;
+      const entered = new Promise((resolve) => { enter = resolve; });
+      const cleanup = new Promise((resolve) => { finish = resolve; });
+      const wait = async ({ quality, onProgress }) => {
+        if (quality !== 'balanced' || !block) return;
+        onProgress(0.4);
+        enter();
+        await cleanup;
+        if (outcome === 'error') throw new Error('quality conversion failed');
+      };
+      const h = await recordedVideo({
+        trimVideo: async (_blob, startSeconds, endSeconds, settings) => {
+          await wait(settings);
+          endSeconds ??= 1.5;
+          return { blob: new Blob(['reduced-video'], { type: 'video/mp4' }), width: 640, height: 360,
+            durationSeconds: endSeconds - startSeconds, startSeconds, endSeconds };
+        },
+        exportGif: async (_blob, settings) => {
+          await wait(settings);
+          return { blob: new Blob(['GIF89a'], { type: 'image/gif' }),
+            width: 320, height: 180, durationSeconds: 1, frameCount: 6 };
+        },
+      });
+      const previous = await h.engine.handle({ ...command, quality: 'small' });
+      assert.equal(previous.ok, true);
+      const pending = h.engine.handle({ ...command, quality: 'balanced' });
+      await entered;
+      const busy = await h.engine.handle({ type: 'STATUS' });
+      assert.equal(busy.state.exportQuality, 'balanced');
+      assert.deepEqual(busy.state[key], previous.state[key]);
+      if (outcome === 'cancel') {
+        const cancelling = await h.engine.handle({ type: 'CANCEL_EXPORT' });
+        assert.equal(cancelling.state.exportQuality, 'balanced');
+      }
+      finish();
+      const failed = await pending;
+      assert.equal(failed.ok, false);
+      assert.equal(failed.state.exportQuality, null);
+      assert.equal(failed.state.status, 'ready');
+      assert.deepEqual(failed.state[key], previous.state[key]);
+      assert.deepEqual(failed.state.result, previous.state.result);
+      assert.equal(h.urls.length, 2);
+      assert.equal(h.revoked.length, 0);
+      if (outcome === 'cancel') assert.equal(failed.cancelled, true);
+      const cached = await h.engine.handle({ ...command, quality: 'small' });
+      assert.deepEqual(cached.state[key], previous.state[key]);
+      block = false;
+      const retried = await h.engine.handle({ ...command, quality: 'balanced' });
+      assert.equal(retried.ok, true);
+      assert.equal(retried.state[key].quality, 'balanced');
+      assert.equal(retried.state.exportQuality, null);
+      assert.deepEqual(h.revoked, [previous.state[key].url]);
+    }
+  }
+});
+
+test('discard clears quality caches and releases every source and derived URL exactly once', async () => {
+  const h = await recordedVideo();
+  await h.engine.handle({ type: 'PREPARE_VIDEO_EXPORT', quality: 'small' });
+  await h.engine.handle({ type: 'PREPARE_EXPORT', quality: 'balanced', startSeconds: 0, endSeconds: 1 });
+  await h.engine.handle({ type: 'PREPARE_GIF', quality: 'small' });
+  await h.engine.handle({ type: 'PREPARE_GIF', quality: 'balanced', startSeconds: 0, endSeconds: 1 });
+  const originalBlob = h.urls[0];
+  const oldGif = h.engine.getState().gifResult.url;
+  const discarded = await h.engine.handle({ type: 'DISCARD' });
+  assert.equal(discarded.state.exportQuality, null);
+  assert.equal(h.revoked.length, 5);
+  assert.equal(new Set(h.revoked).size, 5);
+  await h.select();
+  await h.start();
+  h.advance(1000);
+  await h.engine.handle({ type: 'STOP' });
+  const next = await h.engine.handle({ type: 'PREPARE_GIF', quality: 'small' });
+  assert.equal(next.ok, true);
+  assert.notEqual(next.state.gifResult.url, oldGif);
+  assert.notEqual(h.exports.at(-1), originalBlob);
+  assert.equal(h.exports.length, 3);
 });

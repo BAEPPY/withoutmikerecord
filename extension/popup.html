@@ -116,6 +116,15 @@
               <option value="audio">소리만</option>
             </select>
           </div>
+          <div class="save-format-field" id="save-quality-field" hidden>
+            <label for="save-quality">저장 화질</label>
+            <select id="save-quality" aria-describedby="save-quality-note">
+              <option id="quality-original" value="original">원본 유지</option>
+              <option id="quality-balanced" value="balanced">보통 · 최대 720p</option>
+              <option id="quality-small" value="small">저용량 · 최대 480p</option>
+            </select>
+          </div>
+          <p class="save-quality-note" id="save-quality-note" hidden></p>
           <div class="range-save-row" id="range-save-row">
             <button class="button primary" id="save-range-button" type="button">선택 구간 저장 · .mp4</button>
             <button class="button secondary copy-button" id="copy-range-gif-button" type="button" hidden>선택 GIF 복사</button>

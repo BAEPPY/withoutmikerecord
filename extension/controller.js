@@ -1,8 +1,10 @@
+import { getVideoQuality } from './video-quality.js';
+
 export const EMPTY_STATE = {
   status: 'idle', tab: null, elapsedMs: 0, bytes: 0, level: 0,
   error: null, notice: null, result: null, selection: null, exportResult: null, videoExportResult: null,
   mode: 'audio', selectionToken: null, selectionUrl: null, videoSessionToken: null, gifResult: null, rangeGifResult: null, exportProgress: 0,
-  exportFormat: null, exportContent: null,
+  exportFormat: null, exportContent: null, exportQuality: null,
   download: { id: null, status: 'idle', error: null },
 };
 
@@ -251,7 +253,11 @@ export function createController(api, { onStateChange = () => {} } = {}) {
         throw new Error('화면 녹화를 마친 뒤 복사할 GIF 구간을 선택해 주세요.');
       }
       if (current.download.status === 'pending') throw new Error('파일 저장이 진행 중이에요.');
-      const prepared = await send('PREPARE_GIF', message.scope === 'range' ? selectedVideoRange(message, current) : {});
+      const quality = getVideoQuality(message.quality).id;
+      const prepared = await send('PREPARE_GIF', {
+        ...(message.scope === 'range' ? selectedVideoRange(message, current) : {}),
+        ...(message.quality === undefined ? {} : { quality }),
+      });
       if (!prepared.ok) return prepared;
       const output = message.scope === 'range' ? prepared.state.rangeGifResult : prepared.state.gifResult;
       if (!output?.url) throw new Error('복사할 GIF를 만들지 못했어요. 다시 시도해 주세요.');
@@ -261,8 +267,13 @@ export function createController(api, { onStateChange = () => {} } = {}) {
       if (current.status !== 'ready' || !current.result) throw new Error('녹음을 먼저 마쳐 주세요.');
       if (current.download.status === 'pending') throw new Error('파일 저장이 진행 중이에요.');
       const content = message.content === undefined ? 'both' : message.content;
+      let quality = 'original';
+      let qualityOptions = {};
       if (message.type === 'SAVE_VIDEO' || message.type === 'SAVE_VIDEO_RANGE') {
         if (current.result.kind !== 'video' || !['mp4', 'gif'].includes(message.format)) throw new Error('영상 저장 형식을 선택해 주세요.');
+        quality = getVideoQuality(message.quality).id;
+        if (message.format === 'mp4' && content === 'audio') quality = 'original';
+        qualityOptions = message.quality === undefined ? {} : { quality };
         if (message.format === 'mp4' && !['both', 'video', 'audio'].includes(content)) {
           throw new Error('저장할 구성을 선택해 주세요. 영상과 소리, 영상만, 소리만 중에서 고를 수 있어요.');
         }
@@ -271,14 +282,17 @@ export function createController(api, { onStateChange = () => {} } = {}) {
         }
         if (message.type === 'SAVE_VIDEO_RANGE') selectedVideoRange(message, current);
         if (message.format === 'gif') {
-          const prepared = await send('PREPARE_GIF', message.type === 'SAVE_VIDEO_RANGE' ? {
-            startSeconds: message.startSeconds, endSeconds: message.endSeconds,
-          } : {});
+          const prepared = await send('PREPARE_GIF', {
+            ...(message.type === 'SAVE_VIDEO_RANGE' ? {
+              startSeconds: message.startSeconds, endSeconds: message.endSeconds,
+            } : {}),
+            ...qualityOptions,
+          });
           if (!prepared.ok) return prepared;
           current = prepared.state;
         }
-        if (message.type === 'SAVE_VIDEO' && message.format === 'mp4' && content !== 'both') {
-          const prepared = await send('PREPARE_VIDEO_EXPORT', { content });
+        if (message.type === 'SAVE_VIDEO' && message.format === 'mp4' && (content !== 'both' || quality !== 'original')) {
+          const prepared = await send('PREPARE_VIDEO_EXPORT', { content, ...qualityOptions });
           if (!prepared.ok) return prepared;
           current = prepared.state;
         }
@@ -286,7 +300,7 @@ export function createController(api, { onStateChange = () => {} } = {}) {
       if (message.type === 'SAVE_RANGE' || (message.type === 'SAVE_VIDEO_RANGE' && message.format === 'mp4')) {
         const prepared = await send('PREPARE_EXPORT', {
           startSeconds: message.startSeconds, endSeconds: message.endSeconds,
-          ...(message.type === 'SAVE_VIDEO_RANGE' ? { content } : {}),
+          ...(message.type === 'SAVE_VIDEO_RANGE' ? { content, ...qualityOptions } : {}),
         });
         if (!prepared.ok) return prepared;
         current = prepared.state;
@@ -294,7 +308,7 @@ export function createController(api, { onStateChange = () => {} } = {}) {
       const output = message.type === 'SAVE_VIDEO_RANGE' ? message.format === 'gif' ? current.rangeGifResult : current.exportResult
         : message.type === 'SAVE_RANGE' ? current.exportResult
         : message.type === 'SAVE_VIDEO' && message.format === 'gif' ? current.gifResult
-        : message.type === 'SAVE_VIDEO' && content !== 'both' ? current.videoExportResult : current.result;
+        : message.type === 'SAVE_VIDEO' && (content !== 'both' || quality !== 'original') ? current.videoExportResult : current.result;
       if (!output?.url) throw new Error('저장할 파일을 준비하지 못했어요. 다시 시도해 주세요.');
       saveInFlight = true;
       try {

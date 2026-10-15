@@ -28,6 +28,12 @@ const ui = {
   saveFormatField: byId("save-format-field"),
   saveContent: byId("save-content"),
   saveContentField: byId("save-content-field"),
+  saveQuality: byId("save-quality"),
+  saveQualityField: byId("save-quality-field"),
+  saveQualityNote: byId("save-quality-note"),
+  qualityOriginal: byId("quality-original"),
+  qualityBalanced: byId("quality-balanced"),
+  qualitySmall: byId("quality-small"),
   saveRange: byId("save-range-button"),
   rangeSaveRow: byId("range-save-row"),
   saveRow: byId("save-row"),
@@ -73,6 +79,8 @@ const statusLabels = {
   ready: "녹음 완료",
   error: "녹음 확인 필요",
 };
+const QUALITY_STORAGE_KEY = "withoutmikerecord.saveQuality";
+const QUALITY_VALUES = ["original", "balanced", "small"];
 
 let state = { status: "loading", elapsedMs: 0, bytes: 0, level: 0 };
 let busy = false;
@@ -193,8 +201,26 @@ function saveContent() {
   return ["both", "video", "audio"].includes(ui.saveContent.value) ? ui.saveContent.value : "both";
 }
 
+function hasVisualOutput() {
+  return videoResult() && (ui.saveFormat.value === "gif" || saveContent() !== "audio");
+}
+
+function saveQuality() {
+  return QUALITY_VALUES.includes(ui.saveQuality.value) ? ui.saveQuality.value : "original";
+}
+
+function loadSaveQuality() {
+  try {
+    const saved = localStorage.getItem(QUALITY_STORAGE_KEY);
+    return QUALITY_VALUES.includes(saved) ? saved : "original";
+  } catch {
+    return "original";
+  }
+}
+
 function videoSaveOptions() {
-  return ui.saveFormat.value === "gif" ? { format: "gif" } : { format: "mp4", content: saveContent() };
+  if (ui.saveFormat.value === "gif") return { format: "gif", quality: saveQuality() };
+  return { format: "mp4", content: saveContent(), ...(hasVisualOutput() ? { quality: saveQuality() } : {}) };
 }
 
 function savedOutputLabel() {
@@ -280,9 +306,19 @@ function renderEditor() {
   ui.saveRange.hidden = false;
   ui.saveFormatField.hidden = !video;
   ui.saveContentField.hidden = !video || ui.saveFormat.value === "gif";
+  const visual = hasVisualOutput();
+  const gif = ui.saveFormat.value === "gif";
+  ui.saveQualityField.hidden = !visual;
+  ui.saveQualityNote.hidden = !visual;
+  setText(ui.qualityOriginal, gif ? "높음 · 최대 640px" : "원본 유지");
+  setText(ui.qualityBalanced, gif ? "보통 · 최대 480px" : "보통 · 최대 720p");
+  setText(ui.qualitySmall, gif ? "저용량 · 최대 320px" : "저용량 · 최대 480p");
+  setText(ui.saveQualityNote, gif
+    ? "크기는 긴 변 기준이며 원본보다 확대하지 않아요. 화질을 낮추면 대체로 파일이 작아져요."
+    : "원본보다 확대하지 않아요. 화질을 낮추면 대체로 파일이 작아지며, 소리 설정은 그대로예요.");
   const description = ui.saveFormat.value === "gif" ? "GIF는 소리 없이 저장해요."
     : `MP4는 ${{ both: "영상과 소리를 함께", video: "소리 없이 영상만", audio: "영상 없이 소리만" }[saveContent()]} 저장해요.`;
-  setText(ui.videoNote, `${description} 미리보기는 원본 영상과 소리예요. 변환은 선택 구간 길이만큼 시간이 걸릴 수 있어요.`);
+  setText(ui.videoNote, `${description} 미리보기는 원본 영상과 소리예요. 변환은 저장할 영상 길이만큼 시간이 걸릴 수 있어요.`);
   setText(ui.trimTitle, video ? "보고, 원하는 구간만 저장하기" : "듣고, 원하는 구간만 저장하기");
   if (previewEnd === null) setText(ui.previewRange, rangePreviewLabel());
   ui.previewPosition.setAttribute("aria-label", video ? "영상 현재 위치와 전체 길이" : "미리 듣기 현재 위치와 전체 길이");
@@ -351,6 +387,7 @@ function render() {
   if (exporting()) {
     if (["mp4", "gif"].includes(state.exportFormat)) ui.saveFormat.value = state.exportFormat;
     if (ui.saveFormat.value !== "gif" && ["both", "video", "audio"].includes(state.exportContent)) ui.saveContent.value = state.exportContent;
+    if (hasVisualOutput() && QUALITY_VALUES.includes(state.exportQuality)) ui.saveQuality.value = state.exportQuality;
   }
   const status = state.status;
   const recording = status === "recording";
@@ -401,6 +438,7 @@ function render() {
   ui.save.disabled = busy || pending || status !== "ready" || !state.result;
   ui.saveFormat.disabled = busy || pending || status !== "ready";
   ui.saveContent.disabled = busy || pending || status !== "ready";
+  ui.saveQuality.disabled = busy || pending || status !== "ready";
   ui.cancelExport.hidden = !exporting();
   ui.cancelExport.disabled = cancellingExport;
   setText(ui.cancelExport, cancellingExport ? "처리 중지 중…" : "처리 중지 · 원본 유지");
@@ -623,6 +661,17 @@ ui.save.addEventListener("click", () => {
 });
 ui.saveFormat.addEventListener("change", render);
 ui.saveContent.addEventListener("change", render);
+ui.saveQuality.addEventListener("change", () => {
+  ui.saveQuality.value = saveQuality();
+  try {
+    localStorage.setItem(QUALITY_STORAGE_KEY, ui.saveQuality.value);
+  } catch {
+    // The chosen quality still works when preference storage is unavailable.
+  }
+  copyStatus = "";
+  copyMode = "";
+  render();
+});
 ui.shortcutSettings.addEventListener("click", async () => {
   const scheme = /\bEdg\//.test(navigator.userAgent) ? "edge" : "chrome";
   const url = `${scheme}://extensions/shortcuts`;
@@ -651,7 +700,9 @@ async function copyGif(scope) {
   copyingScope = scope;
   copyStatus = "GIF를 준비하고 있어요. 복사가 끝날 때까지 이 창을 열어 두세요.";
   copyMode = "";
-  const payload = scope === "range" ? { scope, startSeconds: selection.startSeconds, endSeconds: selection.endSeconds } : { scope };
+  const payload = scope === "range"
+    ? { scope, quality: saveQuality(), startSeconds: selection.startSeconds, endSeconds: selection.endSeconds }
+    : { scope, quality: saveQuality() };
   const successful = await command("PREPARE_GIF_COPY", payload, async (response) => {
     if (typeof response.output?.url !== "string" || typeof globalThis.__withoutMikeCopyGif !== "function") {
       throw new Error("GIF 복사를 준비하지 못했어요. 팝업을 다시 열어 주세요.");
@@ -780,6 +831,7 @@ ui.discard.addEventListener("click", () => {
   void command("DISCARD");
 });
 
+ui.saveQuality.value = loadSaveQuality();
 render();
 void armShortcuts();
 void loadShortcutAssignments();

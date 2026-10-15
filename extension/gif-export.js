@@ -1,3 +1,5 @@
+import { getVideoQuality } from './video-quality.js';
+
 export const GIF_MAX_DIMENSION = 640;
 export const GIF_MAX_FRAMES = 600;
 export const GIF_MAX_FPS = 10;
@@ -29,7 +31,8 @@ function validateRange(startSeconds, endSeconds, durationSeconds) {
 }
 
 /** All frames span the complete recording; long recordings use a lower fps. */
-export function createGifPlan(sourceWidth, sourceHeight, durationSeconds) {
+export function createGifPlan(sourceWidth, sourceHeight, durationSeconds, quality = 'original') {
+  const profile = getVideoQuality(quality);
   if (!Number.isFinite(sourceWidth) || !Number.isFinite(sourceHeight)
       || sourceWidth < 1 || sourceHeight < 1) {
     throw new Error('녹화 영상의 크기를 확인할 수 없습니다.');
@@ -38,10 +41,10 @@ export function createGifPlan(sourceWidth, sourceHeight, durationSeconds) {
       || durationSeconds > GIF_MAX_DURATION_SECONDS) {
     throw new Error('GIF로 변환할 영상의 길이를 확인할 수 없거나 2시간을 넘었습니다.');
   }
-  const scale = Math.min(1, GIF_MAX_DIMENSION / Math.max(sourceWidth, sourceHeight));
+  const scale = Math.min(1, profile.gifMaxDimension / Math.max(sourceWidth, sourceHeight));
   const width = Math.max(1, Math.round(sourceWidth * scale));
   const height = Math.max(1, Math.round(sourceHeight * scale));
-  const frameCount = Math.min(GIF_MAX_FRAMES, Math.ceil(durationSeconds * GIF_MAX_FPS));
+  const frameCount = Math.min(GIF_MAX_FRAMES, Math.ceil(durationSeconds * profile.gifFrameRate));
   // GIF delay units are hundredths of a second. Distribute rounding so the
   // total animation duration differs from the source by at most 0.005 seconds.
   const totalCentiseconds = Math.max(1, Math.round(durationSeconds * 100));
@@ -139,9 +142,10 @@ function workerClient(worker, signal) {
  * is involved, and failures leave the caller's original MP4 untouched.
  */
 export async function exportGif(blob, {
-  startSeconds = 0, endSeconds, onProgress = () => {}, signal,
+  startSeconds = 0, endSeconds, onProgress = () => {}, signal, quality = 'original',
 } = {}) {
   checkAbort(signal);
+  getVideoQuality(quality);
   if (!(blob instanceof Blob) || !blob.size) throw new Error('GIF로 변환할 녹화 파일이 없습니다.');
   validateRange(startSeconds, endSeconds);
   const maxBytes = Math.min(GIF_MAX_OUTPUT_BYTES, GIF_MAX_COMBINED_BYTES - blob.size);
@@ -167,7 +171,7 @@ export async function exportGif(blob, {
     checkAbort(signal);
     validateRange(startSeconds, endSeconds, video.duration);
     const rangeEnd = endSeconds ?? video.duration;
-    const plan = createGifPlan(video.videoWidth, video.videoHeight, rangeEnd - startSeconds);
+    const plan = createGifPlan(video.videoWidth, video.videoHeight, rangeEnd - startSeconds, quality);
     canvas = document.createElement('canvas');
     canvas.width = plan.width;
     canvas.height = plan.height;

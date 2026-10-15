@@ -26,13 +26,23 @@ function harness(options = {}) {
   }
   class Video extends EventTarget {
     duration = 4;
-    videoWidth = 640;
-    videoHeight = 360;
+    videoWidth = options.width ?? 640;
+    videoHeight = options.height ?? 360;
     readyState = 2;
     _time = 0;
     frames = new Map();
+    listeners = new Map();
     src = '';
     constructor() { super(); videos.push(this); }
+    addEventListener(type, listener, settings) {
+      if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+      this.listeners.get(type).add(listener);
+      super.addEventListener(type, listener, settings);
+    }
+    removeEventListener(type, listener, settings) {
+      this.listeners.get(type)?.delete(listener);
+      super.removeEventListener(type, listener, settings);
+    }
     get currentTime() { return this._time; }
     set currentTime(value) {
       if (value > 1e6 && options.infiniteDuration) this.duration = 4;
@@ -43,6 +53,10 @@ function harness(options = {}) {
       if (!this.src) return;
       metadataEntered.resolve();
       this.duration = blobs.get(this.src) === original ? (options.infiniteDuration ? Infinity : 4) : 1.04;
+      if (blobs.get(this.src) !== original) {
+        this.videoWidth = canvases.at(-1)?.width ?? this.videoWidth;
+        this.videoHeight = canvases.at(-1)?.height ?? this.videoHeight;
+      }
       if (options.metadataHang) return;
       queueMicrotask(() => this.dispatchEvent(new Event('loadedmetadata')));
     }
@@ -77,6 +91,7 @@ function harness(options = {}) {
     state = 'inactive';
     constructor(stream, settings) {
       this.stream = stream;
+      this.settings = settings;
       this.mimeType = options.wrongMime ? 'video/webm' : settings.mimeType;
       recorders.push(this);
     }
@@ -96,7 +111,7 @@ function harness(options = {}) {
       const canvas = {
         draws: [],
         getContext() { return { drawImage: (...args) => this.draws.push(args) }; },
-        captureStream(fps) { assert.equal(fps, 30); return new Stream([new Track('video')]); },
+        captureStream(fps) { this.frameRate = fps; return new Stream([new Track('video')]); },
       };
       canvases.push(canvas);
       return canvas;
@@ -127,6 +142,7 @@ function assertReleased(h) {
   assert.ok(h.tracks.every((track) => track.stopped));
   assert.ok(h.contexts.every((context) => context.closed));
   assert.ok(h.videos.every((video) => video.src === '' && video.paused && video.frames.size === 0));
+  assert.ok(h.videos.every(video => [...video.listeners.values()].every(listeners => listeners.size === 0)));
   assert.ok(h.canvases.every((canvas) => canvas.width === 0 && canvas.height === 0));
   assert.deepEqual([...h.revoked].sort(), [...h.blobs.keys()].sort());
 }
@@ -156,6 +172,101 @@ test('full-range export reuses the original and creates no encoder or audio grap
   assertReleased(h);
 });
 
+test('whole export discovers its endpoint from media when end is omitted', async () => {
+  const h = harness({ infiniteDuration: true });
+  const result = await h.trimVideo(h.original, 0, undefined);
+  assert.equal(result.blob, h.original);
+  assert.equal(result.endSeconds, 4);
+  assert.equal(h.recorders.length, 0);
+  assertReleased(h);
+});
+
+for (const [quality, width, height, frameRate, bitrate] of [
+  ['balanced', 1280, 720, 24, 1800000],
+  ['small', 852, 480, 15, 600000],
+]) {
+  test(`whole ${quality} export re-encodes at a smaller size while retaining sound`, async () => {
+    const h = harness({ width: 1920, height: 1080 });
+    const job = h.trimVideo(h.original, 0, undefined, { quality });
+    await h.started;
+    assert.equal(h.canvases[0].width, width);
+    assert.equal(h.canvases[0].height, height);
+    assert.equal(h.canvases[0].frameRate, frameRate);
+    assert.equal(h.recorders[0].settings.videoBitsPerSecond, bitrate);
+    assert.equal(h.recorders[0].settings.audioBitsPerSecond, 128000);
+    assert.deepEqual(h.recorders[0].stream.getTracks().map(track => track.kind), ['video', 'audio']);
+    h.advance(4);
+    const result = await job;
+    assert.notEqual(result.blob, h.original);
+    assert.equal(result.startSeconds, 0);
+    assert.equal(result.endSeconds, 4);
+    assert.equal(result.width, width);
+    assert.equal(result.height, height);
+    assertReleased(h);
+  });
+}
+
+for (const [sourceWidth, sourceHeight, width, height] of [
+  [320, 180, 320, 180], [1080, 1920, 270, 480], [3840, 1080, 854, 240],
+]) {
+  test(`small range export fits ${sourceWidth}×${sourceHeight} without stretching or enlarging`, async () => {
+    const h = harness({ width: sourceWidth, height: sourceHeight });
+    const job = h.trimVideo(h.original, 1.25, 2.25, { quality: 'small' });
+    await h.started;
+    assert.equal(h.videos[0].currentTime, 1.25);
+    assert.equal(h.canvases[0].width, width);
+    assert.equal(h.canvases[0].height, height);
+    h.advance(1);
+    await job;
+    assertReleased(h);
+  });
+}
+
+test('invalid quality rejects before loading media or creating capture resources', async () => {
+  const h = harness();
+  for (const quality of ['high', null, 0, {}, false]) {
+    await assert.rejects(h.trimVideo(h.original, 0, undefined, { quality }), /화질/);
+  }
+  assert.equal(h.videos.length, 0);
+  assert.equal(h.recorders.length, 0);
+  assertReleased(h);
+});
+
+test('cancelling whole reduced-quality export keeps the original and releases capture resources', async () => {
+  const h = harness();
+  const controller = new AbortController();
+  const job = h.trimVideo(h.original, 0, undefined, { quality: 'small', signal: controller.signal });
+  await h.started;
+  controller.abort();
+  await assert.rejects(job, { name: 'AbortError' });
+  assert.equal(await h.original.text(), 'original-video');
+  assertReleased(h);
+});
+
+test('whole reduced-quality export stops at media end without waiting for timer or frame callbacks', async () => {
+  const h = harness();
+  const job = h.trimVideo(h.original, 0, undefined, { quality: 'small' });
+  await h.started;
+  h.videos[0]._time = 4;
+  h.videos[0].dispatchEvent(new Event('ended'));
+  assert.equal(h.recorders[0].state, 'inactive', 'the ended event must stop capture immediately');
+  const result = await job;
+  assert.equal(result.endSeconds, 4);
+  assert.equal(result.blob.size > 0, true);
+  assertReleased(h);
+});
+
+test('premature media end fails instead of silently returning an incomplete conversion', async () => {
+  const h = harness();
+  const job = h.trimVideo(h.original, 1, 3, { quality: 'balanced' });
+  await h.started;
+  h.videos[0]._time = 1.5;
+  h.videos[0].dispatchEvent(new Event('ended'));
+  await assert.rejects(job, /일찍 끝나/);
+  assert.equal(await h.original.text(), 'original-video');
+  assertReleased(h);
+});
+
 test('selected MP4 contains video and original audio with progress and actual output duration', async () => {
   const h = harness();
   const progress = [];
@@ -173,6 +284,8 @@ test('selected MP4 contains video and original audio with progress and actual ou
   assert.equal(result.startSeconds, 1.25);
   assert.equal(result.endSeconds, 2.25);
   assert.equal(result.width, 640);
+  assert.equal(h.canvases[0].frameRate, 30);
+  assert.equal(h.recorders[0].settings.videoBitsPerSecond, 5000000);
   assert.match(result.mimeType, /^video\/mp4/);
   assert.equal(await result.blob.text(), 'clipped-video');
   assert.equal(await h.original.text(), 'original-video');
