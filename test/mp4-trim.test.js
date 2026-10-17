@@ -45,6 +45,10 @@ for (const [filename, codec, channels] of [
     assert.ok(clip.durationSeconds >= 0.9 && clip.durationSeconds < 1.1);
     const output = await parse(clip.blob);
     const input = await parse(source);
+    // A decodable audio track can still be silent in players that honor the
+    // movie header's preferred playback volume.
+    assert.equal(output.file.moov.mvhd.volume, 1);
+    assert.equal(output.track.tkhd.volume, 1);
     assert.equal(output.info.tracks.length, 1);
     assert.equal(output.info.audioTracks[0].codec, codec);
     assert.equal(output.info.audioTracks[0].audio.channel_count, channels);

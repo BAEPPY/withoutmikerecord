@@ -54,7 +54,7 @@ export function createController(api, { onStateChange = () => {} } = {}) {
       api.action.setBadgeText({ text: labels[current.status] || '' }),
       api.action.setBadgeBackgroundColor({ color: current.status === 'recording' ? '#da4761' : '#247e76' }),
       api.action.setTitle({ title: current.status === 'recording'
-        ? current.mode === 'video' ? '화면과 소리 녹화 중 — 4로 종료' : '탭 소리 녹음 중 — 2로 종료'
+        ? current.mode === 'video' ? '화면과 소리 녹화 중 — 4로 종료' : '탭 소리 녹음 중 — 2·6으로 종료'
         : '탭 소리 · 화면 녹화' }),
       onStateChange(current),
     ]);
@@ -220,7 +220,7 @@ export function createController(api, { onStateChange = () => {} } = {}) {
     if (message.type === 'PAGE_STOP') {
       if (!Number.isInteger(message.targetTabId) || current.tab?.id !== message.targetTabId ||
           current.mode === 'video' || !['recording', 'paused'].includes(current.status)) {
-        throw new Error('이 탭에서 진행 중인 녹음이 없어요. 녹음한 탭에서 2를 눌러 주세요.');
+        throw new Error('이 탭에서 진행 중인 녹음이 없어요. 녹음한 탭에서 2 또는 6을 눌러 주세요.');
       }
       const reply = await send('STOP');
       await badge(reply.state);

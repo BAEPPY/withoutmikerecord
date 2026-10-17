@@ -155,6 +155,61 @@ test('failed starts preserve their error and never retry a normal unbound stop',
   assert.doesNotMatch(env.text('stop-label'), /대기/);
 });
 
+test('popup 5/6 and mixed audio aliases stop a pending audio start using its operation id', async () => {
+  for (const [startKey, stopKey] of [['5', '6'], ['1', '6'], ['5', '2']]) {
+    const env = await popup();
+    const start = deferred();
+    env.respond = (message) => message.type === 'START' ? start.promise
+      : Promise.resolve({ ok: true, state: { ...idle(), status: 'ready' } });
+    assert.ok(env.press(startKey).prevented);
+    assert.ok(env.press(stopKey).prevented);
+    env.press(stopKey === '6' ? '2' : '6');
+    assert.deepEqual(env.commands().map(({ type }) => type), ['START', 'STOP_PENDING']);
+    assert.equal(env.commands()[1].mode, 'audio');
+    assert.equal(env.commands()[1].operationId, env.commands()[0].operationId);
+    await settle();
+    start.resolve({ ok: true, state: { ...idle(), status: 'recording' } });
+    await settle();
+    assert.equal(env.elements.get('status-pill').dataset.status, 'ready');
+    assert.equal(env.commands().length, 2);
+  }
+});
+
+test('popup 6 stops audio and cannot stop video; accessible hints expose both audio key pairs', async () => {
+  const audio = await popup({ initialState: { ...idle(), status: 'recording' } });
+  assert.ok(audio.press('6').prevented);
+  await settle();
+  assert.deepEqual(audio.commands().map(({ type }) => type), ['STOP']);
+  assert.equal(audio.elements.get('stop-button').attributes['aria-keyshortcuts'], '2 6');
+  assert.match(audio.text('shortcut-status'), /5\/6.*1\/2/);
+  assert.match(html, /id="start-button"[^>]*aria-keyshortcuts="1 5"/);
+
+  const video = await popup({ initialState: { ...idle(), mode: 'video', status: 'recording' } });
+  assert.equal(video.press('6').prevented, undefined);
+  assert.deepEqual(video.commands(), []);
+  assert.equal(video.elements.get('stop-button').attributes['aria-keyshortcuts'], '4');
+});
+
+test('popup recognizes physical and numpad audio aliases while retaining NumLock navigation', async () => {
+  for (const [key, code] of [['5', 'Numpad5'], ['Unidentified', 'Numpad5'], [undefined, 'Numpad5'], ['(', 'Digit5']]) {
+    const env = await popup();
+    assert.ok(env.press(key, { code }).prevented);
+    await settle();
+    assert.deepEqual(env.commands().map(({ type }) => type), ['START']);
+  }
+  for (const [key, code] of [['6', 'Numpad6'], ['Unidentified', 'Numpad6'], [undefined, 'Numpad6'], ['-', 'Digit6']]) {
+    const env = await popup({ initialState: { ...idle(), status: 'recording' } });
+    assert.ok(env.press(key, { code }).prevented);
+    await settle();
+    assert.deepEqual(env.commands().map(({ type }) => type), ['STOP']);
+  }
+  for (const [key, code] of [['Clear', 'Numpad5'], ['ArrowRight', 'Numpad6']]) {
+    const env = await popup();
+    assert.equal(env.press(key, { code }).prevented, undefined);
+    assert.deepEqual(env.commands(), []);
+  }
+});
+
 test('an early stop reply takes precedence over a later arriving start reply', async () => {
   const env = await popup();
   const start = deferred();
@@ -177,6 +232,7 @@ test('popup sends bound video cancellation before selector state exists and stay
     ? opening.promise : Promise.resolve({ ok: true, state: idle() });
   env.press('3');
   assert.equal(env.press('2').prevented, undefined);
+  assert.equal(env.press('6').prevented, undefined);
   assert.ok(env.press('4').prevented);
   env.press('4');
   assert.deepEqual(env.commands().map(({ type }) => type), ['OPEN_VIDEO_SELECTOR', 'STOP_PENDING']);
@@ -226,11 +282,24 @@ test('queued stop still respects mode, repeat, IME, modifiers, and editable fiel
     { ctrlKey: true }, { altKey: true }, { metaKey: true }, { shiftKey: true },
     { defaultPrevented: true }, { target: input }]) {
     assert.equal(env.press('2', overrides).prevented, undefined);
+    assert.equal(env.press('6', overrides).prevented, undefined);
   }
   assert.equal(env.press('4').prevented, undefined);
   start.resolve({ ok: true, state: { ...idle(), status: 'recording' } });
   await settle();
   assert.deepEqual(env.commands().map(({ type }) => type), ['START']);
+});
+
+test('popup ignores guarded 5 starts while preserving typing and composition', async () => {
+  const env = await popup();
+  const input = new Element();
+  input.editable = true;
+  for (const overrides of [{ repeat: true }, { isComposing: true }, { keyCode: 229 },
+    { ctrlKey: true }, { altKey: true }, { metaKey: true }, { shiftKey: true },
+    { defaultPrevented: true }, { target: input }]) {
+    assert.equal(env.press('5', { code: 'Digit5', ...overrides }).prevented, undefined);
+  }
+  assert.deepEqual(env.commands(), []);
 });
 
 test('shows actual customized assignments and missing keys without promising suggested defaults', async () => {

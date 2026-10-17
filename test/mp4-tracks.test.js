@@ -71,6 +71,7 @@ for (const filename of ['av-fragmented.mp4', 'av-edited.mp4']) {
     const original = await fixture(filename);
     const result = await selectMp4Tracks(original, 'audio');
     const input = await parse(original), output = await parse(result.blob);
+    assert.equal(output.file.moov.mvhd.volume, 1, 'audio extraction must not set playback volume to zero');
     assert.equal(result.content, 'audio');
     assert.equal(result.kind, 'audio');
     assert.equal(result.mimeType, 'audio/mp4');
@@ -103,6 +104,7 @@ test('native Opus fragment gaps and encoder priming survive whole-track extracti
   const original = await fixture('chrome-opus-fragmented.mp4');
   const result = await selectMp4Tracks(original, 'audio');
   const input = await parse(original), output = await parse(result.blob);
+  assert.equal(output.file.moov.mvhd.volume, 1, 'Opus extraction must preserve audible movie volume');
   assert.ok(Math.abs(result.durationSeconds - 2.1890833333333333) < 0.000001);
   assertPacketsEqual(input, output, 'audio');
   const sourceTrack = track(input, 'audio'), outputTrack = track(output, 'audio');

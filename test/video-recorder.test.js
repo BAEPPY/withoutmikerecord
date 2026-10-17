@@ -16,6 +16,7 @@ function harness(options = {}) {
   const exportSettings = [];
   const inspections = [];
   const trims = [];
+  const audioTrims = [];
   const trackSelections = [];
   const states = [];
   const metadata = new WeakMap();
@@ -86,8 +87,11 @@ function harness(options = {}) {
       throw new Error('video must not use the audio-only parser');
     },
     trimMp4: (blob, start, end) => {
+      audioTrims.push({ blob, startSeconds: start, endSeconds: end });
       if (options.trimMp4) return options.trimMp4(blob, start, end);
-      throw new Error('video must not use the audio-only trimmer');
+      assert.match(blob.type, /^audio\/mp4/, 'audio trimming must only receive the separated audio track');
+      return { blob: new Blob(['trimmed-audio'], { type: blob.type }),
+        durationSeconds: end - start, startSeconds: start, endSeconds: end };
     },
     inspectVideo: async (blob) => {
       inspections.push(blob);
@@ -130,7 +134,7 @@ function harness(options = {}) {
     url: { createObjectURL: (blob) => { urls.push(blob); return `blob:test-${urls.length}`; }, revokeObjectURL: (url) => revoked.push(url) },
   });
   return { engine, audio, video, cropped, captures, crops, recorders, urls, revoked, exports, exportSettings, inspections, trims,
-    trackSelections, states,
+    audioTrims, trackSelections, states,
     advance: (ms) => { elapsed += ms; },
     select: () => engine.handle({ type: 'SELECT_VIDEO', tab, selectionToken: 'fresh-token' }),
     start: (overrides = {}) => engine.handle({ type: 'START', mode: 'video', tab, region,
@@ -839,7 +843,7 @@ test('whole video exports extract only the chosen track, reuse exact content, an
   assert.equal(h.urls.length, 3);
 });
 
-test('all three range contents trim the same timeline before selecting tracks and cache by content', async () => {
+test('range exports use the selected timeline and copy original audio without video encoding', async () => {
   const h = await recordedVideo();
   const selection = { startSeconds: 0.25, endSeconds: 1.25 };
   const files = [];
@@ -859,19 +863,21 @@ test('all three range contents trim the same timeline before selecting tracks an
     assert.deepEqual(cached.state.exportResult, output);
   }
   assert.equal(new Set(files).size, 3);
-  assert.equal(h.trims.length, 3, 'switching content must not reuse the other kind of clip');
+  assert.equal(h.trims.length, 2, 'audio-only clips never decode or re-encode the video');
+  assert.equal(h.audioTrims.length, 1);
   assert.equal(h.trackSelections.length, 2, 'both tracks need no extraction');
   for (const trim of h.trims) {
     assert.equal(trim.blob, h.urls[0]);
     assert.equal(trim.startSeconds, selection.startSeconds);
     assert.equal(trim.endSeconds, selection.endSeconds);
   }
-  for (const selected of h.trackSelections) {
-    assert.notEqual(selected.blob, h.urls[0]);
-    assert.equal(await selected.blob.text(), 'trimmed-video');
-  }
+  assert.notEqual(h.trackSelections[0].blob, h.urls[0]);
+  assert.equal(await h.trackSelections[0].blob.text(), 'trimmed-video');
+  assert.equal(h.trackSelections[1].blob, h.urls[0], 'audio packets come directly from the original recording');
+  assert.equal(await h.audioTrims[0].blob.text(), 'selected-audio');
+  assert.equal(h.audioTrims[0].startSeconds, selection.startSeconds);
+  assert.equal(h.audioTrims[0].endSeconds, selection.endSeconds);
   assert.equal(h.trackSelections[0].settings.signal, h.trims[1].settings.signal);
-  assert.equal(h.trackSelections[1].settings.signal, h.trims[2].settings.signal);
   assert.equal(h.engine.getState().result.kind, 'video');
 });
 
@@ -888,18 +894,145 @@ test('range progress stays monotonic through trimming and track extraction with 
       assert.equal(signal, trimSignal);
       assert.equal(h.engine.getState().exportProgress, 0.85, 'trim completion reserves progress for extraction');
       for (const value of [0, 0.5, 0.1, 1]) onProgress(value);
-      return { blob: new Blob(['audio'], { type: 'audio/mp4' }), kind: 'audio', content,
-        mimeType: 'audio/mp4', durationSeconds: 1 };
+      return { blob: new Blob(['video'], { type: 'video/mp4' }), kind: 'video', content,
+        mimeType: 'video/mp4', durationSeconds: 1, width: 640, height: 360 };
     },
   });
   const firstState = h.states.length;
-  const result = await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'audio', startSeconds: 0, endSeconds: 1 });
+  const result = await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'video', startSeconds: 0, endSeconds: 1 });
   assert.equal(result.ok, true);
   const progress = h.states.slice(firstState).map((state) => state.exportProgress);
   assert.equal(progress[0], 0);
   assert.equal(progress.at(-1), 1);
   assert.ok(progress.some((value) => value > 0.85 && value < 1));
   assert.deepEqual([...progress].sort((a, b) => a - b), progress);
+});
+
+test('audio-only ranges clamp to the audio endpoint and keep actual packet bounds separate from the UI selection', async () => {
+  const audio = new Blob(['original-aac-packets'], { type: 'audio/mp4;codecs=mp4a.40.2' });
+  const h = await recordedVideo({
+    trimVideo: () => { throw new Error('audio-only saving must not re-encode video or audio'); },
+    selectMp4Tracks: async (blob, content, { signal, onProgress }) => {
+      assert.equal(blob, h.urls[0]);
+      assert.equal(content, 'audio');
+      assert.equal(signal.aborted, false);
+      for (const value of [0, 0.5, 0.25, 1]) onProgress(value);
+      return { blob: audio, kind: 'audio', content, mimeType: audio.type, durationSeconds: 1.4 };
+    },
+    trimMp4: async (blob, startSeconds, endSeconds) => {
+      assert.equal(blob, audio, 'trim only the copied original audio');
+      assert.equal(startSeconds, 0.2);
+      assert.equal(endSeconds, 1.4, 'video ending after the audio must not invalidate a full-end range');
+      assert.equal(h.engine.getState().exportProgress, 0.85);
+      return { blob: new Blob(['copied-packets'], { type: audio.type }),
+        startSeconds: 0.192, endSeconds: 1.4, durationSeconds: 1.208 };
+    },
+  });
+  const original = h.engine.getState().result;
+  const selection = { startSeconds: 0.2, endSeconds: 1.5 };
+  const firstState = h.states.length;
+  const result = await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'audio', quality: 'small', ...selection });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.state.selection, selection);
+  assert.equal(result.state.exportResult.startSeconds, 0.192);
+  assert.equal(result.state.exportResult.endSeconds, 1.4);
+  assert.equal(result.state.exportResult.durationSeconds, 1.208);
+  assert.equal(result.state.exportResult.mimeType, audio.type);
+  assert.equal(result.state.exportResult.quality, 'original');
+  assert.match(result.state.exportResult.filename, /-clip-0\.20-1\.50s-audio-only\.mp4$/);
+  assert.deepEqual(result.state.result, original);
+  assert.equal(h.trims.length, 0);
+  assert.equal(h.recorders.length, 1, 'saving audio never starts another recorder');
+  assert.equal(h.urls.length, 2, 'the separated intermediate audio needs no Blob URL');
+  const progress = h.states.slice(firstState).map((state) => state.exportProgress);
+  assert.deepEqual([...progress].sort((a, b) => a - b), progress);
+  assert.equal(progress[0], 0);
+  assert.equal(progress.at(-1), 1);
+  const cached = await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'audio', quality: 'balanced', ...selection });
+  assert.deepEqual(cached.state.exportResult, result.state.exportResult);
+  assert.equal(h.audioTrims.length, 1, 'cache keys use the requested bounds and ignore visual quality');
+});
+
+test('a range after the audio endpoint fails without replacing the prior playable export', async () => {
+  const h = await recordedVideo({ selectMp4Tracks: async (_blob, content) => ({
+    blob: new Blob(['audio'], { type: 'audio/mp4' }), kind: 'audio', content,
+    mimeType: 'audio/mp4', durationSeconds: 1.4,
+  }) });
+  const first = await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'audio', startSeconds: 0, endSeconds: 1 });
+  assert.equal(first.ok, true);
+  const failed = await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'audio', startSeconds: 1.4, endSeconds: 1.5 });
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /선택한 구간에 저장할 소리가 없습니다/);
+  assert.deepEqual(failed.state.exportResult, first.state.exportResult);
+  assert.deepEqual(failed.state.result, first.state.result);
+  assert.deepEqual(failed.state.selection, { startSeconds: 1.4, endSeconds: 1.5 });
+  assert.equal(failed.state.status, 'ready');
+  assert.equal(failed.state.exportProgress, 0);
+  assert.equal(h.audioTrims.length, 1, 'a non-overlapping audio selection never reaches the trimmer');
+  assert.equal(h.trims.length, 0);
+  assert.equal(h.urls.length, 2);
+  assert.equal(h.revoked.length, 0);
+});
+
+test('failed audio packet trimming leaves the original and previous export intact', async () => {
+  for (const failure of ['throw', 'empty', 'wrong-type', 'zero-duration']) {
+    let fail = false;
+    const h = await recordedVideo({ trimMp4: async (_blob, startSeconds, endSeconds) => {
+      if (fail && failure === 'throw') throw new Error('audio packet trim failed');
+      return { blob: new Blob(fail && failure === 'empty' ? [] : ['audio'], {
+        type: fail && failure === 'wrong-type' ? 'video/mp4' : 'audio/mp4',
+      }), startSeconds, endSeconds, durationSeconds: fail && failure === 'zero-duration' ? 0 : endSeconds - startSeconds };
+    } });
+    const first = await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'audio', startSeconds: 0, endSeconds: 1 });
+    fail = true;
+    const failed = await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'audio', startSeconds: 0.25, endSeconds: 1.25 });
+    assert.equal(failed.ok, false, failure);
+    assert.equal(failed.state.status, 'ready');
+    assert.equal(failed.state.exportProgress, 0);
+    assert.deepEqual(failed.state.exportResult, first.state.exportResult);
+    assert.deepEqual(failed.state.result, first.state.result);
+    assert.equal(h.urls.length, 2);
+    assert.equal(h.revoked.length, 0);
+    assert.equal(h.trims.length, 0);
+    fail = false;
+    assert.equal((await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'audio', startSeconds: 0.25, endSeconds: 1.25 })).ok, true);
+    assert.equal(h.revoked.length, 1);
+  }
+});
+
+test('cancelling audio packet trimming discards late results and preserves the prior export', async () => {
+  for (const outcome of ['resolve', 'reject']) {
+    let finish;
+    let enter;
+    let calls = 0;
+    const entered = new Promise((resolve) => { enter = resolve; });
+    const cleanup = new Promise((resolve) => { finish = resolve; });
+    const h = await recordedVideo({ trimMp4: async (_blob, startSeconds, endSeconds) => {
+      if (++calls === 2) {
+        enter();
+        await cleanup;
+        if (outcome === 'reject') throw new Error('late audio trim failure');
+      }
+      return { blob: new Blob(['audio'], { type: 'audio/mp4' }), startSeconds, endSeconds,
+        durationSeconds: endSeconds - startSeconds };
+    } });
+    const first = await h.engine.handle({ type: 'PREPARE_EXPORT', content: 'audio', startSeconds: 0, endSeconds: 1 });
+    const pending = h.engine.handle({ type: 'PREPARE_EXPORT', content: 'audio', startSeconds: 0.25, endSeconds: 1.25 });
+    await entered;
+    const cancelled = await h.engine.handle({ type: 'CANCEL_EXPORT' });
+    assert.equal(cancelled.state.status, 'trimming', 'keep the job busy until its temporary data is released');
+    assert.equal(h.trackSelections.at(-1).settings.signal.aborted, true);
+    finish();
+    const result = await pending;
+    assert.equal(result.cancelled, true);
+    assert.equal(result.state.status, 'ready');
+    assert.equal(result.state.exportProgress, 0);
+    assert.deepEqual(result.state.result, first.state.result);
+    assert.deepEqual(result.state.exportResult, first.state.exportResult);
+    assert.equal(h.urls.length, 2);
+    assert.equal(h.revoked.length, 0);
+    assert.equal(h.trims.length, 0);
+  }
 });
 
 test('invalid content is rejected without changing selection and GIF cannot accept audio-only output', async () => {
@@ -1005,6 +1138,7 @@ test('track extraction cancellation keeps original and previous output until cle
       assert.deepEqual(cancelled.state.videoExportResult, previous.state.videoExportResult);
       assert.equal(h.urls.length, 2);
       assert.equal(h.revoked.length, 0);
+      assert.equal(h.audioTrims.length, 0, 'cancelling extraction prevents the audio packet-trimming phase');
     }
   }
 });
@@ -1021,7 +1155,7 @@ test('cancelling range trim prevents the track-extraction phase from starting', 
     return { blob: new Blob(['late-video'], { type: 'video/mp4' }), width: 640, height: 360,
       durationSeconds: 1, startSeconds, endSeconds };
   } });
-  const pending = h.engine.handle({ type: 'PREPARE_EXPORT', content: 'audio', startSeconds: 0, endSeconds: 1 });
+  const pending = h.engine.handle({ type: 'PREPARE_EXPORT', content: 'video', startSeconds: 0, endSeconds: 1 });
   await entered;
   await h.engine.handle({ type: 'CANCEL_EXPORT' });
   finish();
@@ -1225,8 +1359,8 @@ test('audio-only MP4 exports ignore visual quality and reuse the unchanged audio
     rangeOutputs.push(range.state.exportResult.url);
   }
   assert.equal(new Set(rangeOutputs).size, 1);
-  assert.equal(h.trims.length, 1);
-  assert.equal(h.trims[0].settings.quality, 'original');
+  assert.equal(h.trims.length, 0, 'audio-only ranges also bypass the video decoder and encoder');
+  assert.equal(h.audioTrims.length, 1);
   assert.equal(h.trackSelections.length, 2);
 });
 

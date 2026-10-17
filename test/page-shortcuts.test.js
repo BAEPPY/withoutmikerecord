@@ -227,6 +227,49 @@ test('a failed start drops the queued stop and clears it before the next start',
   assert.match(env.toast(), /녹음을 시작했어요/);
 });
 
+test('5/6 and mixed audio aliases queue exactly one matching stop while starting', async () => {
+  for (const [startKey, stopKey] of [['5', '6'], ['1', '6'], ['5', '2']]) {
+    const env = page();
+    const started = deferred();
+    env.respond = (message) => message.key === startKey
+      ? started.promise : { ok: true, state: { mode: 'audio', status: 'ready' } };
+    const start = env.press(startKey);
+    await env.press(stopKey).completion;
+    await env.press(stopKey === '6' ? '2' : '6').completion;
+    await env.press(startKey).completion;
+    assert.deepEqual(env.sent.map((message) => message.key), [startKey]);
+    started.resolve({ ok: true, state: { mode: 'audio', status: 'recording' } });
+    await start.completion;
+    assert.deepEqual(env.sent.map((message) => message.key), [startKey, stopKey]);
+    assert.match(env.toast(), /녹음을 마쳤어요/);
+  }
+});
+
+test('5 starts audio directly without selecting a region and advertises its stop keys', async () => {
+  const env = page();
+  await env.press('5').completion;
+  assert.deepEqual(env.sent, [{ target: 'background', type: 'PAGE_SHORTCUT', key: '5' }]);
+  assert.match(env.toast(), /소리만 녹음을 시작/);
+  assert.match(env.toast(), /2 또는 6/);
+  await env.press('6').completion;
+  assert.deepEqual(env.sent.map((message) => message.key), ['5', '6']);
+  assert.match(env.toast(), /녹음을 마쳤어요/);
+});
+
+test('a rejected 5 start sends queued 6 only when audio is already recording', async () => {
+  for (const mode of ['audio', 'video']) {
+    const env = page();
+    const started = deferred();
+    env.respond = (message) => message.key === '5'
+      ? started.promise : { ok: true, state: { mode: 'audio', status: 'ready' } };
+    const start = env.press('5');
+    await env.press('6').completion;
+    started.resolve({ ok: false, error: '이미 진행 중입니다.', state: { mode, status: 'recording' } });
+    await start.completion;
+    assert.deepEqual(env.sent.map((message) => message.key), mode === 'audio' ? ['5', '6'] : ['5']);
+  }
+});
+
 test('ignores repeats, synthetic keys, IME, modifiers, and editable controls', async () => {
   const env = page();
   for (const overrides of [
@@ -239,9 +282,11 @@ test('ignores repeats, synthetic keys, IME, modifiers, and editable controls', a
       composedPath: () => [element('div', { role })],
     })),
   ]) {
-    const { event, completion } = env.press('1', { code: 'Digit1', ...overrides });
-    await completion;
-    assert.equal(event.prevented, undefined);
+    for (const key of ['1', '5', '6']) {
+      const { event, completion } = env.press(key, { code: `Digit${key}`, ...overrides });
+      await completion;
+      assert.equal(event.prevented, undefined);
+    }
   }
   assert.equal(env.sent.length, 0);
 });
@@ -274,7 +319,7 @@ test('text, numeric, and date input controls retain their editing keys', async (
   const env = page();
   for (const type of ['text', 'number', 'search', 'email', 'password', 'tel', 'url', 'date', 'datetime-local', 'month', 'week', 'time']) {
     const input = Object.assign(element('input', { type }), { type });
-    for (const key of ['1', '2', '3', '4']) {
+    for (const key of ['1', '2', '3', '4', '5', '6']) {
       const { event, completion } = env.press(key, {
         code: `Digit${key}`, defaultPrevented: true, composedPath: () => [input],
       });
@@ -303,6 +348,8 @@ test('physical digit keys normalize differing keyboard layouts without changing 
     { key: 'é', code: 'Digit2', expected: '2' },
     { key: '"', code: 'Digit3', expected: '3' },
     { key: "'", code: 'Digit4', expected: '4' },
+    { key: '(', code: 'Digit5', expected: '5' },
+    { key: '-', code: 'Digit6', expected: '6' },
     { key: '2', code: 'Digit1', expected: '2' },
   ];
   for (const { key, code, expected } of cases) {
@@ -317,7 +364,7 @@ test('physical digit keys normalize differing keyboard layouts without changing 
 test('numpad digit keys work when numeric or unidentified but preserve NumLock-off navigation', async () => {
   const env = page();
   env.respond = async () => ({ ok: false, error: 'test response' });
-  for (const number of ['1', '2', '3', '4']) {
+  for (const number of ['1', '2', '3', '4', '5', '6']) {
     for (const key of [number, undefined, 'Unidentified']) {
       const { event, completion } = env.press(key, { code: `Numpad${number}` });
       await completion;
@@ -328,6 +375,7 @@ test('numpad digit keys work when numeric or unidentified but preserve NumLock-o
   const sentBeforeNavigation = env.sent.length;
   for (const [key, code] of [
     ['End', 'Numpad1'], ['ArrowDown', 'Numpad2'], ['PageDown', 'Numpad3'], ['ArrowLeft', 'Numpad4'],
+    ['Clear', 'Numpad5'], ['ArrowRight', 'Numpad6'],
   ]) {
     const { event, completion } = env.press(key, { code });
     await completion;
@@ -777,7 +825,7 @@ test('4 before the scheduled selector launch prevents a later BEGIN', async () =
   assert.deepEqual(env.selections, []);
 });
 
-for (const key of ['1', '2', '3']) {
+for (const key of ['1', '2', '3', '5', '6']) {
   test(`failed ${key} during video recording keeps errors out of captured frames until 4 stops recording`, async () => {
     const env = page();
     // The video can have started via a browser command or popup; even the

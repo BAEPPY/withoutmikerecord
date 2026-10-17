@@ -119,6 +119,9 @@ export async function trimMp4(blob, startSeconds, endSeconds) {
 
   const output = createFile();
   output.init({ timescale, duration: mediaDuration, brands: ['isom', 'iso6', 'mp41'] });
+  // MP4Box 2.4.1 initializes this as fixed-point 256, but its writer shifts
+  // again and overflows to zero. Use unity so players do not mute the movie.
+  output.moov.mvhd.volume = 1;
   const id = output.addTrack({
     type: entry.type,
     hdlr: 'soun',

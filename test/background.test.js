@@ -73,7 +73,8 @@ async function harness() {
 
 test('top-level page keys use the sender tab, ignoring a forged capture target in the payload', async () => {
   const h = await harness();
-  for (const [key, type] of [['1', 'START'], ['2', 'PAGE_STOP'], ['3', 'BEGIN_VIDEO'], ['4', 'STOP_VIDEO']]) {
+  for (const [key, type] of [['1', 'START'], ['2', 'PAGE_STOP'], ['3', 'BEGIN_VIDEO'], ['4', 'STOP_VIDEO'],
+    ['5', 'START'], ['6', 'PAGE_STOP']]) {
     const response = await h.dispatch({
       target: 'background', type: 'PAGE_SHORTCUT', key,
       targetTabId: 88, expectedTabId: 88, streamId: 'untrusted-stream',
@@ -113,7 +114,7 @@ test('page shortcuts reject other extensions, child frames, missing tabs, and un
   ]) {
     await h.dispatch(valid, sender);
   }
-  await h.dispatch({ ...valid, key: '5' }, h.page);
+  await h.dispatch({ ...valid, key: '7' }, h.page);
   await h.dispatch({ ...valid, key: null }, h.page);
   await h.dispatch({ ...valid, target: 'offscreen' }, h.page);
   assert.deepEqual(h.calls, []);

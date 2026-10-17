@@ -432,8 +432,8 @@ function render() {
   setText(ui.pause, paused ? "녹음 재개" : "일시 정지");
   ui.stop.disabled = Boolean(queuedStop) || !canStop(mode);
   setText(ui.stopLabel, queuedStop ? "종료 요청 대기 중…" : selecting || activeCommand === "OPEN_VIDEO_SELECTOR" ? "영역 선택 취소" : video ? "영상 끝내기" : "녹음 끝내기");
-  ui.stop.setAttribute("aria-keyshortcuts", video ? "4" : "2");
-  ui.stop.title = selecting ? "영역 선택 취소 (키보드 4)" : video ? "영상 끝내기 (키보드 4)" : "녹음 끝내기 (키보드 2)";
+  ui.stop.setAttribute("aria-keyshortcuts", video ? "4" : "2 6");
+  ui.stop.title = selecting ? "영역 선택 취소 (키보드 4)" : video ? "영상 끝내기 (키보드 4)" : "소리만 녹음 끝내기 (키보드 2 또는 6)";
   ui.readyControls.hidden = !ready;
   ui.save.disabled = busy || pending || status !== "ready" || !state.result;
   ui.saveFormat.disabled = busy || pending || status !== "ready";
@@ -480,7 +480,7 @@ async function armShortcuts() {
   ui.shortcutStatus.dataset.status = shortcutConnection;
   ui.shortcutStatus.title = shortcutDetail;
   setText(ui.shortcutStatus, shortcutConnection === "connected"
-    ? "이 탭에 연결됨 · 창을 닫아도 1/2 소리 · 3/4 영상"
+    ? "이 탭에 연결됨 · 창을 닫아도 5/6 소리만 (1/2도 가능) · 3/4 영상"
     : "페이지 숫자키 연결 불가 · 아래 등록 상태와 단축키 설정을 확인해 주세요.");
 }
 
@@ -640,18 +640,27 @@ document.addEventListener("keydown", (event) => {
   const target = event.target;
   if (target instanceof Element && (target.isContentEditable
     || target.closest('input, textarea, select, audio, video, [role="textbox"], [role="spinbutton"]'))) return;
-  const stopMode = event.key === "2" ? "audio" : event.key === "4" ? "video" : null;
+  const key = popupShortcutKey(event);
+  const stopMode = key === "2" || key === "6" ? "audio" : key === "4" ? "video" : null;
   if (stopMode && stopCapture(stopMode)) {
     event.preventDefault();
     return;
   }
   if (busy) return;
-  const button = event.key === "1" && ["idle", "error"].includes(state.status) ? ui.start
-    : event.key === "3" && ["idle", "error"].includes(state.status) ? ui.startVideo : null;
+  const button = (key === "1" || key === "5") && ["idle", "error"].includes(state.status) ? ui.start
+    : key === "3" && ["idle", "error"].includes(state.status) ? ui.startVideo : null;
   if (!button || button.disabled || button.closest("[hidden]")) return;
   event.preventDefault();
   button.click();
 });
+
+function popupShortcutKey(event) {
+  if (/^[1-6]$/.test(event.key || "")) return event.key;
+  const digit = /^Digit([1-6])$/.exec(event.code || "");
+  if (digit) return digit[1];
+  if (!event.key || event.key === "Unidentified") return /^Numpad([1-6])$/.exec(event.code || "")?.[1];
+  return null;
+}
 ui.save.addEventListener("click", () => {
   if (state.status === "ready" && state.result && state.download?.status !== "pending") {
     stopRangePreview();

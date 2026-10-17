@@ -2,7 +2,7 @@
   'use strict';
 
   const installationKey = '__withoutMikePageShortcuts';
-  const installationVersion = 3;
+  const installationVersion = 4;
   const previous = globalThis[installationKey];
   try {
     if (previous?.version === installationVersion && previous.isAlive?.()) {
@@ -13,7 +13,7 @@
   } catch { /* An older extension context may already be invalidated. */ }
 
   let pendingKey = null;
-  let stopAfterStart = false;
+  let stopAfterStart = null;
   let cancelVideoRequested = false;
   let scheduledVideoStart = null;
   let videoRecording = false;
@@ -432,7 +432,7 @@
       return;
     }
 
-    // Once enabled, these four keys control the recorder instead of the player's
+    // Once enabled, these six keys control the recorder instead of the player's
     // numeric seek shortcuts. Native play controls remain usable and focused.
     event.preventDefault();
     event.stopImmediatePropagation();
@@ -440,13 +440,16 @@
   }
 
   function shortcutKey(event) {
-    if (/^[1-4]$/.test(event.key || '')) return event.key;
-    const digit = /^Digit([1-4])$/.exec(event.code || '');
+    if (/^[1-6]$/.test(event.key || '')) return event.key;
+    const digit = /^Digit([1-6])$/.exec(event.code || '');
     if (digit) return digit[1];
-    // With Num Lock off, Numpad1/2/3/4 are navigation keys, not recorder keys.
-    if (!event.key || event.key === 'Unidentified') return /^Numpad([1-4])$/.exec(event.code || '')?.[1];
+    // With Num Lock off, numpad navigation keys keep their normal behavior.
+    if (!event.key || event.key === 'Unidentified') return /^Numpad([1-6])$/.exec(event.code || '')?.[1];
     return null;
   }
+
+  function isAudioStart(key) { return key === '1' || key === '5'; }
+  function isAudioStop(key) { return key === '2' || key === '6'; }
 
   async function performShortcut(key) {
     const reconnectHint = '확장 프로그램을 다시 연결하려면 페이지를 새로고침한 뒤 확장 아이콘을 눌러 주세요.';
@@ -457,8 +460,8 @@
     }
     if (pendingKey !== null) {
       // Capture permission and media setup may outlast a short key sequence.
-      // Remember one stop so pressing 1 then 2 cannot leave recording running.
-      if (pendingKey === '1' && key === '2') stopAfterStart = true;
+      // Remember one stop, including mixed aliases such as 1 then 6.
+      if (isAudioStart(pendingKey) && isAudioStop(key)) stopAfterStart ||= key;
       if (pendingKey === '3' && key === '4') cancelVideoSelection();
       return;
     }
@@ -472,26 +475,26 @@
       const reply = await send({
         target: 'background', type: 'PAGE_SHORTCUT', key,
       });
-      const stopExistingAudio = key === '1' && stopAfterStart && reply?.state?.mode === 'audio'
+      const stopExistingAudio = isAudioStart(key) && stopAfterStart && reply?.state?.mode === 'audio'
         && ['starting', 'recording', 'paused'].includes(reply.state.status);
       if (!reply?.ok && !stopExistingAudio) throw new Error(reply?.error || reconnectHint);
-      if (key === '1' || key === '4') {
+      if (isAudioStart(key) || key === '4') {
         videoRecording = false;
         removeVideoViewportWatch();
         restoreVideoControls();
       }
-      if (pendingKey === '1' && stopAfterStart) {
-        stopAfterStart = false;
-        pendingKey = '2';
+      if (isAudioStart(pendingKey) && stopAfterStart) {
+        pendingKey = stopAfterStart;
+        stopAfterStart = null;
         const stopped = await send({
-          target: 'background', type: 'PAGE_SHORTCUT', key: '2',
+          target: 'background', type: 'PAGE_SHORTCUT', key: pendingKey,
         });
         if (!stopped?.ok) throw new Error(stopped?.error || reconnectHint);
       }
       showToast(pendingKey === '4'
         ? '화면 녹화를 마쳤어요. 확장 아이콘을 눌러 파일을 저장해 주세요.'
-        : pendingKey === '1'
-        ? '녹음을 시작했어요. 2를 누르면 중지합니다.'
+        : isAudioStart(pendingKey)
+        ? '소리만 녹음을 시작했어요. 2 또는 6을 누르면 중지합니다.'
         : '녹음을 마쳤어요. 확장 아이콘을 눌러 파일을 저장해 주세요.');
     } catch (error) {
       if (!runtimeAvailable() || /extension context invalidated/i.test(error?.message || '')) {
@@ -502,7 +505,7 @@
       }
     } finally {
       pendingKey = null;
-      stopAfterStart = false;
+      stopAfterStart = null;
       cancelVideoRequested = false;
     }
   }

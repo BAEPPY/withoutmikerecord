@@ -673,6 +673,26 @@ export class TabAudioRecorder {
     return { ...selected, startSeconds: trimmed.startSeconds, endSeconds: trimmed.endSeconds };
   }
 
+  async makeAudioClip(selection, job, settings) {
+    // Extract and trim the original audio packets directly. This needs no video
+    // playback, AudioContext, or re-encoding of the recorded sound.
+    const audio = await this.selectMp4Tracks(this.originalBlob, 'audio', {
+      signal: settings.signal, onProgress: (progress) => settings.onProgress(progress * 0.85),
+    });
+    this.assertExportActive(job);
+    this.validateVideoOutput(audio, 'audio');
+    const endSeconds = Math.min(selection.endSeconds, audio.durationSeconds);
+    if (selection.startSeconds >= endSeconds) {
+      throw new Error('선택한 구간에 저장할 소리가 없습니다. 소리가 있는 구간을 선택해 주세요.');
+    }
+    settings.onProgress(0.85);
+    this.assertExportActive(job);
+    const clipped = await this.trimMp4(audio.blob, selection.startSeconds, endSeconds);
+    this.assertExportActive(job);
+    settings.onProgress(1);
+    return { ...clipped, kind: 'audio', content: 'audio', mimeType: clipped.blob?.type };
+  }
+
   async prepareExport(message) {
     const selection = this.validateSelection(message);
     const isVideo = this.state.result.kind === 'video';
@@ -693,9 +713,11 @@ export class TabAudioRecorder {
     const job = this.beginExport('trimming', { format: 'mp4', content: isVideo ? content : 'audio', quality });
     let succeeded = false;
     try {
-      const clip = await this.runExport(job, (settings) => isVideo
-        ? this.makeVideoClip(selection, content, quality, job, settings)
-        : this.trimMp4(this.originalBlob, selection.startSeconds, selection.endSeconds));
+      const clip = await this.runExport(job, (settings) => {
+        if (!isVideo) return this.trimMp4(this.originalBlob, selection.startSeconds, selection.endSeconds);
+        if (content === 'audio') return this.makeAudioClip(selection, job, settings);
+        return this.makeVideoClip(selection, content, quality, job, settings);
+      });
       if (!clip.blob?.size || !Number.isFinite(clip.durationSeconds) || clip.durationSeconds <= 0) {
         throw new Error('선택한 구간의 파일을 만들지 못했어요. 다른 구간으로 다시 시도해 주세요.');
       }

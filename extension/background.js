@@ -32,8 +32,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.tab) {
     if (sender.frameId !== 0 || !Number.isInteger(sender.tab.id)) return;
     let command;
-    if (message.type === 'PAGE_SHORTCUT' && ['1', '2', '3', '4'].includes(message.key)) {
-      command = { type: { 1: 'START', 2: 'PAGE_STOP', 3: 'BEGIN_VIDEO', 4: 'STOP_VIDEO' }[message.key] };
+    if (message.type === 'PAGE_SHORTCUT' && ['1', '2', '3', '4', '5', '6'].includes(message.key)) {
+      command = { type: { 1: 'START', 2: 'PAGE_STOP', 3: 'BEGIN_VIDEO', 4: 'STOP_VIDEO', 5: 'START', 6: 'PAGE_STOP' }[message.key] };
     } else if (message.type === 'VIDEO_REGION_SELECTED' && typeof message.selectionToken === 'string') {
       command = { type: 'START_VIDEO', region: message.region, selectionToken: message.selectionToken };
     } else if (message.type === 'CANCEL_VIDEO_SELECTION' && typeof message.selectionToken === 'string') {

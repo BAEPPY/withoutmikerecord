@@ -2,8 +2,10 @@
 Requires Python Playwright, Chromium, ffmpeg and ffprobe.
 """
 import asyncio
+import array
 import functools
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -15,6 +17,17 @@ from playwright.async_api import async_playwright
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / 'dist'
 OUTPUT.mkdir(exist_ok=True)
+
+def decoded_audio(path, start=0, end=None):
+    """Decode the actual downloadable bytes; container validity alone misses silence."""
+    pcm = array.array('f', subprocess.check_output([
+        'ffmpeg', '-v', 'error', '-i', str(path), '-ac', '1', '-ar', '48000', '-f', 'f32le', '-']))
+    segment = pcm[int(start * 48000):None if end is None else int(end * 48000)]
+    assert segment, {'file': str(path), 'start': start, 'end': end}
+    rms = math.sqrt(sum(value * value for value in segment) / len(segment))
+    crossings = sum(segment[i - 1] < 0 <= segment[i] for i in range(1, len(segment)))
+    return {'rms': rms, 'peak': max(abs(value) for value in segment),
+            'frequency': crossings * 48000 / len(segment), 'seconds': len(pcm) / 48000}
 
 class QuietHandler(SimpleHTTPRequestHandler):
     def log_message(self, *args):
@@ -31,6 +44,13 @@ async def main():
         context = await browser.new_context(viewport={'width': 380, 'height': 620}, device_scale_factor=2)
         owner = await context.new_page()
         await owner.goto(f'http://127.0.0.1:{server.server_port}/')
+        codecs = await owner.evaluate('''() => {
+          const audio = document.createElement('audio');
+          return ['audio/mp4;codecs=mp4a.40.2','audio/mp4;codecs=opus','audio/mp4',
+            'video/mp4;codecs=mp4a.40.2','video/mp4;codecs=opus','video/mp4'].map(type=>({
+              type, record: MediaRecorder.isTypeSupported(type), play: audio.canPlayType(type)}));
+        }''')
+        print('Native codec support', json.dumps(codecs), flush=True)
         await owner.evaluate('''async () => {
           const {TabAudioRecorder} = await import('./recorder.js');
           const {createController} = await import('./controller.js');
@@ -39,6 +59,7 @@ async def main():
           window.syntheticTone = oscillator;
           oscillator.frequency.value = 440;
           const gain = sourceContext.createGain(); gain.gain.value = 0.2;
+          window.syntheticGain = gain;
           const output = sourceContext.createMediaStreamDestination();
           oscillator.connect(gain).connect(output); oscillator.start();
           await sourceContext.resume();
@@ -63,8 +84,8 @@ async def main():
                 if (message.target === 'offscreen') return recorder.handle(message);
                 if (message.type !== 'PAGE_SHORTCUT') throw Error('Unexpected page request');
                 pageCommands.push(message);
-                if (message.key === '1') syntheticTone.frequency.setValueAtTime(880, sourceContext.currentTime + 0.6);
-                return controller.handle({type:message.key === '1' ? 'START' : 'PAGE_STOP',targetTabId:1});
+                if (['1','5'].includes(message.key)) syntheticTone.frequency.setValueAtTime(880, sourceContext.currentTime + 0.6);
+                return controller.handle({type:['1','5'].includes(message.key) ? 'START' : 'PAGE_STOP',targetTabId:1});
               }},
             tabs: {query:async()=>[sourceTab],get:async(id)=>{
               if(id !== 1) throw Error('Missing source tab'); return sourceTab;
@@ -86,7 +107,7 @@ async def main():
           // preventDefault must not suppress the recorder's trusted digits.
           window.sitePrevented = 0;
           window.addEventListener('keydown',event=>{
-            if(!['1','2'].includes(event.key)) return;
+            if(!['1','2','5','6'].includes(event.key)) return;
             const editing=event.composedPath().some(node=>node.isContentEditable ||
               node.tagName==='INPUT' && node.type==='text');
             if(!editing) { event.preventDefault(); sitePrevented++; }
@@ -94,7 +115,7 @@ async def main():
           window.playerFrameMarkup = `<input id="frame-volume" type="range"><input id="frame-input-button" type="button" value="재생"><button id="frame-play">재생</button><input id="frame-text"><script>
             window.sitePrevented=0;
             window.addEventListener('keydown',event=>{
-              if(['1','2'].includes(event.key) && event.target.type!=='text') {
+              if(['1','2','5','6'].includes(event.key) && event.target.type!=='text') {
                 event.preventDefault(); sitePrevented++;
               }
             },true);
@@ -140,20 +161,20 @@ async def main():
         # must not start a recording or steal typed digits.
         await owner.bring_to_front()
         await owner.click('#page-input')
-        await owner.keyboard.type('12')
-        assert await owner.input_value('#page-input') == '12'
+        await owner.keyboard.type('1256')
+        assert await owner.input_value('#page-input') == '1256'
         await owner.locator('#shadow-input').fill('')
-        await owner.keyboard.type('12')
-        assert await owner.locator('#shadow-input').input_value() == '12'
+        await owner.keyboard.type('1256')
+        assert await owner.locator('#shadow-input').input_value() == '1256'
         await owner.click('#page-play')
         await owner.keyboard.press('Alt+1')
         await owner.evaluate("window.dispatchEvent(new KeyboardEvent('keydown', {key:'1',bubbles:true,cancelable:true}))")
         assert await owner.evaluate('pageCommands.length') == 0
         await owner.locator('#page-volume').focus()
-        await owner.keyboard.down('1')
+        await owner.keyboard.down('5')
         await owner.wait_for_function("recorder.getState().status === 'recording'")
-        await owner.keyboard.down('1')  # auto-repeat must not issue another START
-        await owner.keyboard.up('1')
+        await owner.keyboard.down('5')  # auto-repeat must not issue another START
+        await owner.keyboard.up('5')
         assert await owner.evaluate('pageCommands.length') == 1
         assert await owner.evaluate('sitePrevented') > 0
         popup = await popup_page()
@@ -177,9 +198,9 @@ async def main():
         # reinjects the script; exactly one request proves injection is idempotent.
         await owner.bring_to_front()
         await owner.locator('#page-video').focus()
-        await owner.keyboard.press('2')
+        await owner.keyboard.press('6')
         await owner.wait_for_function("recorder.getState().status === 'ready'")
-        assert await owner.evaluate('pageCommands.map(command=>command.key)') == ['1', '2']
+        assert await owner.evaluate('pageCommands.map(command=>command.key)') == ['5', '6']
         popup = await popup_page()
         await popup.wait_for_function("document.querySelector('#status-label').textContent === '녹음 완료'")
         state = (await bridge({'type': 'STATUS'}))['state']
@@ -200,7 +221,8 @@ async def main():
         assert len(probe['streams']) == 1 and probe['streams'][0]['codec_type'] == 'audio', probe
         assert 'mp4' in probe['format']['format_name'], probe
         assert float(probe['format']['duration']) > 1.5, probe
-        subprocess.run(['ffmpeg', '-v', 'error', '-i', str(sample), '-f', 'null', '-'], check=True)
+        full_audio = decoded_audio(sample)
+        assert full_audio['rms'] > 0.05, full_audio
         await popup.fill('#trim-start', '0.91')
         await popup.fill('#trim-end', '1.51')
         await popup.click('#preview-range')
@@ -221,11 +243,9 @@ async def main():
             'ffprobe','-v','error','-show_format','-show_streams','-of','json',str(clip_path)]))
         assert len(clip_probe['streams']) == 1 and clip_probe['streams'][0]['codec_type'] == 'audio'
         assert abs(float(clip_probe['format']['duration']) - 0.6) < 0.1, clip_probe
-        import array
-        pcm = array.array('f', subprocess.check_output([
-            'ffmpeg','-v','error','-i',str(clip_path),'-ac','1','-ar','48000','-f','f32le','-']))
-        crossings = sum(pcm[i-1] < 0 <= pcm[i] for i in range(1, len(pcm)))
-        frequency = crossings * 48000 / len(pcm)
+        trimmed_audio = decoded_audio(clip_path)
+        assert trimmed_audio['rms'] > 0.05, trimmed_audio
+        frequency = trimmed_audio['frequency']
         assert 850 <= frequency <= 910, frequency
         await popup.close()
         popup = await popup_page()
@@ -239,27 +259,27 @@ async def main():
         await popup.close()
         await owner.bring_to_front()
 
-        async def player_pair(player, start='#frame-volume', stop='#frame-input-button'):
+        async def player_pair(player, start='#frame-volume', stop='#frame-input-button', start_key='1', stop_key='2'):
             """Real trusted keys in a player must route once to its top tab."""
             await owner.evaluate("controller.handle({type:'DISCARD'})")
             before = await owner.evaluate('pageCommands.length')
             text = player.locator('#frame-text')
             await text.fill('')
-            await owner.keyboard.type('12')
-            assert await text.input_value() == '12'
+            await owner.keyboard.type('1256')
+            assert await text.input_value() == '1256'
             assert await owner.evaluate('pageCommands.length') == before
             await player.locator(start).focus()
-            await owner.keyboard.press('1')
+            await owner.keyboard.press(start_key)
             await owner.wait_for_function("recorder.getState().status === 'recording'")
             await text.fill('')
-            await owner.keyboard.type('2')
-            assert await text.input_value() == '2'
+            await owner.keyboard.type('26')
+            assert await text.input_value() == '26'
             assert await owner.evaluate('recorder.getState().status') == 'recording'
             await asyncio.sleep(0.15)
             await player.locator(stop).focus()
-            await owner.keyboard.press('2')
+            await owner.keyboard.press(stop_key)
             await owner.wait_for_function("recorder.getState().status === 'ready'")
-            assert await owner.evaluate('(before)=>pageCommands.slice(before).map(command=>command.key)',before) == ['1','2']
+            assert await owner.evaluate('(before)=>pageCommands.slice(before).map(command=>command.key)',before) == [start_key,stop_key]
             assert await player.locator('body').evaluate('()=>window.sitePrevented') >= 2
 
         # The first iframe existed before injection. Dynamic and reloaded
@@ -271,12 +291,12 @@ async def main():
           const loaded=new Promise(resolve=>iframe.onload=resolve);
           iframe.srcdoc=playerFrameMarkup;document.body.append(iframe);await loaded;
         }''')
-        await player_pair(owner.frame_locator('#dynamic-player'),start='#frame-input-button',stop='#frame-volume')
+        await player_pair(owner.frame_locator('#dynamic-player'),start='#frame-input-button',stop='#frame-volume',start_key='5')
         await owner.evaluate('''async()=>{
           const iframe=document.querySelector('#dynamic-player');
           await new Promise(resolve=>{iframe.onload=resolve;iframe.srcdoc=playerFrameMarkup+'<p>reloaded</p>';});
         }''')
-        await player_pair(owner.frame_locator('#dynamic-player'),start='#frame-play',stop='#frame-volume')
+        await player_pair(owner.frame_locator('#dynamic-player'),start='#frame-play',stop='#frame-volume',stop_key='6')
 
         # A stale installation object must be disposed and replaced, rather
         # than causing the reinjection guard to silently leave dead listeners.
@@ -299,6 +319,41 @@ async def main():
         }''')
         await player_pair(owner.frame_locator('#existing-player'),start='#frame-input-button',stop='#frame-play')
 
+        # Common user order: start recording while the page is silent, then
+        # press play. Existing tests with an already-running tone miss this.
+        await owner.evaluate('''async()=>{
+          await controller.handle({type:'DISCARD'});
+          syntheticGain.gain.value=0;
+          syntheticTone.frequency.cancelScheduledValues(sourceContext.currentTime);
+          syntheticTone.frequency.value=660;
+          const reply=await controller.handle({type:'START'});
+          if(!reply.ok)throw Error(reply.error);
+        }''')
+        await asyncio.sleep(0.4)
+        await owner.evaluate('syntheticGain.gain.value=0.2')
+        await asyncio.sleep(0.9)
+        delayed_reply = await owner.evaluate("controller.handle({type:'STOP'})")
+        assert delayed_reply['ok'], delayed_reply
+        saved_reply = await owner.evaluate("controller.handle({type:'SAVE'})")
+        assert saved_reply['ok'], saved_reply
+        delayed_path = OUTPUT / 'test-delayed-audio.mp4'
+        delayed_path.write_bytes(bytes(await owner.evaluate('''async()=>Array.from(new Uint8Array(
+          await (await fetch(downloaded.at(-1).url)).arrayBuffer()))''')))
+        silent_intro = decoded_audio(delayed_path, 0.1, 0.3)
+        delayed_audio = decoded_audio(delayed_path, 0.65, 1.0)
+        assert silent_intro['rms'] < 0.001, silent_intro
+        assert delayed_audio['rms'] > 0.05, delayed_audio
+        assert 630 <= delayed_audio['frequency'] <= 690, delayed_audio
+        delayed_trim_reply = await owner.evaluate(
+            "controller.handle({type:'SAVE_RANGE',startSeconds:0.65,endSeconds:1.05})")
+        assert delayed_trim_reply['ok'], delayed_trim_reply
+        delayed_clip_path = OUTPUT / 'test-delayed-trimmed.mp4'
+        delayed_clip_path.write_bytes(bytes(await owner.evaluate('''async()=>Array.from(new Uint8Array(
+          await (await fetch(downloaded.at(-1).url)).arrayBuffer()))''')))
+        delayed_trim_audio = decoded_audio(delayed_clip_path)
+        assert delayed_trim_audio['rms'] > 0.05, delayed_trim_audio
+        assert 630 <= delayed_trim_audio['frequency'] <= 690, delayed_trim_audio
+
         # A quick stop must reach the background while native capture is still
         # pending. Destroying the popup must not discard its stop intention.
         await owner.evaluate('''async()=>{
@@ -308,10 +363,10 @@ async def main():
         }''')
         timing_popup = await popup_page()
         await timing_popup.wait_for_selector('#start-button:enabled')
-        await timing_popup.keyboard.press('1')
+        await timing_popup.keyboard.press('5')
         await owner.wait_for_function('captureGateEntered')
-        await timing_popup.keyboard.press('2')
-        await timing_popup.keyboard.press('2')
+        await timing_popup.keyboard.press('6')
+        await timing_popup.keyboard.press('6')
         await owner.wait_for_function("popupCommands.some(message=>message.type === 'STOP_PENDING')")
         pending = await owner.evaluate("popupCommands.filter(message=>['START','STOP_PENDING'].includes(message.type))")
         assert [message['type'] for message in pending] == ['START','STOP_PENDING'], pending
@@ -331,7 +386,9 @@ async def main():
                           'codec': probe['streams'][0]['codec_name'],
                           'duration': probe['format']['duration'], 'bytes': sample.stat().st_size,
                           'trimDuration': clip_probe['format']['duration'], 'trimFrequency': frequency,
-                          'ui': 'popup closed: range1 record despite prior preventDefault, pause, resume, player2 stop; input guards, existing/dynamic/reloaded iframe keys, stale/legacy reinjection, actual command assignment/settings, hundredths, preview, trim, persist range, full save; quick popup1→2 sends durable STOP_PENDING before delayed capture and survives popup close',
+                          'fullAudio': full_audio, 'trimAudio': trimmed_audio,
+                          'delayedAudio': delayed_audio, 'delayedTrimAudio': delayed_trim_audio,
+                          'ui': 'popup closed: range5 record despite prior preventDefault, pause, resume, player6 stop; legacy1/2 and mixed5/2,1/6 iframe keys, input guards, stale/legacy reinjection, actual command assignment/settings, hundredths, preview, trim, persist range, full save; quick popup5→6 sends durable STOP_PENDING before delayed capture and survives popup close',
                           'scope': 'synthetic input and Chrome API bridge; real page keys, MP4 encoder and popup UI'}, ensure_ascii=False))
         await browser.close()
 

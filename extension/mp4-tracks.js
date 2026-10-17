@@ -136,6 +136,9 @@ export async function selectMp4Tracks(blob, content, { signal, onProgress = () =
   const output = createFile();
   const movieDuration = Math.round(durationSeconds * info.timescale);
   output.init({ timescale: info.timescale, duration: movieDuration, brands: ['isom', 'iso6', 'mp41'] });
+  // The MP4Box 2.4.1 default overflows to zero when written as 8.8 fixed-point.
+  // Audio needs unity playback volume even when a player honors this header.
+  output.moov.mvhd.volume = content === 'audio' ? 1 : 0;
   const id = output.addTrack({
     type: entry.type,
     hdlr: content === 'audio' ? 'soun' : 'vide',
