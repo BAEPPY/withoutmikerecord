@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>파일에서 소리 추출</title>
+    <link rel="stylesheet" href="extract.css" />
+    <script type="module" src="extract.js"></script>
+  </head>
+  <body>
+    <main class="app" aria-labelledby="page-title">
+      <header>
+        <p class="eyebrow">WITHOUT MIKERECORD · LOCAL</p>
+        <h1 id="page-title">파일에서 소리 추출</h1>
+        <p class="intro">기기에 있는 영상에서 소리만 꺼내 MP4로 저장하세요.</p>
+      </header>
+
+      <section class="card source-card" aria-labelledby="source-heading">
+        <h2 id="source-heading">1. 파일 선택</h2>
+        <label class="file-label" for="source-file">소리를 추출할 영상 또는 오디오 파일</label>
+        <input id="source-file" type="file" accept="video/*,audio/*,.mp4,.mov,.webm,.m4v,.m4a,.mkv,.ogg,.wav,.mp3" aria-describedby="file-help" />
+        <p class="help" id="file-help">MP4 · MOV · WebM 등 브라우저에서 재생 가능한 파일<br />최대 128 MiB · 2시간</p>
+        <div class="source-details">
+          <p id="source-name">선택한 파일이 없어요.</p>
+          <span id="source-size"></span>
+        </div>
+        <div class="actions">
+          <button class="button primary" id="extract-button" type="button" disabled>추출 시작</button>
+          <button class="button secondary" id="cancel-extract-button" type="button" hidden>추출 취소</button>
+        </div>
+        <div class="progress-section" id="extract-progress-section" hidden>
+          <div class="progress-labels">
+            <p id="extract-status" role="status" aria-live="polite">파일 확인 중</p>
+            <span id="extract-progress-label">0%</span>
+          </div>
+          <progress id="extract-progress" max="1" value="0" aria-label="소리 추출 진행률"></progress>
+        </div>
+        <p class="error" id="extract-error" role="alert" hidden></p>
+      </section>
+
+      <section class="card result-card" id="result-section" aria-labelledby="result-heading" hidden>
+        <div class="result-heading"><h2 id="result-heading">2. 소리 MP4 저장</h2><span class="audio-badge">AUDIO ONLY</span></div>
+        <p id="result-name" class="result-name"></p>
+        <p id="result-details" class="help"></p>
+        <audio id="result-audio" controls preload="metadata" aria-label="추출한 소리 미리 듣기"></audio>
+        <p class="preview-error help" id="preview-error" role="status" hidden></p>
+        <button class="button primary" id="save-extracted-button" type="button">소리 MP4 저장</button>
+        <p class="download-status" id="download-status" role="status" aria-live="polite"></p>
+        <button class="text-button" id="refresh-download-button" type="button" hidden>저장 상태 다시 확인</button>
+      </section>
+
+      <p class="keep-open">추출과 저장이 끝날 때까지 이 탭을 열어 두세요. 창을 닫으면 아직 저장하지 않은 결과가 사라져요.</p>
+      <footer>파일은 기기 안에서 처리해요 · 서버 전송 없음 · 마이크 사용 없음<br />다른 탭에서 진행 중인 녹음·녹화와 저장된 결과는 그대로 유지돼요.</footer>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,52 @@
+:root {
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", sans-serif;
+  color: #edf4f8;
+  background: #0c1422;
+  font-synthesis: none;
+  --muted: #a0b0c3;
+  --accent: #6de5cc;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, input { font: inherit; }
+button, p, h1, h2 { margin: 0; }
+[hidden] { display: none !important; }
+.app { width: min(100%, 720px); padding: 48px 24px 30px; margin: 0 auto; }
+.eyebrow { color: var(--accent); font-size: 11px; letter-spacing: 1.6px; }
+h1 { margin-top: 12px; font-size: clamp(25px, 5vw, 34px); letter-spacing: -1px; }
+.intro { margin-top: 12px; color: var(--muted); font-size: 14px; line-height: 1.7; }
+.card { margin-top: 24px; padding: 24px; border: 1px solid #304055; border-radius: 18px; background: #142130; }
+h2 { font-size: 16px; font-weight: 650; }
+.file-label { display: block; margin: 20px 0 9px; color: #c4d2df; font-size: 12px; }
+input[type="file"] { display: block; width: 100%; min-width: 0; padding: 9px; border: 1px solid #40556d; border-radius: 9px; color: var(--muted); background: #101d2d; font-size: 12px; }
+input[type="file"]::file-selector-button { padding: 9px 14px; margin-right: 12px; border: 0; border-radius: 6px; background: #27463f; color: #bdf9eb; cursor: pointer; font: inherit; }
+.help { margin-top: 10px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.source-details { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 18px 0; font-size: 12px; }
+#source-name, .result-name { overflow-wrap: anywhere; }
+#source-size { flex-shrink: 0; color: var(--muted); font-variant-numeric: tabular-nums; }
+.actions { display: flex; gap: 10px; }
+.button { min-height: 44px; padding: 11px 18px; border: 1px solid transparent; border-radius: 9px; font-size: 13px; font-weight: 650; cursor: pointer; }
+.primary { color: #092923; background: var(--accent); }
+.primary:hover:enabled { background: #8defd9; }
+.secondary { color: #d3deea; background: #172436; border-color: #40556d; }
+.secondary:hover:enabled { background: #213148; }
+button:disabled, input:disabled { opacity: .45; cursor: default; }
+button:focus-visible, input:focus-visible { outline: 2px solid #c7fff3; outline-offset: 3px; }
+.progress-section { margin-top: 22px; }
+.progress-labels { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 9px; color: #c4d2df; font-size: 12px; }
+#extract-progress-label { font-variant-numeric: tabular-nums; }
+progress { display: block; width: 100%; height: 7px; border: 0; border-radius: 4px; overflow: hidden; accent-color: var(--accent); }
+progress::-webkit-progress-bar { background: #293d4b; }
+progress::-webkit-progress-value { background: var(--accent); }
+.error { margin-top: 18px; padding: 12px; border: 1px solid #623846; border-radius: 9px; background: #39232e; color: #ffd1d6; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.result-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.audio-badge { color: var(--accent); font-size: 10px; letter-spacing: 1px; }
+.result-name { margin-top: 18px; font-size: 13px; }
+.result-card audio { display: block; width: 100%; margin: 18px 0; }
+.preview-error { margin: -6px 0 16px; color: #e6c58b; }
+.download-status { margin-top: 12px; color: #c3e7df; font-size: 12px; line-height: 1.7; }
+.text-button { margin-top: 8px; padding: 5px 0; border: 0; background: transparent; color: var(--accent); font-size: 12px; cursor: pointer; }
+.keep-open { margin-top: 22px; color: #c4d2df; font-size: 12px; line-height: 1.8; }
+footer { margin-top: 22px; padding-top: 18px; border-top: 1px solid #223044; color: var(--muted); font-size: 11px; line-height: 1.9; }
+@media (max-width: 460px) { .app { padding: 28px 16px; } .card { padding: 18px; } .source-details { flex-wrap: wrap; } }
