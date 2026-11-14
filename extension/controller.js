@@ -48,13 +48,19 @@ export function createController(api, { onStateChange = () => {} } = {}) {
     return reply.state;
   }
 
+  function canStart(current) {
+    return ['idle', 'error'].includes(current.status)
+      || (current.status === 'ready' && current.download.status === 'complete');
+  }
+
   async function badge(current) {
     const labels = { selecting: '영역', starting: '…', recording: 'REC', paused: 'Ⅱ', stopping: '…', trimming: '…', exporting: 'GIF', ready: '↓', error: '!' };
     await Promise.all([
       api.action.setBadgeText({ text: labels[current.status] || '' }),
       api.action.setBadgeBackgroundColor({ color: current.status === 'recording' ? '#da4761' : '#247e76' }),
       api.action.setTitle({ title: current.status === 'recording'
-        ? current.mode === 'video' ? '화면과 소리 녹화 중 — 4로 종료' : '탭 소리 녹음 중 — 2·6으로 종료'
+        ? current.mode === 'gif' ? '영역 GIF 녹화 중 — 6으로 종료'
+          : current.mode === 'video' ? '화면과 소리 녹화 중 — 4로 종료' : '탭 소리 녹음 중 — 2로 종료'
         : '탭 소리 · 화면 녹화' }),
       onStateChange(current),
     ]);
@@ -133,8 +139,9 @@ export function createController(api, { onStateChange = () => {} } = {}) {
     }
     let current = await reconcileDownload(await state());
     if (message.type === 'STATUS') return { ok: true, state: current };
-    if (message.type === 'ARM_SHORTCUTS' || message.type === 'OPEN_VIDEO_SELECTOR') {
-      if (message.type === 'OPEN_VIDEO_SELECTOR' && !['idle', 'error'].includes(current.status)) {
+    if (['ARM_SHORTCUTS', 'OPEN_VIDEO_SELECTOR', 'OPEN_GIF_SELECTOR'].includes(message.type)) {
+      const openSelector = message.type !== 'ARM_SHORTCUTS';
+      if (openSelector && !canStart(current)) {
         throw new Error('진행 중인 녹음을 마치고 새 녹음을 준비해 주세요.');
       }
       const tab = await activeWebTab(message.targetTabId);
@@ -143,50 +150,60 @@ export function createController(api, { onStateChange = () => {} } = {}) {
       } catch {
         throw new Error('단축키 연결 권한을 확인하지 못했어요. 이 탭에서 확장 프로그램을 다시 눌러 주세요.');
       }
-      if (message.type === 'OPEN_VIDEO_SELECTOR') {
-        const response = await api.tabs.sendMessage(tab.id, { type: 'SHOW_VIDEO_SELECTOR' }, { frameId: 0 });
+      if (openSelector) {
+        const response = await api.tabs.sendMessage(tab.id, {
+          type: message.type === 'OPEN_GIF_SELECTOR' ? 'SHOW_GIF_SELECTOR' : 'SHOW_VIDEO_SELECTOR',
+        }, { frameId: 0 });
         if (!response?.ok) throw new Error('영역 선택 화면을 열지 못했어요. 페이지를 새로고침하고 다시 연결해 주세요.');
       }
       return { ok: true, state: current, shortcutTabId: tab.id };
     }
-    if (message.type === 'BEGIN_VIDEO') {
-      if (!['idle', 'error'].includes(current.status)) throw new Error('진행 중인 녹음을 마치고 새 녹음을 준비해 주세요.');
+    if (message.type === 'BEGIN_VIDEO' || message.type === 'BEGIN_GIF') {
+      const mode = message.type === 'BEGIN_GIF' ? 'gif' : 'video';
+      if (!canStart(current)) throw new Error('진행 중인 녹음을 마치고 새 녹음을 준비해 주세요.');
       const tab = await activeWebTab(message.targetTabId);
       let imageDataUrl;
       try { imageDataUrl = await api.tabs.captureVisibleTab(tab.windowId, { format: 'png' }); }
       catch { throw new Error('화면을 가져오지 못했어요. 녹화할 페이지에서 확장 아이콘을 다시 눌러 주세요.'); }
       const latest = await activeWebTab(tab.id);
-      if (latest.url !== tab.url) throw new Error('페이지가 바뀌었어요. 3을 눌러 영역을 다시 선택해 주세요.');
+      if (latest.url !== tab.url) throw new Error('페이지가 바뀌었어요. 3 또는 5를 눌러 영역을 다시 선택해 주세요.');
       const selectionToken = crypto.randomUUID();
       await ensureDocument();
-      const reply = await send('SELECT_VIDEO', { tab: { id: tab.id, title: tab.title, url: tab.url }, selectionToken });
+      const reply = await send('SELECT_VIDEO', { tab: { id: tab.id, title: tab.title, url: tab.url }, selectionToken,
+        ...(mode === 'gif' ? { mode } : {}) });
       await badge(reply.state);
       return reply.ok ? { ...reply, imageDataUrl, selectionToken } : reply;
     }
-    if (['CANCEL_VIDEO', 'STOP_VIDEO'].includes(message.type) &&
-        message.selectionToken === undefined && ['idle', 'error'].includes(current.status)) {
+    const stopMode = message.type === 'STOP_GIF' ? 'gif' : message.type === 'STOP_VIDEO' ? 'video' : null;
+    if (['CANCEL_VIDEO', 'STOP_VIDEO', 'STOP_GIF'].includes(message.type) &&
+        message.selectionToken === undefined && canStart(current)) {
       // Opening the selector is acknowledged before its page task starts.
       // A quick stop must cancel that task even before SELECT_VIDEO exists.
       const tabId = message.targetTabId === undefined ? (await activeWebTab()).id : message.targetTabId;
       if (!Number.isInteger(tabId) || tabId < 0) throw new Error('취소할 탭을 확인하지 못했어요.');
-      const response = await api.tabs.sendMessage(tabId, { type: 'CANCEL_VIDEO_SELECTOR' }, { frameId: 0 }).catch(() => null);
+      const response = await api.tabs.sendMessage(tabId, {
+        type: 'CANCEL_VIDEO_SELECTOR', ...((stopMode || message.mode) ? { mode: stopMode || message.mode } : {}),
+      }, { frameId: 0 }).catch(() => null);
       if (response?.cancelled) return { ok: true, state: current };
     }
-    if (message.type === 'CANCEL_VIDEO' || (message.type === 'STOP_VIDEO' && current.status === 'selecting')) {
-      if (current.status !== 'selecting' ||
+    if (message.type === 'CANCEL_VIDEO' || (stopMode && current.status === 'selecting')) {
+      if (current.status !== 'selecting' || (stopMode && current.mode !== stopMode) ||
+          (message.mode !== undefined && current.mode !== message.mode) ||
           (message.targetTabId !== undefined && current.tab?.id !== message.targetTabId) ||
           (message.selectionToken !== undefined && current.selectionToken !== message.selectionToken)) {
         throw new Error('진행 중인 영역 선택이 아니에요.');
       }
       const reply = await send('CANCEL_VIDEO', { selectionToken: current.selectionToken });
-      await api.tabs.sendMessage(current.tab.id, { type: 'CANCEL_VIDEO_SELECTOR' }, { frameId: 0 }).catch(() => {});
+      await api.tabs.sendMessage(current.tab.id, {
+        type: 'CANCEL_VIDEO_SELECTOR', ...(current.mode === 'gif' ? { mode: 'gif' } : {}),
+      }, { frameId: 0 }).catch(() => {});
       await badge(reply.state);
       return reply;
     }
     if (message.type === 'START_VIDEO') {
-      if (current.status !== 'selecting' || current.tab?.id !== message.targetTabId ||
+      if (current.status !== 'selecting' || !['video', 'gif'].includes(current.mode) || current.tab?.id !== message.targetTabId ||
           typeof message.selectionToken !== 'string' || current.selectionToken !== message.selectionToken) {
-        throw new Error('영역 선택이 만료됐어요. 3을 눌러 다시 선택해 주세요.');
+        throw new Error('영역 선택이 만료됐어요. 3 또는 5를 눌러 다시 선택해 주세요.');
       }
       try {
         const tab = await activeWebTab(message.targetTabId);
@@ -199,7 +216,7 @@ export function createController(api, { onStateChange = () => {} } = {}) {
           throw new Error('가로·세로 16픽셀 이상의 영역을 선택해 주세요.');
         }
         const streamId = await api.tabCapture.getMediaStreamId({ targetTabId: tab.id });
-        const reply = await send('START', { mode: 'video', streamId, tab: { id: tab.id, title: tab.title },
+        const reply = await send('START', { mode: current.mode, streamId, tab: { id: tab.id, title: tab.title },
           region: r, selectionToken: message.selectionToken });
         await badge(reply.state);
         return reply;
@@ -209,8 +226,8 @@ export function createController(api, { onStateChange = () => {} } = {}) {
         throw error;
       }
     }
-    if (message.type === 'STOP_VIDEO') {
-      if (current.mode !== 'video' || current.tab?.id !== message.targetTabId || !['recording', 'paused'].includes(current.status)) {
+    if (stopMode) {
+      if (current.mode !== stopMode || current.tab?.id !== message.targetTabId || !['recording', 'paused'].includes(current.status)) {
         throw new Error('이 탭에서 진행 중인 화면 녹화가 없어요.');
       }
       const reply = await send('STOP');
@@ -219,8 +236,8 @@ export function createController(api, { onStateChange = () => {} } = {}) {
     }
     if (message.type === 'PAGE_STOP') {
       if (!Number.isInteger(message.targetTabId) || current.tab?.id !== message.targetTabId ||
-          current.mode === 'video' || !['recording', 'paused'].includes(current.status)) {
-        throw new Error('이 탭에서 진행 중인 녹음이 없어요. 녹음한 탭에서 2 또는 6을 눌러 주세요.');
+          current.mode !== 'audio' || !['recording', 'paused'].includes(current.status)) {
+        throw new Error('이 탭에서 진행 중인 녹음이 없어요. 녹음한 탭에서 2를 눌러 주세요.');
       }
       const reply = await send('STOP');
       await badge(reply.state);
@@ -231,7 +248,7 @@ export function createController(api, { onStateChange = () => {} } = {}) {
       return { ok: true, state: current };
     }
     if (message.type === 'START' || message.type === 'BROWSER_START') {
-      if (!['idle', 'error'].includes(current.status)) {
+      if (!canStart(current)) {
         throw new Error('진행 중인 녹음을 마치고 새 녹음을 시작해 주세요.');
       }
       const tab = await activeWebTab(message.targetTabId);
@@ -348,15 +365,16 @@ export function createController(api, { onStateChange = () => {} } = {}) {
     // capture happens to be active after an unrelated or failed start.
     if (typeof message.operationId !== 'string' || !message.operationId ||
         message.operationId !== previous?.operationId ||
-        !['START', 'OPEN_VIDEO_SELECTOR', 'PAUSE', 'RESUME'].includes(previous?.type) ||
-        !['audio', 'video'].includes(message.mode)) {
+        !['START', 'OPEN_VIDEO_SELECTOR', 'OPEN_GIF_SELECTOR', 'PAUSE', 'RESUME'].includes(previous?.type) ||
+        !['audio', 'video', 'gif'].includes(message.mode)) {
       return { ok: false, error: '종료 요청이 만료됐어요. 종료 키를 다시 눌러 주세요.', state: await state() };
     }
     const original = await previous.result;
-    if (previous.type === 'OPEN_VIDEO_SELECTOR') {
-      if (message.mode !== 'video') return { ok: false, error: '영상 종료 키는 4예요.', state: await state() };
+    if (['OPEN_VIDEO_SELECTOR', 'OPEN_GIF_SELECTOR'].includes(previous.type)) {
+      const mode = previous.type === 'OPEN_GIF_SELECTOR' ? 'gif' : 'video';
+      if (message.mode !== mode) return { ok: false, error: mode === 'gif' ? 'GIF 종료 키는 6이에요.' : '영상 종료 키는 4예요.', state: await state() };
       if (!original.ok) return original;
-      return safeRun({ type: 'CANCEL_VIDEO', targetTabId: original.shortcutTabId });
+      return safeRun({ type: mode === 'gif' ? 'STOP_GIF' : 'CANCEL_VIDEO', mode, targetTabId: original.shortcutTabId });
     }
     if (previous.type === 'START' && !original.ok) return original;
     const source = original.state;
@@ -366,7 +384,7 @@ export function createController(api, { onStateChange = () => {} } = {}) {
       return { ok: false, error: '종료할 녹음이 바뀌었어요. 상태를 확인해 주세요.', state: current };
     }
     if (!['starting', 'recording', 'paused'].includes(current.status)) return { ok: true, state: current };
-    return safeRun({ type: message.mode === 'video' ? 'STOP_VIDEO' : 'PAGE_STOP', targetTabId: source.tab.id });
+    return safeRun({ type: message.mode === 'gif' ? 'STOP_GIF' : message.mode === 'video' ? 'STOP_VIDEO' : 'PAGE_STOP', targetTabId: source.tab.id });
   }
 
   return {
@@ -409,7 +427,7 @@ export function createController(api, { onStateChange = () => {} } = {}) {
       const current = await state();
       if (current.tab?.id === tabId && current.status === 'selecting') {
         await this.handle({ type: 'CANCEL_VIDEO', targetTabId: tabId, selectionToken: current.selectionToken });
-      } else if (current.tab?.id === tabId && current.mode === 'video' &&
+      } else if (current.tab?.id === tabId && ['video', 'gif'].includes(current.mode) &&
           ['starting', 'recording', 'paused'].includes(current.status)) {
         // A replaced document no longer owns the viewport watcher. End only
         // its session, even if a newer recording starts before this is handled.

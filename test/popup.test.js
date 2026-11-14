@@ -155,50 +155,49 @@ test('failed starts preserve their error and never retry a normal unbound stop',
   assert.doesNotMatch(env.text('stop-label'), /대기/);
 });
 
-test('popup 5/6 and mixed audio aliases stop a pending audio start using its operation id', async () => {
-  for (const [startKey, stopKey] of [['5', '6'], ['1', '6'], ['5', '2']]) {
-    const env = await popup();
-    const start = deferred();
-    env.respond = (message) => message.type === 'START' ? start.promise
-      : Promise.resolve({ ok: true, state: { ...idle(), status: 'ready' } });
-    assert.ok(env.press(startKey).prevented);
-    assert.ok(env.press(stopKey).prevented);
-    env.press(stopKey === '6' ? '2' : '6');
-    assert.deepEqual(env.commands().map(({ type }) => type), ['START', 'STOP_PENDING']);
-    assert.equal(env.commands()[1].mode, 'audio');
-    assert.equal(env.commands()[1].operationId, env.commands()[0].operationId);
-    await settle();
-    start.resolve({ ok: true, state: { ...idle(), status: 'recording' } });
-    await settle();
-    assert.equal(env.elements.get('status-pill').dataset.status, 'ready');
-    assert.equal(env.commands().length, 2);
-  }
-});
-
-test('popup 6 stops audio and cannot stop video; accessible hints expose both audio key pairs', async () => {
-  const audio = await popup({ initialState: { ...idle(), status: 'recording' } });
-  assert.ok(audio.press('6').prevented);
+test('popup 5/6 stops a pending GIF selector with its operation id and ignores other stop modes', async () => {
+  const env = await popup();
+  const opening = deferred();
+  env.respond = (message) => message.type === 'OPEN_GIF_SELECTOR' ? opening.promise
+    : Promise.resolve({ ok: true, state: idle() });
+  assert.ok(env.press('5').prevented);
+  assert.equal(env.press('2').prevented, undefined);
+  assert.equal(env.press('4').prevented, undefined);
+  assert.ok(env.press('6').prevented);
+  env.press('6');
+  assert.deepEqual(env.commands().map(({ type }) => type), ['OPEN_GIF_SELECTOR', 'STOP_PENDING']);
+  assert.equal(env.commands()[1].mode, 'gif');
+  assert.equal(env.commands()[1].operationId, env.commands()[0].operationId);
   await settle();
-  assert.deepEqual(audio.commands().map(({ type }) => type), ['STOP']);
-  assert.equal(audio.elements.get('stop-button').attributes['aria-keyshortcuts'], '2 6');
-  assert.match(audio.text('shortcut-status'), /5\/6.*1\/2/);
-  assert.match(html, /id="start-button"[^>]*aria-keyshortcuts="1 5"/);
-
-  const video = await popup({ initialState: { ...idle(), mode: 'video', status: 'recording' } });
-  assert.equal(video.press('6').prevented, undefined);
-  assert.deepEqual(video.commands(), []);
-  assert.equal(video.elements.get('stop-button').attributes['aria-keyshortcuts'], '4');
+  opening.resolve({ ok: true, state: { ...idle(), mode: 'gif', status: 'selecting' } });
+  await settle();
+  assert.equal(env.elements.get('status-pill').dataset.status, 'idle');
+  assert.equal(env.commands().length, 2);
 });
 
-test('popup recognizes physical and numpad audio aliases while retaining NumLock navigation', async () => {
+test('popup stop keys control only their matching audio, video or GIF session', async () => {
+  for (const [mode, key, wrong] of [['audio', '2', ['4', '6']], ['video', '4', ['2', '6']], ['gif', '6', ['2', '4']]]) {
+    const env = await popup({ initialState: { ...idle(), mode, status: 'recording' } });
+    for (const other of wrong) assert.equal(env.press(other).prevented, undefined);
+    assert.deepEqual(env.commands(), []);
+    assert.equal(env.elements.get('stop-button').attributes['aria-keyshortcuts'], key);
+    assert.ok(env.press(key).prevented);
+    await settle();
+    assert.deepEqual(env.commands().map(({ type }) => type), ['STOP']);
+  }
+  assert.match(html, /id="start-button"[^>]*aria-keyshortcuts="1"/);
+  assert.match(html, /id="start-gif-button"[^>]*aria-keyshortcuts="5"/);
+});
+
+test('popup recognizes physical and numpad GIF keys while retaining NumLock navigation', async () => {
   for (const [key, code] of [['5', 'Numpad5'], ['Unidentified', 'Numpad5'], [undefined, 'Numpad5'], ['(', 'Digit5']]) {
     const env = await popup();
     assert.ok(env.press(key, { code }).prevented);
     await settle();
-    assert.deepEqual(env.commands().map(({ type }) => type), ['START']);
+    assert.deepEqual(env.commands().map(({ type }) => type), ['OPEN_GIF_SELECTOR']);
   }
   for (const [key, code] of [['6', 'Numpad6'], ['Unidentified', 'Numpad6'], [undefined, 'Numpad6'], ['-', 'Digit6']]) {
-    const env = await popup({ initialState: { ...idle(), status: 'recording' } });
+    const env = await popup({ initialState: { ...idle(), mode: 'gif', status: 'recording' } });
     assert.ok(env.press(key, { code }).prevented);
     await settle();
     assert.deepEqual(env.commands().map(({ type }) => type), ['STOP']);
@@ -1033,4 +1032,112 @@ test('changing GIF quality clears the prior copy confirmation and uses the new q
   await settle();
   assert.equal(env.commands().at(-1).quality, 'small');
   assert.match(env.text('copy-status'), /복사 완료/);
+});
+
+test('GIF capture fixes the save format and keeps quality, range and animated copy available', async () => {
+  const env = await popup({ initialState: { ...videoReady(), mode: 'gif' }, storedQuality: 'small' });
+  assert.equal(env.elements.get('save-format').value, 'gif');
+  assert.equal(env.elements.get('save-format').disabled, true);
+  assert.equal(env.elements.get('save-content-field').hidden, true);
+  assert.equal(env.elements.get('save-quality-field').hidden, false);
+  assert.equal(env.elements.get('save-range-button').hidden, false);
+  assert.equal(env.elements.get('copy-gif-button').hidden, false);
+  assert.equal(env.elements.get('video-preview').src, 'blob:original-video');
+  assert.equal(env.elements.get('save-quality').value, 'small');
+
+  // A stale MP4 selection from an earlier session must not change GIF output.
+  env.elements.get('save-format').value = 'mp4';
+  env.elements.get('save-content').value = 'audio';
+  env.click('save-button');
+  await settle();
+  const whole = env.commands().find(({ type }) => type === 'SAVE_VIDEO');
+  assert.equal(whole.format, 'gif');
+  assert.equal(whole.quality, 'small');
+  assert.equal(whole.content, undefined);
+
+  env.click('save-range-button');
+  await settle();
+  const range = env.commands().find(({ type }) => type === 'SAVE_VIDEO_RANGE');
+  assert.equal(range.format, 'gif');
+  assert.equal(range.startSeconds, 1.12);
+  assert.equal(range.endSeconds, 4.56);
+  assert.equal(range.quality, 'small');
+  env.respond = async () => ({ ok: true, state: structuredClone(env.state), output: { url: 'blob:animated-gif' } });
+  env.click('copy-gif-button');
+  await settle();
+  assert.equal(env.commands().at(-1).type, 'PREPARE_GIF_COPY');
+  assert.equal(env.commands().at(-1).quality, 'small');
+});
+
+test('a completed download exposes all three starts without discarding the previous preview first', async () => {
+  for (const [key, button, command] of [['1', 'start-button', 'START'], ['3', 'start-video-button', 'OPEN_VIDEO_SELECTOR'], ['5', 'start-gif-button', 'OPEN_GIF_SELECTOR']]) {
+    const saved = { ...videoReady(), download: { id: 10, status: 'complete' } };
+    const env = await popup({ initialState: saved });
+    for (const id of ['start-button', 'start-video-button', 'start-gif-button']) {
+      assert.equal(env.elements.get(id).disabled, false);
+      assert.equal(Boolean(env.elements.get(id).closest('[hidden]')), false);
+    }
+    assert.equal(env.elements.get('video-preview').src, 'blob:original-video');
+    assert.match(env.text('status-label'), /저장 완료/);
+    assert.ok(env.press(key).prevented);
+    await settle();
+    assert.deepEqual(env.commands().map(({ type }) => type), [command]);
+    assert.equal(env.commands().some(({ type }) => type === 'DISCARD'), false);
+    const byButton = await popup({ initialState: saved });
+    byButton.click(button);
+    await settle();
+    assert.deepEqual(byButton.commands().map(({ type }) => type), [command]);
+  }
+});
+
+test('download completion enables restart on polling, while pending, cancelled and unsaved results remain protected', async () => {
+  const env = await popup({ initialState: { ...videoReady(), download: { id: 10, status: 'pending' } } });
+  for (const status of ['pending', 'interrupted', 'idle']) {
+    env.state = { ...videoReady(), download: { id: status === 'idle' ? null : 10, status } };
+    await env.poll();
+    for (const [key, button] of [['1', 'start-button'], ['3', 'start-video-button'], ['5', 'start-gif-button']]) {
+      assert.equal(env.press(key).prevented, undefined);
+      assert.equal(env.elements.get(button).disabled, true);
+      env.click(button);
+    }
+    assert.deepEqual(env.commands(), []);
+    assert.equal(env.elements.get('video-preview').src, 'blob:original-video');
+  }
+  env.state = { ...videoReady(), download: { id: 10, status: 'complete' } };
+  await env.poll();
+  assert.equal(env.elements.get('start-gif-button').disabled, false);
+  assert.ok(env.press('5').prevented);
+  await settle();
+  assert.equal(env.commands()[0].type, 'OPEN_GIF_SELECTOR');
+});
+
+test('GIF selection cancels with 6 and a new video session restores MP4 saving', async () => {
+  const selecting = await popup({ initialState: { ...idle(), mode: 'gif', status: 'selecting' } });
+  assert.equal(selecting.press('4').prevented, undefined);
+  assert.ok(selecting.press('6').prevented);
+  await settle();
+  assert.deepEqual(selecting.commands().map(({ type }) => type), ['CANCEL_VIDEO']);
+
+  const env = await popup({ initialState: { ...videoReady(), mode: 'gif' } });
+  assert.equal(env.elements.get('save-format').value, 'gif');
+  env.state = { ...idle(), mode: 'video', status: 'recording' };
+  await env.poll();
+  env.state = { ...videoReady(), result: { ...videoReady().result, url: 'blob:next-video' } };
+  await env.poll();
+  assert.equal(env.elements.get('save-format').value, 'mp4');
+  assert.equal(env.elements.get('save-format').disabled, false);
+  assert.equal(env.elements.get('save-content-field').hidden, false);
+});
+
+test('GIF browser shortcut assignments show their actual bindings independently of audio', async () => {
+  const env = await popup({ assignments: [
+    { name: 'start-recording', shortcut: 'Alt+Shift+1' },
+    { name: 'stop-recording', shortcut: 'Alt+Shift+2' },
+    { name: 'start-gif', shortcut: 'Ctrl+Shift+5' },
+    { name: 'stop-gif', shortcut: '' },
+  ] });
+  assert.equal(env.text('shortcut-gif-start'), 'Ctrl+Shift+5');
+  assert.equal(env.text('shortcut-gif-stop'), '미지정');
+  assert.equal(env.elements.get('shortcut-gif-stop').dataset.assigned, 'false');
+  assert.equal(env.text('shortcut-audio-start'), 'Alt+Shift+1');
 });

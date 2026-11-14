@@ -2,7 +2,7 @@
   'use strict';
 
   const installationKey = '__withoutMikePageShortcuts';
-  const installationVersion = 4;
+  const installationVersion = 5;
   const previous = globalThis[installationKey];
   try {
     if (previous?.version === installationVersion && previous.isAlive?.()) {
@@ -16,6 +16,7 @@
   let stopAfterStart = null;
   let cancelVideoRequested = false;
   let scheduledVideoStart = null;
+  let scheduledVideoKey = null;
   let videoRecording = false;
   let videoViewportWatch = null;
   let videoControlsToken = null;
@@ -142,11 +143,14 @@
     if (globalThis[installationKey] === installation) delete globalThis[installationKey];
   }
 
-  function cancelVideoSelection() {
-    const cancelled = scheduledVideoStart !== null || pendingKey === '3';
+  function cancelVideoSelection(mode) {
+    const startKey = scheduledVideoKey || (isVisualStart(pendingKey) ? pendingKey : null);
+    if (mode !== undefined && mode !== visualMode(startKey)) return false;
+    const cancelled = scheduledVideoStart !== null || isVisualStart(pendingKey);
     if (scheduledVideoStart !== null) window.clearTimeout(scheduledVideoStart);
     scheduledVideoStart = null;
-    if (pendingKey === '3') {
+    scheduledVideoKey = null;
+    if (isVisualStart(pendingKey)) {
       cancelVideoRequested = true;
       if (videoViewportWatch?.starting) removeVideoViewportWatch();
     }
@@ -244,7 +248,7 @@
     if (token && finishedVideoTokens.has(token)) return;
     if (token && videoViewportWatch && token !== videoViewportWatch.selectionToken) return;
     if (token && videoControlsToken && token !== videoControlsToken) return;
-    videoRecording = state.mode === 'video' && ['starting', 'recording', 'paused', 'stopping'].includes(state.status);
+    videoRecording = ['video', 'gif'].includes(state.mode) && ['starting', 'recording', 'paused', 'stopping'].includes(state.status);
     if (videoRecording) {
       removeToast();
       if (token) void hideVideoControls(token).catch(() => {});
@@ -270,7 +274,7 @@
     const signalGeometryChange = () => {
       if (videoViewportWatch !== watch || watch.signalled) return;
       watch.signalled = true;
-      if (pendingKey === '3') cancelVideoRequested = true;
+      if (isVisualStart(pendingKey)) cancelVideoRequested = true;
       // Tab capture may keep a fixed output resolution while the source page
       // changes size. Only the source viewport can detect that layout change.
       void send({
@@ -315,9 +319,9 @@
       applyRecordingState(message.state, message.sessionToken);
       respond({ ok: true });
     } else if (message.type === 'CANCEL_VIDEO_SELECTOR') {
-      const cancelled = cancelVideoSelection();
+      const cancelled = cancelVideoSelection(message.mode);
       respond({ ok: true, cancelled });
-    } else if (message.type === 'SHOW_VIDEO_SELECTOR') {
+    } else if (message.type === 'SHOW_VIDEO_SELECTOR' || message.type === 'SHOW_GIF_SELECTOR') {
       if (pendingKey !== null || scheduledVideoStart !== null) {
         respond({ ok: false, error: '진행 중인 요청이 끝난 뒤 다시 시도해 주세요.' });
         return;
@@ -325,28 +329,36 @@
       // OPEN_VIDEO_SELECTOR in the worker is itself a queued command. Return
       // its ACK before asking that same queue to begin the video selection.
       respond({ ok: true });
+      scheduledVideoKey = message.type === 'SHOW_GIF_SELECTOR' ? '5' : '3';
       scheduledVideoStart = window.setTimeout(() => {
+        const startKey = scheduledVideoKey;
         scheduledVideoStart = null;
-        void performShortcut('3');
+        scheduledVideoKey = null;
+        void performShortcut(startKey);
       }, 50);
     }
   }
 
-  async function selectVideoRegion() {
+  async function selectVideoRegion(startKey) {
+    const mode = visualMode(startKey);
+    const stopKey = visualStopKey(startKey);
+    const completedMessage = mode === 'gif'
+      ? 'GIF 녹화를 마쳤어요. 확장 아이콘을 눌러 저장하거나 복사해 주세요.'
+      : '화면 녹화를 마쳤어요. 확장 아이콘을 눌러 파일을 저장해 주세요.';
     removeToast();
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
-    const reply = await send({ target: 'background', type: 'PAGE_SHORTCUT', key: '3' });
-    if (!reply?.ok && cancelVideoRequested && reply?.state?.mode === 'video'
+    const reply = await send({ target: 'background', type: 'PAGE_SHORTCUT', key: startKey });
+    if (!reply?.ok && cancelVideoRequested && reply?.state?.mode === mode
       && ['starting', 'recording', 'paused'].includes(reply.state.status)) {
       // A second start can be rejected because a recording already exists.
       // Its immediately following stop must still reach that recording.
-      const stopped = await send({ target: 'background', type: 'PAGE_SHORTCUT', key: '4' });
-      if (!stopped?.ok) throw new Error(stopped?.error || '녹화를 중지하지 못했어요. 4를 다시 눌러 주세요.');
+      const stopped = await send({ target: 'background', type: 'PAGE_SHORTCUT', key: stopKey });
+      if (!stopped?.ok) throw new Error(stopped?.error || `녹화를 중지하지 못했어요. ${stopKey}를 다시 눌러 주세요.`);
       removeVideoViewportWatch();
       restoreVideoControls();
       videoRecording = false;
-      showToast('화면 녹화를 마쳤어요. 확장 아이콘을 눌러 파일을 저장해 주세요.');
+      showToast(completedMessage);
       return;
     }
     if (!reply?.ok) throw new Error(reply?.error || '영역 선택을 시작하지 못했어요. 다시 시도해 주세요.');
@@ -365,7 +377,7 @@
         throw new Error('영역 선택기를 연결하지 못했어요. 확장 아이콘을 다시 눌러 주세요.');
       }
       const region = await globalThis.__withoutMikeSelectRegion({
-        imageDataUrl: reply.imageDataUrl, selectionToken,
+        imageDataUrl: reply.imageDataUrl, selectionToken, mode,
       });
       if (!region || cancelVideoRequested) {
         await cancel();
@@ -391,12 +403,12 @@
       selectionWatch.starting = false;
       if (!started.state) videoRecording = true;
       if (cancelVideoRequested) {
-        const stopped = await send({ target: 'background', type: 'PAGE_SHORTCUT', key: '4' });
+        const stopped = await send({ target: 'background', type: 'PAGE_SHORTCUT', key: stopKey });
         if (!stopped?.ok) {
-          const alreadyStopping = stopped?.state?.mode === 'video'
+          const alreadyStopping = stopped?.state?.mode === mode
             && stopped.state.videoSessionToken === selectionToken
             && ['stopping', 'ready', 'error'].includes(stopped.state.status);
-          if (!alreadyStopping) throw new Error(stopped?.error || '녹화를 중지하지 못했어요. 4를 다시 눌러 주세요.');
+          if (!alreadyStopping) throw new Error(stopped?.error || `녹화를 중지하지 못했어요. ${stopKey}를 다시 눌러 주세요.`);
           // The direct viewport signal can beat this queued stop. Its matching
           // session has already ended (or is ending), so no error toast belongs
           // on the page, particularly while the final video frames drain.
@@ -407,7 +419,7 @@
         removeVideoViewportWatch(selectionWatch);
         restoreVideoControls(selectionToken);
         videoRecording = false;
-        showToast('화면 녹화를 마쳤어요. 확장 아이콘을 눌러 파일을 저장해 주세요.');
+        showToast(completedMessage);
       }
     } catch (error) {
       if (!submitted) {
@@ -448,28 +460,39 @@
     return null;
   }
 
-  function isAudioStart(key) { return key === '1' || key === '5'; }
-  function isAudioStop(key) { return key === '2' || key === '6'; }
+  function isAudioStart(key) { return key === '1'; }
+  function isAudioStop(key) { return key === '2'; }
+  function isVisualStart(key) { return key === '3' || key === '5'; }
+  function visualMode(key) { return key === '5' ? 'gif' : key === '3' ? 'video' : null; }
+  function visualStopKey(key) { return key === '5' ? '6' : '4'; }
 
   async function performShortcut(key) {
     const reconnectHint = '확장 프로그램을 다시 연결하려면 페이지를 새로고침한 뒤 확장 아이콘을 눌러 주세요.';
-    if (scheduledVideoStart !== null && (key === '3' || key === '4')) {
-      window.clearTimeout(scheduledVideoStart);
-      scheduledVideoStart = null;
-      if (key === '4') return;
+    if (scheduledVideoStart !== null) {
+      const cancelling = key === visualStopKey(scheduledVideoKey);
+      // A popup start is acknowledged before its selector is scheduled. A new
+      // accepted start supersedes that reservation, rather than letting two
+      // mode queues coexist and share the same pending cancellation flag.
+      const replacing = pendingKey === null && (isAudioStart(key) || isVisualStart(key));
+      if (cancelling || replacing) {
+        window.clearTimeout(scheduledVideoStart);
+        scheduledVideoStart = null;
+        scheduledVideoKey = null;
+        if (cancelling) return;
+      }
     }
     if (pendingKey !== null) {
       // Capture permission and media setup may outlast a short key sequence.
-      // Remember one stop, including mixed aliases such as 1 then 6.
+      // Remember only the matching mode's stop while capture setup is pending.
       if (isAudioStart(pendingKey) && isAudioStop(key)) stopAfterStart ||= key;
-      if (pendingKey === '3' && key === '4') cancelVideoSelection();
+      if (isVisualStart(pendingKey) && key === visualStopKey(pendingKey)) cancelVideoSelection();
       return;
     }
     pendingKey = key;
 
     try {
-      if (key === '3') {
-        await selectVideoRegion();
+      if (isVisualStart(key)) {
+        await selectVideoRegion(key);
         return;
       }
       const reply = await send({
@@ -478,7 +501,7 @@
       const stopExistingAudio = isAudioStart(key) && stopAfterStart && reply?.state?.mode === 'audio'
         && ['starting', 'recording', 'paused'].includes(reply.state.status);
       if (!reply?.ok && !stopExistingAudio) throw new Error(reply?.error || reconnectHint);
-      if (isAudioStart(key) || key === '4') {
+      if (isAudioStart(key) || key === '4' || key === '6') {
         videoRecording = false;
         removeVideoViewportWatch();
         restoreVideoControls();
@@ -491,10 +514,12 @@
         });
         if (!stopped?.ok) throw new Error(stopped?.error || reconnectHint);
       }
-      showToast(pendingKey === '4'
+      showToast(pendingKey === '6'
+        ? 'GIF 녹화를 마쳤어요. 확장 아이콘을 눌러 저장하거나 복사해 주세요.'
+        : pendingKey === '4'
         ? '화면 녹화를 마쳤어요. 확장 아이콘을 눌러 파일을 저장해 주세요.'
         : isAudioStart(pendingKey)
-        ? '소리만 녹음을 시작했어요. 2 또는 6을 누르면 중지합니다.'
+        ? '소리만 녹음을 시작했어요. 2를 누르면 중지합니다.'
         : '녹음을 마쳤어요. 확장 아이콘을 눌러 파일을 저장해 주세요.');
     } catch (error) {
       if (!runtimeAvailable() || /extension context invalidated/i.test(error?.message || '')) {

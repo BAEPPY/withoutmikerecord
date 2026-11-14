@@ -1,13 +1,19 @@
 (() => {
   'use strict';
-  if (globalThis.__withoutMikeSelectRegion) return;
+  const installationVersion = 2;
+  if (globalThis.__withoutMikeSelectRegion?.version === installationVersion) return;
+  // Replace legacy selection closures after an extension update; otherwise
+  // their old stop-key handling would remain on an already connected page.
+  globalThis.__withoutMikeCancelRegion?.();
 
   let currentSelection = null;
 
   globalThis.__withoutMikeCancelRegion = () => currentSelection?.cancel();
 
-  globalThis.__withoutMikeSelectRegion = ({ imageDataUrl, selectionToken }) => {
+  const selectRegion = ({ imageDataUrl, selectionToken, mode = 'video' }) => {
     currentSelection?.cancel();
+    if (!['video', 'gif'].includes(mode)) return Promise.reject(new Error('녹화 모드를 확인하지 못했어요.'));
+    const stopKey = mode === 'gif' ? '6' : '4';
     if (!/^data:image\/(?:png|jpeg|webp);base64,/i.test(imageDataUrl || '')) {
       return Promise.reject(new Error('화면 이미지를 가져오지 못했어요. 다시 시도해 주세요.'));
     }
@@ -83,7 +89,7 @@
 
       try {
         dialog = document.createElement('dialog');
-        dialog.setAttribute('aria-label', '녹화할 화면 영역 선택');
+        dialog.setAttribute('aria-label', mode === 'gif' ? 'GIF로 녹화할 화면 영역 선택' : '녹화할 화면 영역 선택');
         dialog.setAttribute('aria-modal', 'true');
         dialog.tabIndex = -1;
         dialog.style.cssText = [
@@ -128,7 +134,7 @@
         const hint = document.createElement('div');
         hint.className = 'hint';
         hint.setAttribute('role', 'status');
-        hint.textContent = '드래그하여 녹화할 영역을 선택하세요. 놓으면 시작 · Esc 또는 4로 취소';
+        hint.textContent = `드래그하여 ${mode === 'gif' ? 'GIF로 녹화할' : '녹화할'} 영역을 선택하세요. 놓으면 시작 · Esc 또는 ${stopKey}로 취소`;
         frame.append(screenshot, shade, selection, hint);
         shadow.append(style, frame);
 
@@ -140,7 +146,7 @@
           });
           selection.hidden = false;
           shade.hidden = true;
-          hint.textContent = `${Math.round(rect.width)} × ${Math.round(rect.height)} px · 놓으면 시작 · Esc 또는 4로 취소`;
+          hint.textContent = `${Math.round(rect.width)} × ${Math.round(rect.height)} px · 놓으면 시작 · Esc 또는 ${stopKey}로 취소`;
           return rect;
         }
 
@@ -164,7 +170,7 @@
           try { dialog.releasePointerCapture(pointerId); } catch { /* Capture may already be released. */ }
           pointerId = null;
           if (rect.width < 16 || rect.height < 16) {
-            hint.textContent = '가로와 세로가 각각 16px 이상이 되도록 다시 드래그해 주세요. Esc 또는 4로 취소';
+            hint.textContent = `가로와 세로가 각각 16px 이상이 되도록 다시 드래그해 주세요. Esc 또는 ${stopKey}로 취소`;
             return;
           }
           finish({
@@ -176,7 +182,12 @@
         listen('pointercancel', (event) => { consume(event); finish(null); });
         listen('keydown', (event) => {
           consume(event);
-          if (event.isTrusted !== false && (event.key === 'Escape' || event.key === '4')) finish(null);
+          if (event.isTrusted === false || event.repeat || event.isComposing || event.keyCode === 229
+            || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+          const digit = /^[1-6]$/.test(event.key || '') ? event.key
+            : /^Digit([1-6])$/.exec(event.code || '')?.[1]
+              || ((!event.key || event.key === 'Unidentified') ? /^Numpad([1-6])$/.exec(event.code || '')?.[1] : null);
+          if (event.key === 'Escape' || digit === stopKey) finish(null);
         });
         for (const type of ['keyup', 'keypress', 'click', 'dblclick', 'contextmenu', 'mousedown', 'mouseup']) {
           listen(type, consume);
@@ -205,4 +216,6 @@
       }
     });
   };
+  selectRegion.version = installationVersion;
+  globalThis.__withoutMikeSelectRegion = selectRegion;
 })();

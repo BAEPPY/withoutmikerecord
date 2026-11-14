@@ -46,7 +46,7 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
   Object.assign(state, {
     status, mode,
     tab: status === 'idle' ? null : { id: 17, title: 'A playing tab' },
-    result: status === 'ready' ? structuredClone(mode === 'video' ? recordedVideo : recordedFile) : null,
+    result: status === 'ready' ? structuredClone(['video', 'gif'].includes(mode) ? recordedVideo : recordedFile) : null,
     selection: status === 'ready' && mode === 'audio' ? { startSeconds: 0, endSeconds: 12 } : null,
   });
   if (download) state.download = structuredClone(download);
@@ -110,7 +110,8 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
         switch (message.type) {
           case 'STATUS': break;
           case 'START':
-            Object.assign(state, { status: 'starting', mode: message.mode || 'audio', tab: message.tab, result: null });
+            Object.assign(state, { status: 'starting', mode: message.mode || 'audio', tab: message.tab, result: null,
+              download: { id: null, status: 'idle', error: null } });
             await env.startRecording(message);
             Object.assign(state, { status: 'recording', mode: message.mode || 'audio', tab: message.tab, result: null });
             break;
@@ -119,7 +120,7 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
             break;
           case 'SELECT_VIDEO':
             Object.assign(state, {
-              status: 'selecting', mode: 'video', tab: message.tab,
+              status: 'selecting', mode: message.mode || 'video', tab: message.tab,
               selectionToken: message.selectionToken, selectionUrl: message.tab.url,
             });
             break;
@@ -127,7 +128,7 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
           case 'PAUSE': state.status = 'paused'; break;
           case 'RESUME': state.status = 'recording'; break;
           case 'STOP':
-            Object.assign(state, { status: 'ready', result: structuredClone(state.mode === 'video' ? recordedVideo : recordedFile) });
+            Object.assign(state, { status: 'ready', result: structuredClone(['video', 'gif'].includes(state.mode) ? recordedVideo : recordedFile) });
             break;
           case 'SET_SELECTION':
             state.selection = { startSeconds: message.startSeconds, endSeconds: message.endSeconds };
@@ -181,7 +182,12 @@ function browser({ status = 'idle', mode = 'audio', download, document = status 
             break;
           case 'CANCEL_EXPORT': await env.cancelExport(); break;
           case 'DISCARD': Object.assign(state, structuredClone(EMPTY_STATE)); break;
-          case 'DOWNLOAD_UPDATE': state.download = structuredClone(message.download); break;
+          case 'DOWNLOAD_UPDATE':
+            if (state.status !== 'ready' || (['complete', 'interrupted'].includes(message.download.status)
+                && message.download.id !== null && message.download.id !== state.download.id)) {
+              return { ok: false, error: 'stale download', state: structuredClone(state) };
+            }
+            state.download = structuredClone(message.download); break;
           default: throw new Error(`Unexpected offscreen command: ${message.type}`);
         }
         return { ok: true, state: structuredClone(state) };
@@ -1331,7 +1337,7 @@ test('stop or popup cancel can dismiss an acknowledged video selector before BEG
     assert.equal(cancelled.state.status, 'idle');
     assert.equal(scheduled, false);
     assert.deepEqual(events(env, 'sendTabMessage').at(-1).data, {
-      tabId: 17, message: { type: 'CANCEL_VIDEO_SELECTOR' }, options: { frameId: 0 },
+      tabId: 17, message: { type: 'CANCEL_VIDEO_SELECTOR', ...(type === 'STOP_VIDEO' ? { mode: 'video' } : {}) }, options: { frameId: 0 },
     });
     assert.equal(events(env, 'captureVisibleTab').length, 0);
     assert.equal(events(env, 'capture').length, 0);
@@ -1480,7 +1486,7 @@ test('STOP_PENDING cancels the selector on its original tab after the user switc
   assert.equal(cancelled.state.status, 'idle');
   assert.equal(scheduledTab, null);
   assert.deepEqual(events(env, 'sendTabMessage').at(-1).data, {
-    tabId: 17, message: { type: 'CANCEL_VIDEO_SELECTOR' }, options: { frameId: 0 },
+    tabId: 17, message: { type: 'CANCEL_VIDEO_SELECTOR', mode: 'video' }, options: { frameId: 0 },
   });
   assert.equal(events(env, 'capture').length, 0);
   assert.equal(messages(env, 'SELECT_VIDEO').length, 0);
@@ -2033,4 +2039,202 @@ test('a cancelled Save As dialog can be retried with a different quality without
   assert.equal(retry.state.videoExportResult.quality, 'small');
   assert.notEqual(events(env, 'download')[0].data.url, events(env, 'download')[1].data.url);
   assert.deepEqual(retry.state.result, recordedVideo);
+});
+
+test('GIF selector captures a still, preserves its mode, and starts only video-only GIF capture', async () => {
+  const env = browser();
+  const opened = await env.controller.handle({ type: 'OPEN_GIF_SELECTOR', targetTabId: 17 });
+  assert.equal(opened.ok, true);
+  assert.equal(events(env, 'sendTabMessage').at(-1).data.message.type, 'SHOW_GIF_SELECTOR');
+  const selected = await env.controller.handle({ type: 'BEGIN_GIF', targetTabId: 17 });
+  assert.equal(selected.ok, true);
+  assert.equal(selected.state.mode, 'gif');
+  assert.equal(selected.imageDataUrl, screenshot);
+  assert.equal(messages(env, 'SELECT_VIDEO').at(-1).data.mode, 'gif');
+  const started = await env.controller.handle({
+    type: 'START_VIDEO', targetTabId: 17, selectionToken: selected.selectionToken, region: selectedRegion,
+    mode: 'audio',
+  });
+  assert.equal(started.ok, true);
+  assert.equal(started.state.mode, 'gif');
+  assert.equal(messages(env, 'START').at(-1).data.mode, 'gif', 'stored selection mode cannot be replaced by a client field');
+  for (const type of ['PAGE_STOP', 'STOP_VIDEO']) {
+    assert.equal((await env.controller.handle({ type, targetTabId: 17 })).ok, false);
+  }
+  assert.equal(env.state.status, 'recording');
+  const stopped = await env.controller.handle({ type: 'STOP_GIF', targetTabId: 17 });
+  assert.equal(stopped.ok, true);
+  assert.equal(stopped.state.result.kind, 'video');
+  assert.equal(messages(env, 'STOP').length, 1);
+});
+
+test('stop keys cancel only their own visual selector and cannot stop audio or another visual mode', async () => {
+  for (const mode of ['video', 'gif']) {
+    const env = browser();
+    await env.controller.handle({ type: mode === 'gif' ? 'BEGIN_GIF' : 'BEGIN_VIDEO', targetTabId: 17 });
+    const wrong = mode === 'gif' ? 'STOP_VIDEO' : 'STOP_GIF';
+    assert.equal((await env.controller.handle({ type: wrong, targetTabId: 17 })).ok, false);
+    assert.equal(env.state.status, 'selecting');
+    const stopped = await env.controller.handle({ type: mode === 'gif' ? 'STOP_GIF' : 'STOP_VIDEO', targetTabId: 17 });
+    assert.equal(stopped.ok, true);
+    assert.equal(env.state.status, 'idle');
+    assert.equal(messages(env, 'STOP').length, 0);
+  }
+  for (const mode of ['audio', 'video', 'gif']) {
+    const env = browser({ status: 'recording', mode });
+    for (const [type, expected] of [['PAGE_STOP', 'audio'], ['STOP_VIDEO', 'video'], ['STOP_GIF', 'gif']]) {
+      if (mode === expected) continue;
+      assert.equal((await env.controller.handle({ type, targetTabId: 17 })).ok, false);
+    }
+    assert.equal((await env.controller.handle({ type: mode === 'gif' ? 'STOP_GIF' : mode === 'video' ? 'STOP_VIDEO' : 'PAGE_STOP', targetTabId: 88 })).ok, false);
+    assert.equal(messages(env, 'STOP').length, 0);
+  }
+});
+
+test('quick GIF stop cancels a scheduled selector before capture and survives a closed popup', async () => {
+  const env = browser();
+  const entered = deferred(), release = deferred();
+  let scheduled = false;
+  env.sendTabMessage = async (_tabId, message) => {
+    if (message.type === 'SHOW_GIF_SELECTOR') {
+      scheduled = true;
+      entered.resolve();
+      await release.promise;
+      return { ok: true };
+    }
+    if (message.type === 'CANCEL_VIDEO_SELECTOR') {
+      assert.equal(message.mode, 'gif');
+      const cancelled = scheduled;
+      scheduled = false;
+      return { ok: true, cancelled };
+    }
+    throw new Error(message.type);
+  };
+  const opening = env.controller.handle({ type: 'OPEN_GIF_SELECTOR', operationId: 'gif-open' });
+  await entered.promise;
+  const stopping = env.controller.handle({ type: 'STOP_PENDING', operationId: 'gif-open', mode: 'gif' });
+  release.resolve();
+  assert.equal((await opening).ok, true);
+  assert.equal((await stopping).ok, true);
+  assert.equal(scheduled, false);
+  assert.equal(events(env, 'capture').length, 0);
+  assert.equal(events(env, 'captureVisibleTab').length, 0);
+});
+
+test('GIF pending stop rejects the video stop key and stops a pending resume only in GIF mode', async () => {
+  const env = browser();
+  await env.controller.handle({ type: 'OPEN_GIF_SELECTOR', operationId: 'gif-open' });
+  const rejected = await env.controller.handle({ type: 'STOP_PENDING', operationId: 'gif-open', mode: 'video' });
+  assert.equal(rejected.ok, false);
+  assert.equal(events(env, 'sendTabMessage').filter(({ data }) => data.message.type === 'CANCEL_VIDEO_SELECTOR').length, 0);
+  const paused = browser({ status: 'paused', mode: 'gif' });
+  const entered = deferred(), release = deferred();
+  const send = paused.api.runtime.sendMessage;
+  paused.api.runtime.sendMessage = async message => {
+    if (message.type === 'RESUME') { entered.resolve(); await release.promise; }
+    return send(message);
+  };
+  void paused.controller.handle({ type: 'RESUME', operationId: 'resume-gif' });
+  await entered.promise;
+  const stopping = paused.controller.handle({ type: 'STOP_PENDING', operationId: 'resume-gif', mode: 'gif' });
+  release.resolve();
+  assert.equal((await stopping).ok, true);
+  assert.equal(paused.state.status, 'ready');
+  assert.equal(messages(paused, 'STOP').length, 1);
+});
+
+test('completed downloads allow the next audio, video, or GIF start without discarding first', async () => {
+  for (const mode of ['audio', 'video', 'gif']) {
+    for (const type of ['START', 'BROWSER_START', 'BEGIN_VIDEO', 'BEGIN_GIF', 'OPEN_VIDEO_SELECTOR', 'OPEN_GIF_SELECTOR']) {
+      const env = browser({ status: 'ready', mode, download: { id: 91, status: 'complete', error: null } });
+      const previous = structuredClone(env.state.result);
+      const reply = await env.controller.handle({ type, targetTabId: 17 });
+      assert.equal(reply.ok, true, mode + ':' + type);
+      assert.equal(messages(env, 'DISCARD').length, 0);
+      if (type.startsWith('OPEN_')) assert.deepEqual(env.state.result, previous, 'opening a selector preserves the saved file until selection begins');
+    }
+  }
+});
+
+test('unsaved, cancelled, and still-downloading files block every new capture mode', async () => {
+  for (const status of ['idle', 'interrupted', 'pending']) {
+    for (const type of ['START', 'BEGIN_VIDEO', 'BEGIN_GIF', 'OPEN_VIDEO_SELECTOR', 'OPEN_GIF_SELECTOR']) {
+      const env = browser({ status: 'ready', download: { id: status === 'pending' ? 91 : null, status, error: null } });
+      if (status === 'pending') env.items.set(91, { id: 91, state: 'in_progress' });
+      const reply = await env.controller.handle({ type, targetTabId: 17 });
+      assert.equal(reply.ok, false, status + ':' + type);
+      assert.deepEqual(env.state.result, recordedFile);
+      assert.equal(messages(env, 'DISCARD').length, 0);
+      assert.equal(events(env, 'capture').length, 0);
+      assert.equal(events(env, 'captureVisibleTab').length, 0);
+    }
+  }
+});
+
+test('start reconciles a finished download and failed preparation preserves the last saved file', async () => {
+  const env = browser({ status: 'ready', download: { id: 91, status: 'pending', error: null } });
+  env.items.set(91, { id: 91, state: 'complete' });
+  const started = await env.controller.handle({ type: 'START' });
+  assert.equal(started.ok, true);
+  assert.equal(started.state.status, 'recording');
+  for (const type of ['START', 'BEGIN_GIF', 'BEGIN_VIDEO']) {
+    const failed = browser({ status: 'ready', download: { id: 91, status: 'complete', error: null } });
+    failed.capture = failed.captureVisibleTab = async () => { throw new Error('capture failed'); };
+    assert.equal((await failed.controller.handle({ type })).ok, false);
+    assert.deepEqual(failed.state.result, recordedFile);
+    assert.equal(messages(failed, 'DISCARD').length, 0);
+  }
+});
+
+test('a delayed old download completion cannot mark a newer recording as saved', async () => {
+  const env = browser({ status: 'ready', download: { id: 91, status: 'pending', error: null } });
+  const entered = deferred(), release = deferred();
+  let first = true;
+  env.api.downloads.search = async () => {
+    if (first) { first = false; entered.resolve(); await release.promise; }
+    return [{ id: 91, state: 'complete' }];
+  };
+  const oldCompletion = env.controller.onDownloadChanged({ id: 91, state: { current: 'complete' } });
+  await entered.promise;
+  const started = await env.controller.handle({ type: 'START' });
+  assert.equal(started.ok, true);
+  release.resolve();
+  await oldCompletion;
+  assert.equal(env.state.status, 'recording');
+  assert.equal(env.state.download.status, 'idle');
+  assert.equal(env.state.download.id, null);
+  assert.equal(messages(env, 'DISCARD').length, 0);
+});
+
+test('GIF navigation uses the visual viewport session guard and closing its tab cancels selection', async () => {
+  const active = browser({ status: 'recording', mode: 'gif' });
+  active.state.videoSessionToken = 'gif-current';
+  await active.controller.onTabUpdated(17, { status: 'loading' });
+  assert.equal(messages(active, 'VIDEO_VIEWPORT_CHANGED')[0].data.selectionToken, 'gif-current');
+  const selecting = browser();
+  await selecting.controller.handle({ type: 'BEGIN_GIF', targetTabId: 17 });
+  await selecting.controller.onTabRemoved(17);
+  assert.equal(selecting.state.status, 'idle');
+  assert.equal(events(selecting, 'sendTabMessage').at(-1).data.message.mode, 'gif');
+});
+
+test('a delayed video popup stop cannot cancel a newer GIF selection', async () => {
+  const env = browser();
+  const opened = await env.controller.handle({ type: 'OPEN_VIDEO_SELECTOR', operationId: 'older-video-open' });
+  assert.equal(opened.ok, true);
+  // A page-owned selector may now represent a different visual mode while
+  // the old popup still has a valid operation ID for its delayed stop.
+  Object.assign(env.state, {
+    status: 'selecting', mode: 'gif', tab: { id: 17 },
+    selectionToken: 'new-gif-selection', selectionUrl: env.activeTab.url,
+  });
+  const stopped = await env.controller.handle({
+    type: 'STOP_PENDING', operationId: 'older-video-open', mode: 'video',
+  });
+  assert.equal(stopped.ok, false);
+  assert.equal(env.state.status, 'selecting');
+  assert.equal(env.state.mode, 'gif');
+  assert.equal(env.state.selectionToken, 'new-gif-selection');
+  assert.equal(messages(env, 'CANCEL_VIDEO').length, 0);
+  assert.equal(messages(env, 'STOP').length, 0);
 });

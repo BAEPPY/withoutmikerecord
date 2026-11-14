@@ -74,7 +74,7 @@ async function harness() {
 test('top-level page keys use the sender tab, ignoring a forged capture target in the payload', async () => {
   const h = await harness();
   for (const [key, type] of [['1', 'START'], ['2', 'PAGE_STOP'], ['3', 'BEGIN_VIDEO'], ['4', 'STOP_VIDEO'],
-    ['5', 'START'], ['6', 'PAGE_STOP']]) {
+    ['5', 'BEGIN_GIF'], ['6', 'STOP_GIF']]) {
     const response = await h.dispatch({
       target: 'background', type: 'PAGE_SHORTCUT', key,
       targetTabId: 88, expectedTabId: 88, streamId: 'untrusted-stream',
@@ -93,6 +93,7 @@ test('content scripts cannot invoke popup-only commands or forge offscreen state
     'SET_SELECTION', 'ARM_SHORTCUTS', 'STATUS', 'STATE_CHANGED',
     'BEGIN_VIDEO', 'START_VIDEO', 'CANCEL_VIDEO', 'STOP_VIDEO', 'OPEN_VIDEO_SELECTOR', 'SAVE_VIDEO',
     'SAVE_VIDEO_RANGE', 'PREPARE_VIDEO_EXPORT', 'PREPARE_GIF_COPY', 'CANCEL_EXPORT',
+    'BEGIN_GIF', 'STOP_GIF', 'OPEN_GIF_SELECTOR',
   ]) {
     await h.dispatch({
       target: 'background', type, targetTabId: 17,
@@ -338,4 +339,22 @@ test('a closed source page cannot break recording state handling', async () => {
     status: 'ready', mode: 'video', tab: { id: 17 }, selectionToken: null, videoSessionToken: 'ended-video',
   }));
   await assert.doesNotReject(h.stateChange({ status: 'idle', mode: 'audio', tab: null }));
+});
+
+test('GIF browser commands retain source-tab binding and receive separate visual session notifications', async () => {
+  const h = await harness();
+  h.listeners.command('start-gif', { id: 88 });
+  h.listeners.command('stop-gif', { id: 17 });
+  await settle();
+  assert.deepEqual(h.calls, [
+    { type: 'OPEN_GIF_SELECTOR', targetTabId: 88 }, { type: 'STOP_GIF', targetTabId: 17 },
+  ]);
+  await h.stateChange({ status: 'selecting', mode: 'gif', tab: { id: 17 }, selectionToken: 'gif-token', videoSessionToken: null });
+  await h.stateChange({ status: 'recording', mode: 'gif', tab: { id: 17 }, selectionToken: null, videoSessionToken: 'gif-token' });
+  await h.stateChange({ status: 'ready', mode: 'gif', tab: { id: 17 }, selectionToken: null, videoSessionToken: 'gif-token' });
+  await h.stateChange({ status: 'recording', mode: 'audio', tab: { id: 88 } });
+  assert.deepEqual(h.pageMessages.map(({ message }) => [message.state.mode, message.state.status]), [
+    ['gif', 'selecting'], ['gif', 'recording'], ['gif', 'ready'], ['gif', 'idle'],
+  ]);
+  assert.ok(h.pageMessages.every(({ tabId }) => tabId === 17));
 });

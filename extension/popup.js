@@ -17,6 +17,7 @@ const ui = {
   start: byId("start-button"),
   openExtract: byId("open-extract-button"),
   startVideo: byId("start-video-button"),
+  startGif: byId("start-gif-button"),
   startLabel: byId("start-label"),
   recordingControls: byId("recording-controls"),
   pause: byId("pause-button"),
@@ -62,6 +63,8 @@ const ui = {
   shortcutAudioStop: byId("shortcut-audio-stop"),
   shortcutVideoStart: byId("shortcut-video-start"),
   shortcutVideoStop: byId("shortcut-video-stop"),
+  shortcutGifStart: byId("shortcut-gif-start"),
+  shortcutGifStop: byId("shortcut-gif-stop"),
   shortcutAssignmentNote: byId("shortcut-assignment-note"),
   shortcutSettings: byId("shortcut-settings"),
 };
@@ -92,6 +95,7 @@ let connectionError = "";
 let commandVersion = 0;
 let previewUrl = "";
 let previewKind = "audio";
+let lastVisualCaptureMode = null;
 let previewEnd = null;
 let previewFrame = null;
 let previewVersion = 0;
@@ -142,20 +146,27 @@ function videoResult() {
   return state.result?.kind === "video";
 }
 
-function videoMode() {
-  return state.status === "selecting" || state.mode === "video" || videoResult();
+function captureMode() {
+  if (state.mode === "gif") return "gif";
+  return state.status === "selecting" || state.mode === "video" || videoResult() ? "video" : "audio";
+}
+
+function mayStart() {
+  return ["idle", "error"].includes(state.status)
+    || (state.status === "ready" && state.download?.status === "complete");
 }
 
 function pendingCaptureMode() {
   if (activeCommand === "START") return "audio";
   if (activeCommand === "OPEN_VIDEO_SELECTOR") return "video";
-  if (activeCommand === "PAUSE" || activeCommand === "RESUME") return videoMode() ? "video" : "audio";
+  if (activeCommand === "OPEN_GIF_SELECTOR") return "gif";
+  if (activeCommand === "PAUSE" || activeCommand === "RESUME") return captureMode();
   return null;
 }
 
 function canStop(mode) {
   if (busy) return pendingCaptureMode() === mode;
-  return mode === (videoMode() ? "video" : "audio")
+  return mode === (captureMode())
     && ["starting", "recording", "paused", "selecting"].includes(state.status);
 }
 
@@ -201,8 +212,12 @@ function saveContent() {
   return ["both", "video", "audio"].includes(ui.saveContent.value) ? ui.saveContent.value : "both";
 }
 
+function saveFormat() {
+  return captureMode() === "gif" ? "gif" : ui.saveFormat.value;
+}
+
 function hasVisualOutput() {
-  return videoResult() && (ui.saveFormat.value === "gif" || saveContent() !== "audio");
+  return videoResult() && (saveFormat() === "gif" || saveContent() !== "audio");
 }
 
 function saveQuality() {
@@ -219,18 +234,18 @@ function loadSaveQuality() {
 }
 
 function videoSaveOptions() {
-  if (ui.saveFormat.value === "gif") return { format: "gif", quality: saveQuality() };
+  if (saveFormat() === "gif") return { format: "gif", quality: saveQuality() };
   return { format: "mp4", content: saveContent(), ...(hasVisualOutput() ? { quality: saveQuality() } : {}) };
 }
 
 function savedOutputLabel() {
   if (!videoResult()) return ".mp4";
-  if (ui.saveFormat.value === "gif") return ".gif";
+  if (saveFormat() === "gif") return ".gif";
   return `${{ both: "영상+소리", video: "무음 영상", audio: "소리만" }[saveContent()]} .mp4`;
 }
 
 function videoProcessingLabel() {
-  if (ui.saveFormat.value === "gif") return "영상 구간 만드는 중";
+  if (saveFormat() === "gif") return "영상 구간 만드는 중";
   return { both: "영상 구간 만드는 중", video: "무음 영상 만드는 중", audio: "소리만 만드는 중" }[saveContent()];
 }
 
@@ -249,7 +264,7 @@ function readSelection() {
 }
 
 function selectedExportError(selection) {
-  return videoResult() && ui.saveFormat.value !== "gif" && !selection.error && trimAvailable()
+  return videoResult() && saveFormat() !== "gif" && !selection.error && trimAvailable()
     && selection.endSeconds - selection.startSeconds < 0.04 - 1e-9
     ? "영상 MP4 구간은 0.04초 이상 선택해 주세요. 더 짧은 구간은 GIF로 저장할 수 있어요." : "";
 }
@@ -299,15 +314,16 @@ function renderEditor() {
   const url = state.result?.url || "";
   const video = videoResult();
   const kind = video ? "video" : "audio";
+  if (captureMode() === "gif") ui.saveFormat.value = "gif";
   ui.audio.hidden = video;
   ui.video.hidden = !video;
   ui.videoNote.hidden = !video;
   ui.audioTrimControls.hidden = false;
   ui.saveRange.hidden = false;
   ui.saveFormatField.hidden = !video;
-  ui.saveContentField.hidden = !video || ui.saveFormat.value === "gif";
+  ui.saveContentField.hidden = !video || saveFormat() === "gif";
   const visual = hasVisualOutput();
-  const gif = ui.saveFormat.value === "gif";
+  const gif = saveFormat() === "gif";
   ui.saveQualityField.hidden = !visual;
   ui.saveQualityNote.hidden = !visual;
   setText(ui.qualityOriginal, gif ? "높음 · 최대 640px" : "원본 유지");
@@ -316,9 +332,9 @@ function renderEditor() {
   setText(ui.saveQualityNote, gif
     ? "크기는 긴 변 기준이며 원본보다 확대하지 않아요. 화질을 낮추면 대체로 파일이 작아져요."
     : "원본보다 확대하지 않아요. 화질을 낮추면 대체로 파일이 작아지며, 소리 설정은 그대로예요.");
-  const description = ui.saveFormat.value === "gif" ? "GIF는 소리 없이 저장해요."
+  const description = saveFormat() === "gif" ? "GIF는 소리 없이 저장해요."
     : `MP4는 ${{ both: "영상과 소리를 함께", video: "소리 없이 영상만", audio: "영상 없이 소리만" }[saveContent()]} 저장해요.`;
-  setText(ui.videoNote, `${description} 미리보기는 원본 영상과 소리예요. 변환은 저장할 영상 길이만큼 시간이 걸릴 수 있어요.`);
+  setText(ui.videoNote, `${description} ${captureMode() === "gif" ? "미리보기는 소리 없는 원본 영상이에요." : "미리보기는 원본 영상과 소리예요."} 변환은 저장할 영상 길이만큼 시간이 걸릴 수 있어요.`);
   setText(ui.trimTitle, video ? "보고, 원하는 구간만 저장하기" : "듣고, 원하는 구간만 저장하기");
   if (previewEnd === null) setText(ui.previewRange, rangePreviewLabel());
   ui.previewPosition.setAttribute("aria-label", video ? "영상 현재 위치와 전체 길이" : "미리 듣기 현재 위치와 전체 길이");
@@ -365,7 +381,7 @@ function renderEditor() {
   setText(ui.trimError, selection.error || exportError);
   ui.trimError.hidden = !(selection.error || exportError);
   setText(ui.trimSummary, !available ? "구간 편집 불가" : selection.error ? `전체 ${floorHundredths(duration).toFixed(2)}초` : `선택 ${(selection.endSeconds - selection.startSeconds).toFixed(2)}초 / 전체 ${floorHundredths(duration).toFixed(2)}초`);
-  const format = video && ui.saveFormat.value === "gif" ? "gif" : "mp4";
+  const format = video && saveFormat() === "gif" ? "gif" : "mp4";
   const showCopy = video && format === "gif";
   ui.rangeSaveRow.dataset.copy = String(showCopy);
   ui.saveRow.dataset.copy = String(showCopy);
@@ -384,24 +400,30 @@ function renderEditor() {
 }
 
 function render() {
+  const visualMode = captureMode();
+  if (visualMode === "gif") ui.saveFormat.value = "gif";
+  else if (visualMode === "video" && lastVisualCaptureMode === "gif") ui.saveFormat.value = "mp4";
+  if (visualMode !== "audio") lastVisualCaptureMode = visualMode;
   if (exporting()) {
     if (["mp4", "gif"].includes(state.exportFormat)) ui.saveFormat.value = state.exportFormat;
-    if (ui.saveFormat.value !== "gif" && ["both", "video", "audio"].includes(state.exportContent)) ui.saveContent.value = state.exportContent;
+    if (saveFormat() !== "gif" && ["both", "video", "audio"].includes(state.exportContent)) ui.saveContent.value = state.exportContent;
     if (hasVisualOutput() && QUALITY_VALUES.includes(state.exportQuality)) ui.saveQuality.value = state.exportQuality;
   }
   const status = state.status;
   const recording = status === "recording";
   const paused = status === "paused";
   const selecting = status === "selecting";
-  const starting = status === "starting" || activeCommand === "START" || activeCommand === "OPEN_VIDEO_SELECTOR";
-  const mode = pendingCaptureMode() || (videoMode() ? "video" : "audio");
-  const video = mode === "video";
+  const starting = status === "starting" || ["START", "OPEN_VIDEO_SELECTOR", "OPEN_GIF_SELECTOR"].includes(activeCommand);
+  const mode = pendingCaptureMode() || (captureMode());
+  const gif = mode === "gif";
+  const video = mode === "video" || gif;
   const ready = status === "ready" || status === "trimming" || status === "exporting";
   const transitional = status === "starting" || status === "stopping" || status === "trimming" || status === "exporting";
   const download = state.download || {};
   const pending = download.status === "pending";
   const complete = download.status === "complete";
   const interrupted = download.status === "interrupted";
+  const nextReady = status === "ready" && complete;
   const elapsedSeconds = Math.max(0, (Number(state.elapsedMs) || 0) / 1000);
   const time = formatTime(elapsedSeconds);
   ui.app.dataset.ready = String(ready);
@@ -410,33 +432,38 @@ function render() {
   ui.statusPill.dataset.status = status;
   const progress = exportPercent();
   const statusLabel = video ? { starting: "녹화 준비 중", recording: "영상 녹화 중", ready: "녹화 완료", error: "녹화 확인 필요", trimming: `${videoProcessingLabel()} ${progress}%`, exporting: `GIF 만드는 중 ${progress}%` }[status] : null;
-  setText(ui.statusLabel, statusLabel || statusLabels[status] || "상태 확인 중");
-  setText(ui.formatTag, video ? "MP4 / VIDEO + AUDIO" : "MP4 / AUDIO");
-  setText(ui.timerCaption, selecting ? "페이지에서 녹화할 사각형 영역을 드래그해 주세요" : recording ? `팝업을 닫아도 계속 ${video ? "녹화" : "녹음"}돼요` : paused ? "잠시 쉬는 중 · 정지한 시간은 제외돼요" : ready ? `${video ? "녹화" : "녹음"} 파일을 기기에 저장하세요` : status === "stopping" ? "MP4 파일을 정리하고 있어요" : "녹음할 탭에서 시작해 주세요");
+  setText(ui.statusLabel, nextReady ? "저장 완료 · 다음 촬영 준비" : gif && recording ? "GIF 녹화 중" : statusLabel || statusLabels[status] || "상태 확인 중");
+  setText(ui.formatTag, gif ? "GIF / NO AUDIO" : video ? "MP4 / VIDEO + AUDIO" : "MP4 / AUDIO");
+  setText(ui.timerCaption, selecting ? "페이지에서 녹화할 사각형 영역을 드래그해 주세요" : recording ? `팝업을 닫아도 계속 ${video ? "녹화" : "녹음"}돼요` : paused ? "잠시 쉬는 중 · 정지한 시간은 제외돼요" : nextReady ? "시작 버튼이나 1·3·5를 누르면 다음 촬영을 시작해요" : ready ? `${video ? "녹화" : "녹음"} 파일을 기기에 저장하세요` : status === "stopping" ? "녹화 파일을 정리하고 있어요" : "녹음할 탭에서 시작해 주세요");
   ui.level.style.transform = `scaleX(${recording ? Math.max(0, Math.min(1, Number(state.level) || 0)) : 0})`;
-  setText(ui.levelLabel, recording ? "현재 탭 오디오" : paused ? "오디오 일시 정지" : ready ? `${video ? "녹화" : "녹음"} 파일 크기` : "오디오 대기 중");
+  setText(ui.levelLabel, gif ? "GIF는 소리 없이 녹화해요" : recording ? "현재 탭 오디오" : paused ? "오디오 일시 정지" : ready ? `${video ? "녹화" : "녹음"} 파일 크기` : "오디오 대기 중");
   setText(ui.fileSize, formatBytes(state.result?.bytes ?? state.bytes));
   const title = state.tab?.title || "시작할 때 열려 있는 탭";
   setText(ui.source, title);
   ui.source.title = title;
 
-  ui.start.hidden = ready || recording || paused || selecting || starting || status === "stopping";
-  ui.start.disabled = busy || !(status === "idle" || status === "error");
+  ui.start.hidden = (ready && !nextReady) || recording || paused || selecting || starting || status === "stopping";
+  ui.start.disabled = busy || !mayStart();
   ui.startVideo.hidden = ui.start.hidden;
   ui.startVideo.disabled = ui.start.disabled;
-  setText(ui.startLabel, status === "starting" ? "녹음 준비 중…" : "녹음 시작");
+  ui.startGif.hidden = ui.start.hidden;
+  ui.startGif.disabled = ui.start.disabled;
+  setText(ui.startLabel, status === "starting" ? "녹음 준비 중…" : nextReady ? "다음 소리 녹음 · 1" : "소리만 녹음 · 1");
+  setText(ui.startVideo, nextReady ? "다음 화면+소리 녹화 · 3" : "화면+소리 녹화 · 3");
+  setText(ui.startGif, nextReady ? "다음 영역 GIF 녹화 · 5" : "영역 GIF 녹화 · 5");
   ui.recordingControls.hidden = !(recording || paused || selecting || starting || status === "stopping");
   ui.recordingControls.classList.toggle("recording-selecting", selecting || starting);
   ui.pause.hidden = selecting || starting;
   ui.pause.disabled = busy || transitional;
   setText(ui.pause, paused ? "녹음 재개" : "일시 정지");
   ui.stop.disabled = Boolean(queuedStop) || !canStop(mode);
-  setText(ui.stopLabel, queuedStop ? "종료 요청 대기 중…" : selecting || activeCommand === "OPEN_VIDEO_SELECTOR" ? "영역 선택 취소" : video ? "영상 끝내기" : "녹음 끝내기");
-  ui.stop.setAttribute("aria-keyshortcuts", video ? "4" : "2 6");
-  ui.stop.title = selecting ? "영역 선택 취소 (키보드 4)" : video ? "영상 끝내기 (키보드 4)" : "소리만 녹음 끝내기 (키보드 2 또는 6)";
+  setText(ui.stopLabel, queuedStop ? "종료 요청 대기 중…" : selecting || ["OPEN_VIDEO_SELECTOR", "OPEN_GIF_SELECTOR"].includes(activeCommand) ? "영역 선택 취소" : gif ? "GIF 녹화 끝내기" : video ? "영상 끝내기" : "녹음 끝내기");
+  const stopKey = gif ? "6" : video ? "4" : "2";
+  ui.stop.setAttribute("aria-keyshortcuts", stopKey);
+  ui.stop.title = `${selecting ? "영역 선택 취소" : gif ? "GIF 녹화 끝내기" : video ? "영상 끝내기" : "소리만 녹음 끝내기"} (키보드 ${stopKey})`;
   ui.readyControls.hidden = !ready;
   ui.save.disabled = busy || pending || status !== "ready" || !state.result;
-  ui.saveFormat.disabled = busy || pending || status !== "ready";
+  ui.saveFormat.disabled = gif || busy || pending || status !== "ready";
   ui.saveContent.disabled = busy || pending || status !== "ready";
   ui.saveQuality.disabled = busy || pending || status !== "ready";
   ui.cancelExport.hidden = !exporting();
@@ -448,12 +475,12 @@ function render() {
   ui.save.classList.toggle("secondary", trimAvailable());
   setText(ui.save, status === "exporting" && activeCommand === "SAVE_VIDEO" ? `전체 GIF 만드는 중 ${progress}%`
     : status === "trimming" && activeCommand === "SAVE_VIDEO" ? `${videoProcessingLabel()} ${progress}%` : `전체 저장 · ${savedOutputLabel()}`);
-  setText(ui.hint, queuedStop ? "종료 요청을 기억했어요. 진행 중인 준비가 끝나면 바로 종료해요." : selecting ? "이 창을 닫고 페이지에서 영역을 선택하면 녹화가 시작돼요." : ready ? pending ? "저장이 끝날 때까지 파일을 보관해요." : complete ? "저장 완료 · 새 녹음을 시작할 수 있어요." : "브라우저를 닫기 전에 파일을 저장해 주세요." : recording || paused ? video ? "선택 영역 영상과 현재 탭 소리를 함께 녹화해요." : "현재 탭만 녹음해요 · 최대 2시간 또는 128 MB" : starting ? "잠시만 기다려 주세요. 준비 중에도 종료할 수 있어요." : transitional ? "잠시만 기다려 주세요." : "소리만 녹음하거나, 영역을 선택해 영상으로 저장하세요.");
+  setText(ui.hint, queuedStop ? "종료 요청을 기억했어요. 진행 중인 준비가 끝나면 바로 종료해요." : selecting ? "이 창을 닫고 페이지에서 영역을 선택하면 녹화가 시작돼요." : ready ? pending ? "저장이 끝날 때까지 파일을 보관해요." : complete ? "저장 완료 · 1은 소리, 3은 화면+소리, 5는 GIF를 새로 녹화해요." : "브라우저를 닫기 전에 파일을 저장해 주세요." : recording || paused ? gif ? "선택 영역만 GIF로 녹화해요. 소리는 담지 않아요." : video ? "선택 영역 영상과 현재 탭 소리를 함께 녹화해요." : "현재 탭만 녹음해요 · 최대 2시간 또는 128 MB" : starting ? "잠시만 기다려 주세요. 준비 중에도 종료할 수 있어요." : transitional ? "잠시만 기다려 주세요." : "소리, 화면+소리, 영역 GIF 중에서 시작하세요.");
 
   const error = commandError || connectionError || state.error || (interrupted ? download.error || "다운로드가 중단됐어요. 저장을 다시 시도해 주세요." : "");
   setText(ui.error, error);
   ui.error.hidden = !error;
-  const notice = [state.notice, ready && complete ? "다운로드가 완료됐어요. 브라우저의 다운로드 목록에서 확인하세요." : ""].filter(Boolean).join(" ");
+  const notice = [state.notice, ready && complete ? "다운로드 완료 · 다음 촬영을 바로 시작할 수 있어요. 새 촬영 전까지 이전 파일도 다시 저장할 수 있어요." : ""].filter(Boolean).join(" ");
   setText(ui.notice, notice);
   ui.notice.hidden = !notice;
   renderEditor();
@@ -480,7 +507,7 @@ async function armShortcuts() {
   ui.shortcutStatus.dataset.status = shortcutConnection;
   ui.shortcutStatus.title = shortcutDetail;
   setText(ui.shortcutStatus, shortcutConnection === "connected"
-    ? "이 탭에 연결됨 · 창을 닫아도 5/6 소리만 (1/2도 가능) · 3/4 영상"
+    ? "이 탭에 연결됨 · 창을 닫아도 1/2 소리 · 3/4 화면+소리 · 5/6 GIF"
     : "페이지 숫자키 연결 불가 · 아래 등록 상태와 단축키 설정을 확인해 주세요.");
 }
 
@@ -488,6 +515,7 @@ async function loadShortcutAssignments() {
   const assignments = [
     ["start-recording", ui.shortcutAudioStart], ["stop-recording", ui.shortcutAudioStop],
     ["start-video", ui.shortcutVideoStart], ["stop-video", ui.shortcutVideoStop],
+    ["start-gif", ui.shortcutGifStart], ["stop-gif", ui.shortcutGifStop],
   ];
   try {
     const commands = await chrome.commands.getAll();
@@ -513,7 +541,7 @@ async function loadShortcutAssignments() {
 
 async function command(type, payload = {}, afterSuccess = null) {
   if (busy) return;
-  const operationId = ["START", "OPEN_VIDEO_SELECTOR", "PAUSE", "RESUME"].includes(type) ? crypto.randomUUID() : null;
+  const operationId = ["START", "OPEN_VIDEO_SELECTOR", "OPEN_GIF_SELECTOR", "PAUSE", "RESUME"].includes(type) ? crypto.randomUUID() : null;
   busy = true;
   activeCommand = type;
   activeOperationId = operationId;
@@ -605,7 +633,10 @@ async function poll() {
 }
 
 ui.start.addEventListener("click", () => {
-  if (state.status === "idle" || state.status === "error") void command("START");
+  if (mayStart()) {
+    stopRangePreview();
+    void command("START");
+  }
 });
 ui.openExtract.addEventListener("click", async () => {
   if (ui.openExtract.disabled) return;
@@ -619,19 +650,22 @@ ui.openExtract.addEventListener("click", async () => {
     ui.openExtract.disabled = false;
   }
 });
-ui.startVideo.addEventListener("click", () => {
-  if (state.status !== "idle" && state.status !== "error") return;
-  void command("OPEN_VIDEO_SELECTOR").then((ok) => {
+function openSelector(type) {
+  if (!mayStart()) return;
+  stopRangePreview();
+  void command(type).then((ok) => {
     if (ok) window.close();
   });
-});
+}
+ui.startVideo.addEventListener("click", () => openSelector("OPEN_VIDEO_SELECTOR"));
+ui.startGif.addEventListener("click", () => openSelector("OPEN_GIF_SELECTOR"));
 ui.pause.addEventListener("click", () => {
   if (state.status === "recording" || state.status === "paused") {
     void command(state.status === "paused" ? "RESUME" : "PAUSE");
   }
 });
 ui.stop.addEventListener("click", () => {
-  stopCapture(pendingCaptureMode() || (videoMode() ? "video" : "audio"));
+  stopCapture(pendingCaptureMode() || (captureMode()));
 });
 document.addEventListener("keydown", (event) => {
   // Shortcuts belong to this popup; preserve typing and native media controls.
@@ -641,14 +675,14 @@ document.addEventListener("keydown", (event) => {
   if (target instanceof Element && (target.isContentEditable
     || target.closest('input, textarea, select, audio, video, [role="textbox"], [role="spinbutton"]'))) return;
   const key = popupShortcutKey(event);
-  const stopMode = key === "2" || key === "6" ? "audio" : key === "4" ? "video" : null;
+  const stopMode = key === "2" ? "audio" : key === "4" ? "video" : key === "6" ? "gif" : null;
   if (stopMode && stopCapture(stopMode)) {
     event.preventDefault();
     return;
   }
   if (busy) return;
-  const button = (key === "1" || key === "5") && ["idle", "error"].includes(state.status) ? ui.start
-    : key === "3" && ["idle", "error"].includes(state.status) ? ui.startVideo : null;
+  const button = !mayStart() ? null : key === "1" ? ui.start
+    : key === "3" ? ui.startVideo : key === "5" ? ui.startGif : null;
   if (!button || button.disabled || button.closest("[hidden]")) return;
   event.preventDefault();
   button.click();
@@ -702,7 +736,7 @@ ui.saveRange.addEventListener("click", () => {
   else void command("SAVE_RANGE", range);
 });
 async function copyGif(scope) {
-  if (busy || state.status !== "ready" || state.download?.status === "pending" || !videoResult() || ui.saveFormat.value !== "gif") return;
+  if (busy || state.status !== "ready" || state.download?.status === "pending" || !videoResult() || saveFormat() !== "gif") return;
   const selection = readSelection();
   if (scope === "range" && (!trimAvailable() || selection.error)) return;
   stopRangePreview();

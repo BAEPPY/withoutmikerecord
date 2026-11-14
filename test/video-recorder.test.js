@@ -136,7 +136,7 @@ function harness(options = {}) {
   return { engine, audio, video, cropped, captures, crops, recorders, urls, revoked, exports, exportSettings, inspections, trims,
     audioTrims, trackSelections, states,
     advance: (ms) => { elapsed += ms; },
-    select: () => engine.handle({ type: 'SELECT_VIDEO', tab, selectionToken: 'fresh-token' }),
+    select: (mode = 'video') => engine.handle({ type: 'SELECT_VIDEO', mode, tab, selectionToken: 'fresh-token' }),
     start: (overrides = {}) => engine.handle({ type: 'START', mode: 'video', tab, region,
       selectionToken: 'fresh-token', streamId: 'tab-stream', ...overrides }),
   };
@@ -1541,4 +1541,100 @@ test('discard clears quality caches and releases every source and derived URL ex
   assert.notEqual(next.state.gifResult.url, oldGif);
   assert.notEqual(h.exports.at(-1), originalBlob);
   assert.equal(h.exports.length, 3);
+});
+
+test('GIF capture requests video only and works without audio tracks or AudioContext', async () => {
+  const h = harness({ noAudio: true, types: ['video/mp4;codecs=vp9'] });
+  h.engine.AudioContext = undefined;
+  const selection = await h.select('gif');
+  assert.equal(selection.state.mode, 'gif');
+  assert.equal((await h.start({ mode: 'gif' })).ok, true);
+  assert.equal(h.captures[0].audio, false);
+  assert.equal(h.captures[0].video.mandatory.chromeMediaSource, 'tab');
+  assert.deepEqual(h.recorders[0].stream.getTracks(), [h.cropped]);
+  assert.equal(h.recorders[0].settings.audioBitsPerSecond, undefined);
+  assert.equal(h.engine.context, null);
+  assert.equal(h.engine.getState().level, 0);
+  h.advance(2400);
+  const stopped = await h.engine.handle({ type: 'STOP' });
+  assert.equal(stopped.ok, true);
+  assert.equal(stopped.state.mode, 'gif');
+  assert.equal(stopped.state.result.kind, 'video', 'GIF editing reuses the visual preview');
+  assert.equal(stopped.state.result.durationSeconds, 2.4);
+  assert.equal(stopped.state.result.width, 640);
+  assert.equal(h.video.stopped, true);
+  assert.equal(h.cropped.stopped, true);
+  const prepared = await h.engine.handle({ type: 'PREPARE_GIF', quality: 'small' });
+  assert.equal(prepared.ok, true);
+  assert.equal(prepared.state.gifResult.mimeType, 'image/gif');
+  assert.equal(h.exports[0], h.engine.originalBlob);
+});
+
+test('GIF selection rejects mismatched modes and stale capture sessions without touching media', async () => {
+  const h = harness({ noAudio: true, types: ['video/mp4;codecs=vp9'] });
+  assert.equal((await h.select('invalid')).ok, false);
+  assert.equal(h.engine.getState().status, 'idle');
+  await h.select('gif');
+  assert.equal((await h.start()).ok, false, 'video START must not consume a GIF selector');
+  assert.equal((await h.start({ mode: 'gif', selectionToken: 'stale' })).ok, false);
+  assert.equal(h.captures.length, 0);
+  assert.equal(h.engine.getState().mode, 'gif');
+  const cancelled = await h.engine.handle({ type: 'CANCEL_VIDEO', selectionToken: 'fresh-token' });
+  assert.equal(cancelled.state.status, 'idle');
+});
+
+test('GIF viewport changes stop the matching capture and release silent video resources', async () => {
+  const h = harness({ noAudio: true, types: ['video/mp4;codecs=vp9'] });
+  await h.select('gif');
+  await h.start({ mode: 'gif' });
+  h.advance(1800);
+  await h.engine.handle({ type: 'VIDEO_VIEWPORT_CHANGED', tabId: 41, selectionToken: 'wrong' });
+  assert.equal(h.engine.getState().status, 'recording');
+  await h.engine.handle({ type: 'VIDEO_VIEWPORT_CHANGED', tabId: 41, selectionToken: 'fresh-token' });
+  await h.engine.stopPromise;
+  assert.equal(h.engine.getState().status, 'ready');
+  assert.equal(h.engine.getState().mode, 'gif');
+  assert.match(h.engine.getState().notice, /화면 크기/);
+  assert.equal(h.video.stopped, true);
+  assert.equal(h.cropped.stopped, true);
+});
+
+test('GIF supports pause, resume and automatic source-end finalization without audio', async () => {
+  const h = harness({ noAudio: true, types: ['video/mp4;codecs=vp9'] });
+  await h.select('gif');
+  await h.start({ mode: 'gif' });
+  h.advance(1000);
+  await h.engine.handle({ type: 'PAUSE' });
+  assert.equal(h.engine.getState().status, 'paused');
+  await h.engine.handle({ type: 'RESUME' });
+  h.advance(1800);
+  h.video.dispatchEvent(new Event('ended'));
+  await h.engine.stopPromise;
+  assert.equal(h.engine.getState().status, 'ready');
+  assert.equal(h.engine.getState().mode, 'gif');
+  assert.equal(h.recorders[0].stream.getAudioTracks().length, 0);
+});
+
+test('a completed download enables a new GIF selector while failed or pending saves retain the source', async () => {
+  for (const status of ['idle', 'pending', 'interrupted', 'complete']) {
+    const h = harness();
+    await h.select(); await h.start(); h.advance(1800);
+    await h.engine.handle({ type: 'STOP' });
+    const previous = h.engine.getState().result.url;
+    if (status !== 'idle') {
+      await h.engine.handle({ type: 'DOWNLOAD_UPDATE', download: { id: 7, status: 'pending' } });
+      if (status !== 'pending') await h.engine.handle({ type: 'DOWNLOAD_UPDATE', download: { id: 7, status } });
+    }
+    const selected = await h.select('gif');
+    assert.equal(selected.ok, status === 'complete', status);
+    if (status === 'complete') {
+      assert.equal(selected.state.status, 'selecting');
+      assert.equal(selected.state.mode, 'gif');
+      assert.equal(selected.state.result, null);
+      assert.ok(h.revoked.includes(previous));
+    } else {
+      assert.equal(h.engine.getState().result.url, previous);
+      assert.equal(h.revoked.length, 0);
+    }
+  }
 });

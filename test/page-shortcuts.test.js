@@ -227,46 +227,29 @@ test('a failed start drops the queued stop and clears it before the next start',
   assert.match(env.toast(), /녹음을 시작했어요/);
 });
 
-test('5/6 and mixed audio aliases queue exactly one matching stop while starting', async () => {
-  for (const [startKey, stopKey] of [['5', '6'], ['1', '6'], ['5', '2']]) {
-    const env = page();
-    const started = deferred();
-    env.respond = (message) => message.key === startKey
-      ? started.promise : { ok: true, state: { mode: 'audio', status: 'ready' } };
-    const start = env.press(startKey);
-    await env.press(stopKey).completion;
-    await env.press(stopKey === '6' ? '2' : '6').completion;
-    await env.press(startKey).completion;
-    assert.deepEqual(env.sent.map((message) => message.key), [startKey]);
-    started.resolve({ ok: true, state: { mode: 'audio', status: 'recording' } });
-    await start.completion;
-    assert.deepEqual(env.sent.map((message) => message.key), [startKey, stopKey]);
-    assert.match(env.toast(), /녹음을 마쳤어요/);
-  }
-});
-
-test('5 starts audio directly without selecting a region and advertises its stop keys', async () => {
+test('audio startup ignores 6 because it belongs only to GIF mode', async () => {
   const env = page();
-  await env.press('5').completion;
-  assert.deepEqual(env.sent, [{ target: 'background', type: 'PAGE_SHORTCUT', key: '5' }]);
-  assert.match(env.toast(), /소리만 녹음을 시작/);
-  assert.match(env.toast(), /2 또는 6/);
+  const started = deferred();
+  env.respond = (message) => message.key === '1' ? started.promise : { ok: true };
+  const start = env.press('1');
   await env.press('6').completion;
-  assert.deepEqual(env.sent.map((message) => message.key), ['5', '6']);
-  assert.match(env.toast(), /녹음을 마쳤어요/);
+  started.resolve({ ok: true, state: { mode: 'audio', status: 'recording' } });
+  await start.completion;
+  assert.deepEqual(env.sent.map((message) => message.key), ['1']);
+  assert.match(env.toast(), /2를 누르면/);
 });
 
-test('a rejected 5 start sends queued 6 only when audio is already recording', async () => {
-  for (const mode of ['audio', 'video']) {
+test('a rejected 5 start sends queued 6 only when GIF is already recording', async () => {
+  for (const mode of ['audio', 'video', 'gif']) {
     const env = page();
     const started = deferred();
     env.respond = (message) => message.key === '5'
-      ? started.promise : { ok: true, state: { mode: 'audio', status: 'ready' } };
+      ? started.promise : { ok: true, state: { mode: 'gif', status: 'ready' } };
     const start = env.press('5');
     await env.press('6').completion;
     started.resolve({ ok: false, error: '이미 진행 중입니다.', state: { mode, status: 'recording' } });
     await start.completion;
-    assert.deepEqual(env.sent.map((message) => message.key), mode === 'audio' ? ['5', '6'] : ['5']);
+    assert.deepEqual(env.sent.map((message) => message.key), mode === 'gif' ? ['5', '6'] : ['5']);
   }
 });
 
@@ -633,7 +616,7 @@ test('3 routes the accepted normalized region and selection token without showin
     assert.ok(event.prevented && event.stopped);
     assert.deepEqual(env.selections, [{
       imageDataUrl: videoSelection.imageDataUrl,
-      selectionToken: videoSelection.selectionToken,
+      selectionToken: videoSelection.selectionToken, mode: 'video',
     }]);
     assert.deepEqual(env.sent, [
       { target: 'background', type: 'PAGE_SHORTCUT', key: '3' },
@@ -1209,3 +1192,192 @@ for (const scenario of [
     }
   });
 }
+
+function gifState(status, selectionToken = 'gif-token') {
+  return { mode: 'gif', status, videoSessionToken: selectionToken };
+}
+
+const gifSelection = {
+  ...videoSelection, selectionToken: 'gif-token', state: { status: 'selecting', mode: 'gif' },
+};
+
+test('5 selects a GIF region and 6 stops it without any audio command or captured toast', async () => {
+  const env = page({ runtimeMessages: true });
+  const controls = youtubeControls(env);
+  env.respond = (message) => message.key === '5' ? gifSelection
+    : { ok: true, state: gifState(message.key === '6' ? 'ready' : 'recording') };
+  env.selectRegion = async () => videoRegion;
+  await env.press('5').completion;
+  assert.deepEqual(env.selections, [{
+    imageDataUrl: gifSelection.imageDataUrl, selectionToken: 'gif-token', mode: 'gif',
+  }]);
+  assert.equal(env.toast(), '');
+  assert.equal(controls.activeToken, 'gif-token');
+  assert.equal(watcherCount(env, 'resize'), 1);
+  await env.press('6').completion;
+  assert.equal(controls.activeToken, null);
+  assert.equal(watcherCount(env, 'resize'), 0);
+  assert.match(env.toast(), /GIF 녹화를 마쳤어요/);
+  assert.deepEqual(env.sent.map((message) => message.key || message.type), ['5', 'VIDEO_REGION_SELECTED', '6']);
+});
+
+test('6 cancels pending 5 before its selection token arrives without starting the selector', async () => {
+  const env = page();
+  const begin = deferred();
+  env.respond = (message) => message.key === '5' ? begin.promise : { ok: true };
+  const start = env.press('5');
+  await env.press('2').completion;
+  await env.press('4').completion;
+  assert.equal(env.selectorCancels, 0, 'audio/video stop keys must not cancel pending GIF');
+  await env.press('6').completion;
+  await env.press('6').completion;
+  begin.resolve(gifSelection);
+  await start.completion;
+  assert.deepEqual(env.selections, []);
+  assert.deepEqual(env.sent.map((message) => message.key || message.type), ['5', 'CANCEL_VIDEO_SELECTION']);
+});
+
+test('6 cancels an open GIF selector but 2 and 4 do not', async () => {
+  const env = page();
+  const entered = deferred(), selected = deferred();
+  env.respond = (message) => message.key === '5' ? gifSelection : { ok: true };
+  env.selectRegion = () => { entered.resolve(); return selected.promise; };
+  env.cancelRegion = () => selected.resolve(null);
+  const start = env.press('5');
+  await entered.promise;
+  await env.press('2').completion;
+  await env.press('4').completion;
+  assert.equal(env.selectorCancels, 0);
+  await env.press('6').completion;
+  await start.completion;
+  assert.equal(env.selectorCancels, 1);
+  assert.deepEqual(env.sent.map((message) => message.key || message.type), ['5', 'CANCEL_VIDEO_SELECTION']);
+});
+
+test('6 during GIF capture setup queues exactly one GIF stop after START succeeds', async () => {
+  const env = page();
+  const entered = deferred(), started = deferred();
+  env.respond = (message) => {
+    if (message.key === '5') return gifSelection;
+    if (message.type === 'VIDEO_REGION_SELECTED') { entered.resolve(); return started.promise; }
+    return { ok: true, state: gifState('ready') };
+  };
+  env.selectRegion = async () => videoRegion;
+  const start = env.press('5');
+  await entered.promise;
+  await env.press('4').completion;
+  await env.press('6').completion;
+  await env.press('6').completion;
+  assert.equal(env.sent.length, 2);
+  started.resolve({ ok: true, state: gifState('recording') });
+  await start.completion;
+  assert.deepEqual(env.sent.map((message) => message.key || message.type), ['5', 'VIDEO_REGION_SELECTED', '6']);
+  assert.equal(watcherCount(env, 'resize'), 0);
+});
+
+test('SHOW_GIF_SELECTOR acknowledges before BEGIN and uses the same GIF mode as 5', async () => {
+  const env = page({ runtimeMessages: true });
+  const submitted = deferred();
+  env.respond = (message) => {
+    if (message.key === '5') return gifSelection;
+    if (message.type === 'VIDEO_REGION_SELECTED') submitted.resolve();
+    return { ok: true, state: gifState('recording') };
+  };
+  env.selectRegion = async () => videoRegion;
+  await env.message({ type: 'SHOW_GIF_SELECTOR' });
+  assert.deepEqual(env.messageReplies, [{ ok: true }]);
+  assert.deepEqual(env.sent, []);
+  await env.runTimers();
+  await submitted.promise;
+  assert.equal(env.sent[0].key, '5');
+  assert.equal(env.selections[0].mode, 'gif');
+});
+
+test('mode-scoped cancellation never removes another mode scheduled selector', async () => {
+  for (const mode of ['gif', 'video']) {
+    const env = page({ runtimeMessages: true });
+    const startKey = mode === 'gif' ? '5' : '3';
+    env.respond = (message) => message.key === startKey
+      ? mode === 'gif' ? gifSelection : videoSelection : { ok: true };
+    await env.message({ type: mode === 'gif' ? 'SHOW_GIF_SELECTOR' : 'SHOW_VIDEO_SELECTOR' });
+    await env.message({ type: 'CANCEL_VIDEO_SELECTOR', mode: mode === 'gif' ? 'video' : 'gif' });
+    assert.equal(env.messageReplies.at(-1).cancelled, false);
+    await env.message({ type: 'CANCEL_VIDEO_SELECTOR', mode });
+    assert.equal(env.messageReplies.at(-1).cancelled, true);
+    await env.runTimers();
+    assert.deepEqual(env.sent, []);
+  }
+});
+
+test('6 cancels a scheduled GIF selector before BEGIN and leaves video scheduling alone', async () => {
+  const env = page({ runtimeMessages: true });
+  await env.message({ type: 'SHOW_GIF_SELECTOR' });
+  await env.press('6').completion;
+  await env.runTimers();
+  assert.deepEqual(env.sent, []);
+  env.respond = (message) => message.key === '3' ? videoSelection
+    : { ok: false, error: 'no GIF is recording' };
+  await env.message({ type: 'SHOW_VIDEO_SELECTOR' });
+  await env.press('6').completion;
+  await env.runTimers();
+  await settleCallbacks();
+  assert.ok(env.sent.some((message) => message.key === '3'));
+});
+
+test('GIF resize guards stop the matching session and retain controls until its completion', async () => {
+  const env = page({ runtimeMessages: true });
+  const controls = youtubeControls(env);
+  env.respond = (message) => message.key === '5' ? gifSelection
+    : { ok: true, state: gifState(message.type === 'VIDEO_VIEWPORT_CHANGED' ? 'ready' : 'recording') };
+  env.selectRegion = async () => videoRegion;
+  await env.press('5').completion;
+  assert.equal(controls.activeToken, 'gif-token');
+  env.resize(1100, 800);
+  await env.windowEvent('resize');
+  await settleCallbacks();
+  assert.equal(env.sent.at(-1).type, 'VIDEO_VIEWPORT_CHANGED');
+  assert.equal(env.sent.at(-1).selectionToken, 'gif-token');
+  assert.equal(controls.activeToken, null);
+  assert.equal(watcherCount(env, 'resize'), 0);
+});
+
+test('GIF lifecycle suppresses captured toasts and old completed sessions cannot hide controls again', async () => {
+  const env = page({ runtimeMessages: true });
+  const controls = youtubeControls(env);
+  for (const status of ['starting', 'recording', 'paused', 'stopping']) {
+    await env.message({ type: 'RECORDING_STATE', state: gifState(status), sessionToken: 'gif-token' });
+    assert.equal(controls.activeToken, 'gif-token');
+  }
+  await env.message({ type: 'RECORDING_STATE', state: gifState('ready'), sessionToken: 'gif-token' });
+  assert.equal(controls.activeToken, null);
+  await env.message({ type: 'RECORDING_STATE', state: gifState('recording'), sessionToken: 'gif-token' });
+  assert.equal(controls.activeToken, null);
+});
+
+test('a new start replaces a scheduled selector without cross-mode cancellation', async () => {
+  for (const [scheduledMode, startKey, activeMode] of [
+    ['gif', '3', 'video'], ['video', '5', 'gif'], ['gif', '1', 'audio'],
+  ]) {
+    const env = page({ runtimeMessages: true });
+    const begin = deferred();
+    const token = activeMode + '-new-token';
+    env.respond = (message) => {
+      if (message.key === startKey) return begin.promise;
+      return { ok: true, state: { mode: activeMode, status: 'recording', videoSessionToken: token } };
+    };
+    env.selectRegion = async () => videoRegion;
+    await env.message({ type: scheduledMode === 'gif' ? 'SHOW_GIF_SELECTOR' : 'SHOW_VIDEO_SELECTOR' });
+    const start = env.press(startKey);
+    await env.message({ type: 'CANCEL_VIDEO_SELECTOR', mode: scheduledMode });
+    assert.equal(env.messageReplies.at(-1).cancelled, false, 'old mode must not cancel the new start');
+    await env.runTimers();
+    assert.deepEqual(env.sent.map((message) => message.key), [startKey]);
+    begin.resolve(activeMode === 'audio'
+      ? { ok: true, state: { mode: 'audio', status: 'recording' } }
+      : { ...videoSelection, selectionToken: token, state: { mode: activeMode, status: 'selecting' } });
+    await start.completion;
+    assert.equal(env.sent.some((message) => message.type === 'CANCEL_VIDEO_SELECTION'), false);
+    assert.equal(env.selections.length, activeMode === 'audio' ? 0 : 1);
+    if (activeMode !== 'audio') assert.equal(env.sent.at(-1).type, 'VIDEO_REGION_SELECTED');
+  }
+});

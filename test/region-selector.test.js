@@ -50,8 +50,8 @@ function page() {
   vm.runInContext(source, context);
   return {
     window, dialogs, frames, context,
-    begin: () => context.__withoutMikeSelectRegion({
-      imageDataUrl: 'data:image/png;base64,c25hcHNob3Q=', selectionToken: 'selection-1',
+    begin: (options = {}) => context.__withoutMikeSelectRegion({
+      imageDataUrl: 'data:image/png;base64,c25hcHNob3Q=', selectionToken: 'selection-1', ...options,
     }),
     dispatch(type, overrides = {}) {
       const event = {
@@ -135,4 +135,48 @@ test('external cancellation resolves the selection and untrusted events cannot c
   env.context.__withoutMikeCancelRegion();
   assert.equal(await result, null);
   assert.equal(env.listenerCount(), 0);
+});
+
+test('GIF selection uses Esc or 6 and ignores audio/video stop keys and modified keys', async () => {
+  const env = page();
+  const result = env.begin({ mode: 'gif' });
+  for (const details of [
+    { key: '2' }, { key: '4' }, { key: '6', repeat: true }, { key: '6', ctrlKey: true },
+    { key: '6', isComposing: true }, { key: '6', isTrusted: false }, { key: 'ArrowRight', code: 'Numpad6' },
+  ]) {
+    env.dispatch('keydown', details);
+    assert.equal(env.dialogs[0].open, true);
+  }
+  env.dispatch('keydown', { key: '6', code: 'Numpad6' });
+  assert.equal(await result, null);
+  assert.equal(env.listenerCount(), 0);
+});
+
+test('physical GIF stop key and Escape both cancel with the mode-specific hint', async () => {
+  for (const details of [{ key: '-', code: 'Digit6' }, { key: 'Escape' }, { key: 'Unidentified', code: 'Numpad6' }]) {
+    const env = page();
+    const result = env.begin({ mode: 'gif' });
+    const frame = env.dialogs[0].children[0].shadow.children[1];
+    assert.match(frame.children.at(-1).textContent, /GIF.*Esc 또는 6/);
+    env.dispatch('keydown', details);
+    assert.equal(await result, null);
+    assert.equal(env.listenerCount(), 0);
+  }
+});
+
+test('region selector replaces legacy installations and cancels their open dialog once', async () => {
+  const env = page();
+  const old = env.context.__withoutMikeSelectRegion;
+  const result = env.begin();
+  old.version = 1;
+  vm.runInContext(source, env.context);
+  assert.equal(await result, null);
+  assert.notEqual(env.context.__withoutMikeSelectRegion, old);
+  assert.equal(env.context.__withoutMikeSelectRegion.version, 2);
+  const current = env.context.__withoutMikeSelectRegion;
+  vm.runInContext(source, env.context);
+  assert.equal(env.context.__withoutMikeSelectRegion, current);
+  const gif = env.begin({ mode: 'gif' });
+  env.dispatch('keydown', { key: '6' });
+  assert.equal(await gif, null);
 });

@@ -4,11 +4,11 @@ let lastVideoSession = null;
 let lastStateKey = null;
 
 async function notifyRecordingState(state) {
-  const sessionToken = state.mode === 'video' ? state.videoSessionToken || state.selectionToken : null;
+  const sessionToken = ['video', 'gif'].includes(state.mode) ? state.videoSessionToken || state.selectionToken : null;
   const current = typeof sessionToken === 'string' && Number.isInteger(state.tab?.id)
-    ? { sessionToken, tabId: state.tab.id } : null;
+    ? { sessionToken, tabId: state.tab.id, mode: state.mode } : null;
   const previous = lastVideoSession;
-  const key = current ? `${current.tabId}:${sessionToken}:${state.status}` : null;
+  const key = current ? `${current.tabId}:${sessionToken}:${state.mode}:${state.status}` : null;
   if (key === lastStateKey && (!previous || current)) return;
   lastVideoSession = current;
   lastStateKey = key;
@@ -17,7 +17,7 @@ async function notifyRecordingState(state) {
     type: 'RECORDING_STATE', sessionToken: token, state: snapshot,
   }, { frameId: 0 }).catch(() => {}));
   if (previous && (previous.tabId !== current?.tabId || previous.sessionToken !== current?.sessionToken)) {
-    push(previous.tabId, previous.sessionToken, { status: 'idle', mode: 'video', tab: { id: previous.tabId } });
+    push(previous.tabId, previous.sessionToken, { status: 'idle', mode: previous.mode, tab: { id: previous.tabId } });
   }
   if (current) push(current.tabId, sessionToken, {
     status: state.status, mode: state.mode, tab: { id: current.tabId },
@@ -33,7 +33,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     if (sender.frameId !== 0 || !Number.isInteger(sender.tab.id)) return;
     let command;
     if (message.type === 'PAGE_SHORTCUT' && ['1', '2', '3', '4', '5', '6'].includes(message.key)) {
-      command = { type: { 1: 'START', 2: 'PAGE_STOP', 3: 'BEGIN_VIDEO', 4: 'STOP_VIDEO', 5: 'START', 6: 'PAGE_STOP' }[message.key] };
+      command = { type: { 1: 'START', 2: 'PAGE_STOP', 3: 'BEGIN_VIDEO', 4: 'STOP_VIDEO', 5: 'BEGIN_GIF', 6: 'STOP_GIF' }[message.key] };
     } else if (message.type === 'VIDEO_REGION_SELECTED' && typeof message.selectionToken === 'string') {
       command = { type: 'START_VIDEO', region: message.region, selectionToken: message.selectionToken };
     } else if (message.type === 'CANCEL_VIDEO_SELECTION' && typeof message.selectionToken === 'string') {
@@ -60,7 +60,9 @@ chrome.commands.onCommand.addListener((command, tab) => {
   const type = command === 'start-recording' ? 'BROWSER_START'
     : command === 'stop-recording' ? 'PAGE_STOP'
       : command === 'start-video' ? 'OPEN_VIDEO_SELECTOR'
-        : command === 'stop-video' ? 'STOP_VIDEO' : null;
+        : command === 'stop-video' ? 'STOP_VIDEO'
+          : command === 'start-gif' ? 'OPEN_GIF_SELECTOR'
+            : command === 'stop-gif' ? 'STOP_GIF' : null;
   if (type) controller.handle({ type, targetTabId: tab.id }).then(async (reply) => {
     if (!reply.ok) {
       await chrome.action.setBadgeText({ text: '!' });

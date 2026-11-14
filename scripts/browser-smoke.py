@@ -79,13 +79,13 @@ async def main():
           window.popupCommands = [];
           const sourceTab = {id:1,active:true,url:'https://example.test',title:'테스트 음원 · 440/880 Hz'};
           window.chrome = {
-            runtime: {id:'test-extension',getManifest:()=>({version:'1.3.2'}),getURL: (path)=>location.origin+'/'+path, getContexts:async()=>[{}],
+            runtime: {id:'test-extension',getManifest:()=>({version:'1.9.0'}),getURL: (path)=>location.origin+'/'+path, getContexts:async()=>[{}],
               sendMessage:(message)=>{
                 if (message.target === 'offscreen') return recorder.handle(message);
                 if (message.type !== 'PAGE_SHORTCUT') throw Error('Unexpected page request');
                 pageCommands.push(message);
-                if (['1','5'].includes(message.key)) syntheticTone.frequency.setValueAtTime(880, sourceContext.currentTime + 0.6);
-                return controller.handle({type:['1','5'].includes(message.key) ? 'START' : 'PAGE_STOP',targetTabId:1});
+                if (message.key === '1') syntheticTone.frequency.setValueAtTime(880, sourceContext.currentTime + 0.6);
+                return controller.handle({type:message.key === '1' ? 'START' : 'PAGE_STOP',targetTabId:1});
               }},
             tabs: {query:async()=>[sourceTab],get:async(id)=>{
               if(id !== 1) throw Error('Missing source tab'); return sourceTab;
@@ -107,7 +107,7 @@ async def main():
           // preventDefault must not suppress the recorder's trusted digits.
           window.sitePrevented = 0;
           window.addEventListener('keydown',event=>{
-            if(!['1','2','5','6'].includes(event.key)) return;
+            if(!['1','2'].includes(event.key)) return;
             const editing=event.composedPath().some(node=>node.isContentEditable ||
               node.tagName==='INPUT' && node.type==='text');
             if(!editing) { event.preventDefault(); sitePrevented++; }
@@ -115,7 +115,7 @@ async def main():
           window.playerFrameMarkup = `<input id="frame-volume" type="range"><input id="frame-input-button" type="button" value="재생"><button id="frame-play">재생</button><input id="frame-text"><script>
             window.sitePrevented=0;
             window.addEventListener('keydown',event=>{
-              if(['1','2','5','6'].includes(event.key) && event.target.type!=='text') {
+              if(['1','2'].includes(event.key) && event.target.type!=='text') {
                 event.preventDefault(); sitePrevented++;
               }
             },true);
@@ -171,10 +171,10 @@ async def main():
         await owner.evaluate("window.dispatchEvent(new KeyboardEvent('keydown', {key:'1',bubbles:true,cancelable:true}))")
         assert await owner.evaluate('pageCommands.length') == 0
         await owner.locator('#page-volume').focus()
-        await owner.keyboard.down('5')
+        await owner.keyboard.down('1')
         await owner.wait_for_function("recorder.getState().status === 'recording'")
-        await owner.keyboard.down('5')  # auto-repeat must not issue another START
-        await owner.keyboard.up('5')
+        await owner.keyboard.down('1')  # auto-repeat must not issue another START
+        await owner.keyboard.up('1')
         assert await owner.evaluate('pageCommands.length') == 1
         assert await owner.evaluate('sitePrevented') > 0
         popup = await popup_page()
@@ -198,9 +198,9 @@ async def main():
         # reinjects the script; exactly one request proves injection is idempotent.
         await owner.bring_to_front()
         await owner.locator('#page-video').focus()
-        await owner.keyboard.press('6')
+        await owner.keyboard.press('2')
         await owner.wait_for_function("recorder.getState().status === 'ready'")
-        assert await owner.evaluate('pageCommands.map(command=>command.key)') == ['5', '6']
+        assert await owner.evaluate('pageCommands.map(command=>command.key)') == ['1', '2']
         popup = await popup_page()
         await popup.wait_for_function("document.querySelector('#status-label').textContent === '녹음 완료'")
         state = (await bridge({'type': 'STATUS'}))['state']
@@ -291,12 +291,12 @@ async def main():
           const loaded=new Promise(resolve=>iframe.onload=resolve);
           iframe.srcdoc=playerFrameMarkup;document.body.append(iframe);await loaded;
         }''')
-        await player_pair(owner.frame_locator('#dynamic-player'),start='#frame-input-button',stop='#frame-volume',start_key='5')
+        await player_pair(owner.frame_locator('#dynamic-player'),start='#frame-input-button',stop='#frame-volume',start_key='1')
         await owner.evaluate('''async()=>{
           const iframe=document.querySelector('#dynamic-player');
           await new Promise(resolve=>{iframe.onload=resolve;iframe.srcdoc=playerFrameMarkup+'<p>reloaded</p>';});
         }''')
-        await player_pair(owner.frame_locator('#dynamic-player'),start='#frame-play',stop='#frame-volume',stop_key='6')
+        await player_pair(owner.frame_locator('#dynamic-player'),start='#frame-play',stop='#frame-volume',stop_key='2')
 
         # A stale installation object must be disposed and replaced, rather
         # than causing the reinjection guard to silently leave dead listeners.
@@ -363,10 +363,10 @@ async def main():
         }''')
         timing_popup = await popup_page()
         await timing_popup.wait_for_selector('#start-button:enabled')
-        await timing_popup.keyboard.press('5')
+        await timing_popup.keyboard.press('1')
         await owner.wait_for_function('captureGateEntered')
-        await timing_popup.keyboard.press('6')
-        await timing_popup.keyboard.press('6')
+        await timing_popup.keyboard.press('2')
+        await timing_popup.keyboard.press('2')
         await owner.wait_for_function("popupCommands.some(message=>message.type === 'STOP_PENDING')")
         pending = await owner.evaluate("popupCommands.filter(message=>['START','STOP_PENDING'].includes(message.type))")
         assert [message['type'] for message in pending] == ['START','STOP_PENDING'], pending
@@ -388,7 +388,7 @@ async def main():
                           'trimDuration': clip_probe['format']['duration'], 'trimFrequency': frequency,
                           'fullAudio': full_audio, 'trimAudio': trimmed_audio,
                           'delayedAudio': delayed_audio, 'delayedTrimAudio': delayed_trim_audio,
-                          'ui': 'popup closed: range5 record despite prior preventDefault, pause, resume, player6 stop; legacy1/2 and mixed5/2,1/6 iframe keys, input guards, stale/legacy reinjection, actual command assignment/settings, hundredths, preview, trim, persist range, full save; quick popup5→6 sends durable STOP_PENDING before delayed capture and survives popup close',
+                          'ui': 'popup closed: range1 record despite prior preventDefault, pause, resume, player2 stop; 1/2 iframe keys, input guards, stale/legacy reinjection, actual command assignment/settings, hundredths, preview, trim, persist range, full save; quick popup1→2 sends durable STOP_PENDING before delayed capture and survives popup close',
                           'scope': 'synthetic input and Chrome API bridge; real page keys, MP4 encoder and popup UI'}, ensure_ascii=False))
         await browser.close()
 

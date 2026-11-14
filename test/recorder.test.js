@@ -601,3 +601,53 @@ test('packet-aligned exports cache by the requested range and keep independent s
   assert.equal(h.trims.length, 1);
   assert.equal(h.revoked.length, 0);
 });
+
+test('download completion keeps the result until a valid new audio start replaces it', async () => {
+  const h = harness();
+  await h.start(); h.advance(1200); await h.command('STOP');
+  const previous = h.engine.getState().result.url;
+  await h.command('DOWNLOAD_UPDATE', { download: { id: 9, status: 'pending' } });
+  await h.command('DOWNLOAD_UPDATE', { download: { id: 9, status: 'complete' } });
+  assert.equal(h.engine.getState().result.url, previous, 'completion preserves the preview until the next start');
+  assert.equal(h.revoked.length, 0);
+  const invalid = await h.engine.handle({ type: 'START', streamId: '' });
+  assert.equal(invalid.ok, false);
+  assert.equal(h.engine.getState().result.url, previous);
+  assert.equal(h.revoked.length, 0);
+  const restarted = await h.start();
+  assert.equal(restarted.ok, true);
+  assert.equal(restarted.state.status, 'recording');
+  assert.equal(restarted.state.result, null);
+  assert.deepEqual(restarted.state.download, { id: null, status: 'idle', error: null });
+  assert.deepEqual(h.revoked, [previous]);
+  assert.equal(h.recorders.length, 2);
+});
+
+test('unsaved, pending and failed downloads cannot discard audio by pressing start', async () => {
+  for (const status of ['idle', 'pending', 'interrupted']) {
+    const h = harness();
+    await h.start(); await h.command('STOP');
+    const previous = h.engine.getState().result.url;
+    if (status !== 'idle') await h.command('DOWNLOAD_UPDATE', { download: { id: 11, status: 'pending' } });
+    if (status === 'interrupted') await h.command('DOWNLOAD_UPDATE', { download: { id: 11, status } });
+    assert.equal((await h.start()).ok, false, status);
+    assert.equal(h.engine.getState().result.url, previous);
+    assert.equal(h.revoked.length, 0);
+  }
+});
+
+test('an old download completion cannot reset a new recording or its unsaved result', async () => {
+  const h = harness();
+  await h.start(); await h.command('STOP');
+  await h.command('DOWNLOAD_UPDATE', { download: { id: 21, status: 'pending' } });
+  await h.command('DOWNLOAD_UPDATE', { download: { id: 21, status: 'complete' } });
+  await h.start();
+  assert.equal((await h.command('DOWNLOAD_UPDATE', { download: { id: 21, status: 'complete' } })).ok, false);
+  assert.equal(h.engine.getState().status, 'recording');
+  await h.command('STOP');
+  const current = h.engine.getState().result.url;
+  assert.equal((await h.command('DOWNLOAD_UPDATE', { download: { id: 21, status: 'complete' } })).ok, false);
+  assert.equal(h.engine.getState().download.status, 'idle');
+  assert.equal(h.engine.getState().result.url, current);
+  assert.equal((await h.start()).ok, false);
+});

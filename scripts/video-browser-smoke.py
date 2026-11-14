@@ -109,7 +109,7 @@ async def main():
               sendMessage:async(message)=>{
                 if(message.target === 'offscreen') return recorder.handle(message);
                 commands.push(message);
-                const type = message.type === 'PAGE_SHORTCUT' ? ({1:'START',2:'PAGE_STOP',3:'BEGIN_VIDEO',4:'STOP_VIDEO'})[message.key]
+                const type = message.type === 'PAGE_SHORTCUT' ? ({1:'START',2:'PAGE_STOP',3:'BEGIN_VIDEO',4:'STOP_VIDEO',5:'BEGIN_GIF',6:'STOP_GIF'})[message.key]
                   : message.type === 'VIDEO_REGION_SELECTED' ? 'START_VIDEO'
                   : message.type === 'CANCEL_VIDEO_SELECTION' ? 'CANCEL_VIDEO'
                   : message.type === 'VIDEO_VIEWPORT_CHANGED' ? 'VIDEO_VIEWPORT_CHANGED' : null;

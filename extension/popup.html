@@ -23,7 +23,7 @@
         <span class="local-badge">LOCAL</span>
       </header>
 
-      <p class="intro">마이크 없이, 현재 탭에서 재생되는 소리만.</p>
+      <p class="intro">마이크 없이 탭 소리, 화면과 소리, 영역 GIF를 녹화해요.</p>
       <button class="button secondary extract-file-button" id="open-extract-button" type="button">파일에서 소리 추출</button>
 
       <section class="recorder" aria-label="녹음 상태">
@@ -60,14 +60,15 @@
       <p class="message notice-message" id="notice-message" role="status" aria-live="polite" hidden></p>
 
       <div class="controls" aria-label="녹음 제어">
-        <button class="button primary" id="start-button" type="button" aria-keyshortcuts="1 5" title="소리만 녹음 시작 (키보드 1 또는 5)" disabled>
+        <button class="button primary" id="start-button" type="button" aria-keyshortcuts="1" title="소리만 녹음 시작 (키보드 1)" disabled>
           <span class="record-icon" aria-hidden="true"></span>
-          <span id="start-label">녹음 시작</span>
+          <span id="start-label">소리만 녹음 · 1</span>
         </button>
-        <button class="button secondary" id="start-video-button" type="button" aria-keyshortcuts="3" title="영역 영상 녹화 (키보드 3)" disabled>영역 영상 녹화 · 3</button>
+        <button class="button secondary" id="start-video-button" type="button" aria-keyshortcuts="3" title="영역 영상 녹화 (키보드 3)" disabled>화면+소리 녹화 · 3</button>
+        <button class="button secondary" id="start-gif-button" type="button" aria-keyshortcuts="5" title="영역 GIF 녹화 (키보드 5)" disabled>영역 GIF 녹화 · 5</button>
         <div class="button-row" id="recording-controls" hidden>
           <button class="button secondary" id="pause-button" type="button">일시 정지</button>
-          <button class="button stop" id="stop-button" type="button" aria-keyshortcuts="2 6" title="소리만 녹음 끝내기 (키보드 2 또는 6)">
+          <button class="button stop" id="stop-button" type="button" aria-keyshortcuts="2" title="소리만 녹음 끝내기 (키보드 2)">
             <span class="stop-icon" aria-hidden="true"></span><span id="stop-label">녹음 끝내기</span>
           </button>
         </div>
@@ -137,7 +138,7 @@
           <p class="copy-status" id="copy-status" role="status" aria-live="polite" hidden></p>
         </div>
         <p class="control-hint" id="control-hint">먼저 페이지에서 소리를 재생해 주세요.</p>
-        <p class="shortcut-hint">이 창에서 <kbd>5</kbd> 소리만 시작 · <kbd>6</kbd> 소리만 종료<br /><kbd>1</kbd> / <kbd>2</kbd>도 소리 시작 / 종료<br /><kbd>3</kbd> 영역 선택 후 영상 시작 · <kbd>4</kbd> 영상 종료</p>
+        <p class="shortcut-hint"><kbd>1</kbd> / <kbd>2</kbd> 소리 녹음 시작 / 종료<br /><kbd>3</kbd> / <kbd>4</kbd> 화면+소리 녹화 시작 / 종료<br /><kbd>5</kbd> / <kbd>6</kbd> 영역 GIF 녹화 시작 / 종료</p>
         <p class="shortcut-status" id="shortcut-status" role="status" aria-live="polite" data-status="pending">페이지 단축키 연결 중…</p>
         <div class="shortcut-bindings" id="shortcut-fallback" aria-label="브라우저에 등록된 단축키">
           <dl class="shortcut-binding-list">
@@ -145,6 +146,8 @@
             <div><dt>소리 종료</dt><dd id="shortcut-audio-stop">확인 중</dd></div>
             <div><dt>영상 선택</dt><dd id="shortcut-video-start">확인 중</dd></div>
             <div><dt>영상 종료</dt><dd id="shortcut-video-stop">확인 중</dd></div>
+            <div><dt>GIF 선택</dt><dd id="shortcut-gif-start">확인 중</dd></div>
+            <div><dt>GIF 종료</dt><dd id="shortcut-gif-stop">확인 중</dd></div>
           </dl>
           <p class="shortcut-status" id="shortcut-assignment-note" role="status"></p>
           <button class="position-button" id="shortcut-settings" type="button">단축키 설정 열기</button>
